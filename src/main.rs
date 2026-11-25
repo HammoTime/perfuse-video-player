@@ -1094,7 +1094,7 @@ impl App {
             .frame(
                 egui::Frame::new()
                     .fill(Color32::BLACK)
-                    .inner_margin(egui::Margin::symmetric(24, 0)),
+                    .inner_margin(egui::Margin::symmetric(20, 0)),
             )
             .exact_height(72.0)
             .show(ctx, |ui| {
@@ -1185,18 +1185,17 @@ impl App {
 
     fn sidebar(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("sidebar")
-            .exact_width(232.0)
+            .exact_width(244.0)
             .resizable(false)
             .frame(
                 egui::Frame::new()
                     .fill(Color32::from_rgb(20, 20, 23))
-                    .inner_margin(egui::Margin::symmetric(22, 28)),
+                    .inner_margin(egui::Margin::same(28)),
             )
             .show(ctx, |ui| {
                 egui::Frame::new().show(ui, |ui| {
                     ui.set_min_height(ui.available_height());
                     ui.set_width(ui.available_width());
-                    ui.add_space(14.0);
                     if nav(
                         ui,
                         Icon::Home,
@@ -1385,7 +1384,6 @@ impl App {
                         self.library(&section, ctx);
                     }
                     ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                        ui.add_space(4.0);
                         if nav(
                             ui,
                             Icon::Settings,
@@ -1441,33 +1439,31 @@ impl App {
         let max_offset = (content_width.max(estimated_content) - viewport).max(0.0);
         let scrollable = max_offset > 1.0;
         let mut scroll_delta = 0.0_f32;
-        ui.horizontal(|ui| {
+        control_row(ui, 32.0, |ui| {
             ui.label(RichText::new(heading).size(22.0).strong());
             if scrollable {
                 let pitch = HOME_CARD_WIDTH + spacing;
                 let step = (viewport / pitch).floor().max(1.0) * pitch;
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let forward_label = format!("Scroll {heading} forward");
-                    if ui
-                        .add_enabled(
-                            offset_x < max_offset - 1.0,
-                            IconButton::new(Icon::PageNext, &forward_label),
-                        )
-                        .clicked()
-                    {
-                        scroll_delta = -step.min((max_offset - offset_x).max(0.0));
-                    }
-                    let back_label = format!("Scroll {heading} back");
-                    if ui
-                        .add_enabled(
-                            offset_x > 1.0,
-                            IconButton::new(Icon::PagePrevious, &back_label),
-                        )
-                        .clicked()
-                    {
-                        scroll_delta = step.min(offset_x.max(0.0));
-                    }
-                });
+                let back_label = format!("Scroll {heading} back");
+                if ui
+                    .add_enabled(
+                        offset_x > 1.0,
+                        IconButton::new(Icon::PagePrevious, &back_label),
+                    )
+                    .clicked()
+                {
+                    scroll_delta = step.min(offset_x.max(0.0));
+                }
+                let forward_label = format!("Scroll {heading} forward");
+                if ui
+                    .add_enabled(
+                        offset_x < max_offset - 1.0,
+                        IconButton::new(Icon::PageNext, &forward_label),
+                    )
+                    .clicked()
+                {
+                    scroll_delta = -step.min((max_offset - offset_x).max(0.0));
+                }
             }
         });
         let mut picked = None;
@@ -1639,7 +1635,7 @@ impl App {
                         .as_ref()
                         .is_some_and(|l| !l.previous_pages.is_empty());
                     let has_next = page.has_next();
-                    ui.horizontal(|ui| {
+                    control_row(ui, 32.0, |ui| {
                         ui.label(
                             RichText::new(if home {
                                 "Recently Added"
@@ -1666,35 +1662,27 @@ impl App {
                             );
                         }
                         if home && (has_previous || has_next) {
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui
-                                        .add_enabled(
-                                            !self.busy && has_next,
-                                            IconButton::new(
-                                                Icon::PageNext,
-                                                "Next Recently Added page",
-                                            ),
-                                        )
-                                        .clicked()
-                                    {
-                                        page_action = 1;
-                                    }
-                                    if ui
-                                        .add_enabled(
-                                            !self.busy && has_previous,
-                                            IconButton::new(
-                                                Icon::PagePrevious,
-                                                "Previous Recently Added page",
-                                            ),
-                                        )
-                                        .clicked()
-                                    {
-                                        page_action = -1;
-                                    }
-                                },
-                            );
+                            if ui
+                                .add_enabled(
+                                    !self.busy && has_previous,
+                                    IconButton::new(
+                                        Icon::PagePrevious,
+                                        "Previous Recently Added page",
+                                    ),
+                                )
+                                .clicked()
+                            {
+                                page_action = -1;
+                            }
+                            if ui
+                                .add_enabled(
+                                    !self.busy && has_next,
+                                    IconButton::new(Icon::PageNext, "Next Recently Added page"),
+                                )
+                                .clicked()
+                            {
+                                page_action = 1;
+                            }
                         }
                     });
                     ui.add_space(14.0);
@@ -2195,43 +2183,46 @@ impl App {
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::RIGHT_TOP, [-16.0, offset])
             .show(ctx, |ui| {
-                egui::Frame::popup(ui.style()).fill(PANEL).show(ui, |ui| {
-                    ui.strong(title);
-                    if self.client_updates.downloading {
-                        if let Some(Ok(status)) = &self.client_updates.status {
-                            ui.label(status);
+                egui::Frame::popup(ui.style())
+                    .fill(PANEL)
+                    .inner_margin(16)
+                    .show(ui, |ui| {
+                        ui.strong(title);
+                        if self.client_updates.downloading {
+                            if let Some(Ok(status)) = &self.client_updates.status {
+                                ui.label(status);
+                            }
+                        } else if self.runtime_action == RuntimeAction::Upgrade
+                            && let Some(status) = &self.runtime_status
+                        {
+                            let color = if self.runtime_failed {
+                                ERROR_TEXT
+                            } else {
+                                TEXT
+                            };
+                            ui.colored_label(color, status);
+                        } else if key.0.is_some()
+                            && let Some(Err(error)) = &self.client_updates.status
+                        {
+                            ui.colored_label(ERROR_TEXT, error);
                         }
-                    } else if self.runtime_action == RuntimeAction::Upgrade
-                        && let Some(status) = &self.runtime_status
-                    {
-                        let color = if self.runtime_failed {
-                            ERROR_TEXT
-                        } else {
-                            TEXT
-                        };
-                        ui.colored_label(color, status);
-                    } else if key.0.is_some()
-                        && let Some(Err(error)) = &self.client_updates.status
-                    {
-                        ui.colored_label(ERROR_TEXT, error);
-                    }
-                    ui.horizontal(|ui| {
-                        let action = match (&key.0, &key.1) {
-                            (Some(_), Some(_)) => "Update both and restart",
-                            (Some(_), None) => "Update Perfuse and restart",
-                            _ => "Update libraries",
-                        };
-                        let idle = self.runtime_rx.is_none() && !self.client_updates.busy();
-                        if ui.add_enabled(idle, egui::Button::new(action)).clicked() {
-                            // The root context owns shutdown even when the notification
-                            // is drawn in the native playback overlay.
-                            self.update_available(ctx, key.0.is_some());
-                        }
-                        if ui.button("Later").clicked() {
-                            self.dismissed_updates = Some(key.clone());
-                        }
+                        ui.horizontal(|ui| {
+                            let action = match (&key.0, &key.1) {
+                                (Some(_), Some(_)) => "Update both and restart",
+                                (Some(_), None) => "Update Perfuse and restart",
+                                _ => "Update libraries",
+                            };
+                            let idle = self.runtime_rx.is_none() && !self.client_updates.busy();
+                            if ui.add_enabled(idle, egui::Button::new(action)).clicked() {
+                                // The root context owns shutdown even when the notification
+                                // is drawn in the native playback overlay.
+                                self.update_available(ctx, key.0.is_some());
+                            }
+                            if ui.button("Later").clicked() {
+                                self.dismissed_updates = Some(key.clone());
+                            }
+                        });
                     });
-                });
             });
     }
 
@@ -2744,7 +2735,7 @@ impl eframe::App for App {
                 .frame(
                     egui::Frame::new()
                         .fill(PANEL)
-                        .inner_margin(egui::Margin::symmetric(28, 16)),
+                        .inner_margin(egui::Margin::same(28)),
                 )
                 .show(ctx, |ui| {
                     if let Some(status) = self.runtime_status.clone() {
@@ -2796,7 +2787,7 @@ impl eframe::App for App {
                     .is_some_and(|l| !l.previous_pages.is_empty()))
         {
             egui::TopBottomPanel::bottom("pagination")
-                .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(48, 16)))
+                .frame(egui::Frame::new().inner_margin(egui::Margin::same(28)))
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         let previous = self

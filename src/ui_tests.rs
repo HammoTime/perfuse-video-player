@@ -1193,6 +1193,26 @@ fn home_pagination_only_changes_recently_added_and_carousels_scroll_with_arrows(
         app.released = items[5..10].to_vec();
     }
     harness.run_steps(4);
+    // Scroll arrows sit directly next to each carousel heading in left-to-right order.
+    for heading in ["Continue Watching", "Recently Released"] {
+        let title = harness.get_by_label(heading).rect();
+        let back = harness
+            .get_by_label(&format!("Scroll {heading} back"))
+            .rect();
+        let forward = harness
+            .get_by_label(&format!("Scroll {heading} forward"))
+            .rect();
+        assert!(
+            back.left() > title.right() && back.left() - title.right() <= 30.0,
+            "{heading} back button should sit next to heading: title={title:?} back={back:?}"
+        );
+        assert!(
+            forward.left() > back.right() && forward.left() - back.right() <= 30.0,
+            "{heading} forward button should follow back: back={back:?} forward={forward:?}"
+        );
+        assert!((back.center().y - title.center().y).abs() < 4.0);
+        assert!((forward.center().y - title.center().y).abs() < 4.0);
+    }
     assert!(
         harness
             .get_by_label("Scroll Continue Watching back")
@@ -1295,6 +1315,41 @@ fn home_pagination_only_changes_recently_added_and_carousels_scroll_with_arrows(
     let deck_art = harness.state().on_deck[0].thumb.clone().unwrap();
     let released_art = harness.state().released[0].thumb.clone().unwrap();
     harness.run_steps(3);
+    // Recently Added page arrows sit beside the heading/range, and button panel margins are equal.
+    let screen = harness.ctx.content_rect();
+    let recent_title = harness.get_by_label("Recently Added").rect();
+    let recent_prev = harness.get_by_label("Previous Recently Added page").rect();
+    let recent_next = harness.get_by_label("Next Recently Added page").rect();
+    assert!(
+        recent_prev.left() > recent_title.right()
+            && recent_prev.left() - recent_title.right() < 160.0,
+        "Recently Added arrows should sit next to heading: title={recent_title:?} prev={recent_prev:?}"
+    );
+    assert!(recent_next.left() > recent_prev.right());
+    assert!((recent_prev.center().y - recent_title.center().y).abs() < 4.0);
+
+    let back_btn = harness.get_by_label("Back").rect();
+    let close_btn = harness.get_by_label("Close window").rect();
+    assert!((back_btn.left() - 20.0).abs() < 1.5);
+    assert!((back_btn.top() - 20.0).abs() < 1.5);
+    assert!((screen.right() - close_btn.right() - 20.0).abs() < 1.5);
+
+    let home_nav = harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "Home")
+        .rect();
+    let settings_nav = harness.get_by_label("Servers & settings").rect();
+    assert!((home_nav.left() - 28.0).abs() < 1.5);
+    assert!((home_nav.top() - 72.0 - 28.0).abs() < 2.0);
+    assert!((screen.bottom() - settings_nav.bottom() - 28.0).abs() < 2.0);
+
+    let prev_page_btn = harness.get_by_label("Previous page").rect();
+    let sidebar_right = home_nav.right() + 28.0;
+    let prev_left_pad = prev_page_btn.left() - sidebar_right;
+    let prev_bottom_pad = screen.bottom() - prev_page_btn.bottom();
+    assert!(
+        (prev_left_pad - 28.0).abs() < 2.5 && (prev_bottom_pad - 28.0).abs() < 2.5,
+        "pagination margins should be equal (28pt): left={prev_left_pad} bottom={prev_bottom_pad}"
+    );
 
     harness.get_by_label("Next page").click();
     for _ in 0..100 {
@@ -1314,6 +1369,20 @@ fn home_pagination_only_changes_recently_added_and_carousels_scroll_with_arrows(
     assert!(harness.query_by_label("Recently Released").is_some());
     assert!(harness.query_by_label("Page Two Film").is_some());
 
+    harness
+        .get_by_label("Previous Recently Added page")
+        .scroll_to_me();
+    harness.run_steps(4);
+    let prev_rect = harness.get_by_label("Previous Recently Added page").rect();
+    let prev_disabled = harness
+        .get_by_label("Previous Recently Added page")
+        .accesskit_node()
+        .is_disabled();
+    assert!(
+        !prev_disabled && prev_rect.bottom() <= prev_page_btn.top() - 28.0,
+        "Previous Recently Added page not clickable: disabled={prev_disabled} rect={prev_rect:?} pagination_top={}",
+        prev_page_btn.top() - 28.0
+    );
     harness.get_by_label("Previous Recently Added page").click();
     for _ in 0..100 {
         harness.step();
