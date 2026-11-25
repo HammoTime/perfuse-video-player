@@ -1,106 +1,145 @@
+pub mod auth;
+
+use super::Plugin;
+use crate::{
+    cache::Artwork,
+    http,
+    media::{
+        Browse, Item, Kind, Library, MediaSource, PAGE_SIZE, Page, Playback, PlaybackState,
+        Progress, Stream, Version,
+    },
+};
 use reqwest::{Url, blocking::Client, header};
 use serde::Deserialize;
-use std::{io::Read, path::PathBuf, time::Duration};
+use std::{sync::Arc, time::Duration};
 
-pub const PAGE_SIZE: usize = 36;
 const RELEASED_LIMIT: usize = 24;
-const JSON_LIMIT: u64 = 16 * 1024 * 1024;
+
+pub static PLUGIN: Plugin = Plugin {
+    id: "plex",
+    name: "Plex",
+    default_address: "http://localhost:32400",
+    open: |credentials, cache_artwork| {
+        Ok(Arc::new(Plex::new(
+            &credentials.server,
+            &credentials.token,
+            &credentials.client_id,
+            cache_artwork,
+        )?))
+    },
+};
 
 // Intentionally no Debug: the client owns an authentication token.
-#[derive(Clone)]
-pub struct Plex {
+struct Plex {
     base: Url,
     token: String,
     http: Client,
-    cache: Option<PathBuf>,
+    artwork: Artwork,
 }
 
 #[derive(Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct Item {
+struct PlexItem {
     #[serde(default)]
-    pub rating_key: String,
+    rating_key: String,
     #[serde(default)]
-    pub title: String,
+    title: String,
     #[serde(default, rename = "type")]
-    pub kind: String,
-    pub year: Option<u32>,
+    kind: String,
+    year: Option<u32>,
     /// Release or air date as `YYYY-MM-DD`.
-    pub originally_available_at: Option<String>,
-    pub index: Option<u32>,
-    pub parent_index: Option<u32>,
-    pub grandparent_title: Option<String>,
+    originally_available_at: Option<String>,
+    index: Option<u32>,
+    parent_index: Option<u32>,
+    grandparent_title: Option<String>,
     #[serde(default)]
-    pub summary: String,
-    pub thumb: Option<String>,
-    pub art: Option<String>,
-    pub duration: Option<u64>,
-    pub view_offset: Option<u64>,
+    summary: String,
+    thumb: Option<String>,
+    art: Option<String>,
+    duration: Option<u64>,
+    view_offset: Option<u64>,
     #[serde(default)]
-    pub view_count: u32,
+    view_count: u32,
     #[serde(default, rename = "Media")]
-    pub media: Vec<Media>,
+    media: Vec<Media>,
 }
 
-impl Item {
-    pub fn playable(&self) -> bool {
-        matches!(self.kind.as_str(), "movie" | "episode")
+fn kind(value: &str) -> Kind {
+    match value {
+        "movie" => Kind::Movie,
+        "show" => Kind::Series,
+        "season" => Kind::Season,
+        "episode" => Kind::Episode,
+        _ => Kind::Other,
     }
+}
 
-    pub fn subtitle(&self) -> String {
-        if self.kind == "episode" {
-            format!(
-                "{} · S{:02} E{:02}",
-                self.grandparent_title.as_deref().unwrap_or("Episode"),
-                self.parent_index.unwrap_or(0),
-                self.index.unwrap_or(0)
-            )
-        } else {
-            self.year
-                .map(|y| y.to_string())
-                .unwrap_or_else(|| self.kind.clone())
+impl From<PlexItem> for Item {
+    fn from(item: PlexItem) -> Self {
+        Self {
+            id: item.rating_key,
+            title: item.title,
+            kind: kind(&item.kind),
+            year: item.year,
+            release_date: item.originally_available_at,
+            index: item.index,
+            season_number: item.parent_index,
+            series_title: item.grandparent_title,
+            summary: item.summary,
+            thumb: item.thumb,
+            art: item.art,
+            duration_ms: item.duration,
+            resume_ms: item.view_offset,
+            watched: item.view_count > 0,
+            versions: item.media.into_iter().map(Version::from).collect(),
         }
     }
 }
 
 #[derive(Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct Media {
-    pub video_codec: Option<String>,
-    pub audio_codec: Option<String>,
-    pub video_resolution: Option<String>,
-    pub container: Option<String>,
+struct Media {
+    video_codec: Option<String>,
+    audio_codec: Option<String>,
+    video_resolution: Option<String>,
+    container: Option<String>,
     #[serde(default, rename = "Part")]
-    pub parts: Vec<Part>,
+    parts: Vec<Part>,
 }
 
-impl Media {
-    pub fn label(&self) -> String {
-        [
-            self.video_resolution.as_deref(),
-            self.video_codec.as_deref(),
-            self.audio_codec.as_deref(),
-            self.container.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(" · ")
-        .to_uppercase()
+impl From<Media> for Version {
+    fn from(media: Media) -> Self {
+        let stream = match media.parts.len() {
+            0 => Stream::Unavailable,
+            1 => media
+                .parts
+                .into_iter()
+                .next()
+                .and_then(|part| part.key)
+                .map_or(Stream::Unavailable, Stream::Direct),
+            _ => Stream::Multipart,
+        };
+        Self {
+            video_codec: media.video_codec,
+            audio_codec: media.audio_codec,
+            video_resolution: media.video_resolution,
+            container: media.container,
+            stream,
+        }
     }
 }
 
 #[derive(Clone, Deserialize, Default)]
-pub struct Part {
-    pub key: Option<String>,
+struct Part {
+    key: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
-pub struct Section {
-    pub key: String,
-    pub title: String,
+struct Section {
+    key: String,
+    title: String,
     #[serde(rename = "type")]
-    pub kind: String,
+    kind: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -109,7 +148,7 @@ struct Container {
     #[serde(default, rename = "Directory")]
     directories: Vec<Section>,
     #[serde(default, rename = "Metadata")]
-    items: Vec<Item>,
+    items: Vec<PlexItem>,
     total_size: Option<usize>,
     offset: Option<usize>,
 }
@@ -120,35 +159,14 @@ struct Response {
     container: Container,
 }
 
-pub struct Page {
-    pub items: Vec<Item>,
-    pub offset: usize,
-    pub total: Option<usize>,
-}
-
-impl Page {
-    pub fn has_next(&self) -> bool {
-        let end = self.offset + self.items.len();
-        !self.items.is_empty()
-            && self
-                .total
-                .map_or(self.items.len() >= PAGE_SIZE, |total| end < total)
-    }
-}
-
 impl Plex {
-    pub fn new(server: &str, token: &str, client_id: &str) -> Result<Self, String> {
-        let base = Url::parse(server.trim()).map_err(|_| "Enter a valid server URL.".to_owned())?;
-        if !matches!(base.scheme(), "http" | "https")
-            || base.host_str().is_none()
-            || !base.username().is_empty()
-            || base.password().is_some()
-            || base.query().is_some()
-            || base.fragment().is_some()
-            || base.path() != "/"
-        {
-            return Err("Use a server origin, e.g. http://192.168.1.10:32400, without a path or credentials.".into());
-        }
+    fn new(
+        server: &str,
+        token: &str,
+        client_id: &str,
+        cache_artwork: bool,
+    ) -> Result<Self, String> {
+        let base = http::base_url(server)?;
         let token = token.trim();
         if token.is_empty() {
             return Err("Enter your Plex token.".into());
@@ -175,23 +193,15 @@ impl Plex {
             header::ACCEPT,
             header::HeaderValue::from_static("application/json"),
         );
-        let http = Client::builder()
-            .default_headers(headers)
-            // Never forward the Plex token to a redirect target.
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(20))
-            .build()
-            .map_err(|_| "Could not initialize networking.".to_owned())?;
         Ok(Self {
             base,
             token: token.to_owned(),
-            http,
-            cache: crate::cache::dir(),
+            http: http::client(headers)?,
+            artwork: Artwork::new(cache_artwork),
         })
     }
 
-    pub fn url(&self, path: &str) -> Result<Url, String> {
+    fn url(&self, path: &str) -> Result<Url, String> {
         let url = self
             .base
             .join(path)
@@ -204,27 +214,6 @@ impl Plex {
             return Err("Plex returned a path outside the connected server.".into());
         }
         Ok(url)
-    }
-
-    pub fn player_header(&self) -> String {
-        format!("X-Plex-Token: {}", self.token)
-    }
-
-    pub fn timeline(&self, id: &str, state: &str, time: u64, duration: u64) -> Result<(), String> {
-        let response = self
-            .http
-            .get(self.url("/:/timeline")?)
-            .timeout(Duration::from_secs(4))
-            .query(&[
-                ("ratingKey", id.to_owned()),
-                ("key", metadata_path(id)?),
-                ("state", state.to_owned()),
-                ("time", time.to_string()),
-                ("duration", duration.to_string()),
-            ])
-            .send()
-            .map_err(|_| "Playback progress could not reach Plex.".to_owned())?;
-        check_status(response.status())
     }
 
     fn request(
@@ -242,29 +231,42 @@ impl Plex {
         let response = request.send().map_err(|_| {
             "Cannot reach Plex. Check the address, network, and TLS certificate.".to_owned()
         })?;
-        check_status(response.status())?;
-        let bytes = read_limited(response, JSON_LIMIT)?;
-        serde_json::from_slice::<Response>(&bytes)
-            .map(|r| r.container)
-            .map_err(|_| "Plex returned an unexpected response (expected JSON).".to_owned())
+        http::json::<Response>(response, "Plex").map(|r| r.container)
+    }
+}
+
+impl MediaSource for Plex {
+    fn address(&self) -> &str {
+        self.base.as_str()
     }
 
-    pub fn sections(&self) -> Result<Vec<Section>, String> {
+    fn libraries(&self) -> Result<Vec<Library>, String> {
         Ok(self
             .request("/library/sections", &[], None)?
             .directories
             .into_iter()
             .filter(|s| matches!(s.kind.as_str(), "movie" | "show"))
+            .map(|s| Library {
+                id: s.key,
+                title: s.title,
+                kind: kind(&s.kind),
+            })
             .collect())
     }
 
-    pub fn browse(&self, path: &str, search: &str, offset: usize) -> Result<Page, String> {
+    fn browse(&self, scope: &Browse, search: &str, offset: usize) -> Result<Page, String> {
+        let path = match scope {
+            Browse::RecentlyAdded => "/library/recentlyAdded".to_owned(),
+            Browse::ContinueWatching => "/library/onDeck".to_owned(),
+            Browse::Library(library) => section_path(&library.id)?,
+            Browse::Children(id) => format!("{}/children", metadata_path(id)?),
+        };
         let query = if search.trim().is_empty() {
             vec![]
         } else {
             vec![("title", search.trim().to_owned())]
         };
-        let result = self.request(path, &query, Some(offset))?;
+        let result = self.request(&path, &query, Some(offset))?;
         if offset > 0 && result.offset.unwrap_or(0) != offset {
             return Err(
                 "Plex did not honor the requested page. Refresh the library to start again.".into(),
@@ -273,94 +275,105 @@ impl Plex {
         Ok(Page {
             offset: result.offset.unwrap_or(0),
             total: result.total_size,
-            items: result.items,
+            items: result.items.into_iter().map(Item::from).collect(),
         })
     }
 
     /// Newest movies and episodes by release date across the given libraries.
-    pub fn recently_released(&self, sections: &[Section]) -> Result<Vec<Item>, String> {
+    fn recently_released(&self, sections: &[Library]) -> Result<Vec<Item>, String> {
         let mut items = vec![];
         for section in sections {
             // Episodes rather than shows, so new episodes of older series appear.
-            let kind = if section.kind == "show" { "4" } else { "1" };
+            let kind = if section.kind == Kind::Series {
+                "4"
+            } else {
+                "1"
+            };
             let query = [
                 ("type", kind.to_owned()),
                 ("sort", "originallyAvailableAt:desc".to_owned()),
             ];
-            let result = self.request(&section_path(&section.key)?, &query, Some(0))?;
+            let result = self.request(&section_path(&section.id)?, &query, Some(0))?;
             items.extend(
                 result
                     .items
                     .into_iter()
-                    .filter(|item| item.playable() && item.originally_available_at.is_some()),
+                    .map(Item::from)
+                    .filter(|item| item.playable() && item.release_date.is_some()),
             );
         }
         // ISO dates sort chronologically as strings.
-        items.sort_by(|a, b| b.originally_available_at.cmp(&a.originally_available_at));
+        items.sort_by(|a, b| b.release_date.cmp(&a.release_date));
         items.truncate(RELEASED_LIMIT);
         Ok(items)
     }
 
-    pub fn metadata(&self, id: &str) -> Result<Item, String> {
+    fn item(&self, id: &str) -> Result<Item, String> {
         self.request(&metadata_path(id)?, &[], None)?
             .items
             .into_iter()
             .next()
+            .map(Item::from)
             .ok_or_else(|| "This item is no longer available.".to_owned())
     }
 
     /// Artwork from the local disk cache only, without a network request.
-    pub fn cached_artwork(&self, path: &str) -> Option<image::RgbaImage> {
-        let dir = self.cache.as_deref()?;
-        let bytes = crate::cache::read(dir, self.base.as_str(), path)?;
-        let image = decode_artwork(&bytes);
-        if image.is_err() {
-            crate::cache::remove(dir, self.base.as_str(), path);
-        }
-        image.ok()
+    fn cached_artwork(&self, path: &str) -> Option<image::RgbaImage> {
+        self.artwork.cached(self.address(), path)
     }
 
     /// Fetches artwork from the server and stores it in the disk cache.
-    pub fn artwork(&self, path: &str) -> Result<image::RgbaImage, String> {
+    fn artwork(&self, path: &str) -> Result<image::RgbaImage, String> {
         let source = self.url(path)?;
         let backdrop = source.path().split('/').any(|part| part == "art");
+        let request = self.http.get(self.url("/photo/:/transcode")?).query(&[
+            ("url", source.path()),
+            ("width", if backdrop { "1280" } else { "360" }),
+            ("height", if backdrop { "720" } else { "540" }),
+            ("minSize", "1"),
+        ]);
+        self.artwork.fetch(self.address(), path, request)
+    }
+
+    fn playback(&self, _: &Item, version: &Version) -> Result<Playback, String> {
+        let url = self.url(version.stream.direct_file()?)?;
+        if !url.path().starts_with("/library/parts/")
+            || url
+                .query_pairs()
+                .any(|(key, _)| key.eq_ignore_ascii_case("X-Plex-Token"))
+        {
+            return Err("Plex did not return a library media file.".into());
+        }
+        Ok(Playback {
+            url,
+            headers: vec![format!("X-Plex-Token: {}", self.token)],
+        })
+    }
+
+    fn report(&self, item: &Item, _: &Version, progress: Progress) -> Result<(), String> {
+        let state = match progress.state {
+            PlaybackState::Playing => "playing",
+            PlaybackState::Paused => "paused",
+            PlaybackState::Stopped => "stopped",
+        };
         let response = self
             .http
-            .get(self.url("/photo/:/transcode")?)
+            .get(self.url("/:/timeline")?)
+            .timeout(Duration::from_secs(4))
             .query(&[
-                ("url", source.path()),
-                ("width", if backdrop { "1280" } else { "360" }),
-                ("height", if backdrop { "720" } else { "540" }),
-                ("minSize", "1"),
+                ("ratingKey", item.id.clone()),
+                ("key", metadata_path(&item.id)?),
+                ("state", state.to_owned()),
+                ("time", progress.position_ms.to_string()),
+                ("duration", progress.duration_ms.to_string()),
             ])
             .send()
-            .map_err(|_| "Artwork unavailable.".to_owned())?;
-        check_status(response.status())?;
-        let bytes = read_limited(response, 8 * 1024 * 1024)?;
-        let image = decode_artwork(&bytes)?;
-        if let Some(dir) = &self.cache {
-            crate::cache::write(dir, self.base.as_str(), path, &bytes);
-        }
-        Ok(image)
+            .map_err(|_| "Playback progress could not reach Plex.".to_owned())?;
+        http::check_status(response.status(), "Plex")
     }
 }
 
-fn decode_artwork(bytes: &[u8]) -> Result<image::RgbaImage, String> {
-    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
-        .with_guessed_format()
-        .map_err(|_| "Unknown artwork format.".to_owned())?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(2048);
-    limits.max_image_height = Some(2048);
-    limits.max_alloc = Some(32 * 1024 * 1024);
-    reader.limits(limits);
-    reader
-        .decode()
-        .map(|image| image.into_rgba8())
-        .map_err(|_| "Cannot decode artwork.".to_owned())
-}
-
-pub fn metadata_path(id: &str) -> Result<String, String> {
+fn metadata_path(id: &str) -> Result<String, String> {
     if id.is_empty()
         || !id
             .bytes()
@@ -371,44 +384,21 @@ pub fn metadata_path(id: &str) -> Result<String, String> {
     Ok(format!("/library/metadata/{id}"))
 }
 
-pub fn section_path(id: &str) -> Result<String, String> {
+fn section_path(id: &str) -> Result<String, String> {
     if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
         return Err("Plex returned an invalid library identifier.".into());
     }
     Ok(format!("/library/sections/{id}/all"))
 }
 
-fn check_status(status: reqwest::StatusCode) -> Result<(), String> {
-    if status.is_success() {
-        Ok(())
-    } else if matches!(status.as_u16(), 401 | 403) {
-        Err("Plex denied access. Check your token and library permissions.".into())
-    } else if status.is_redirection() {
-        Err("Plex redirected the request. Connect to the final server address directly.".into())
-    } else {
-        Err(format!("Plex returned HTTP {}.", status.as_u16()))
-    }
-}
-
-pub(crate) fn read_limited(reader: impl Read, limit: u64) -> Result<Vec<u8>, String> {
-    let mut bytes = Vec::new();
-    reader
-        .take(limit + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| "The Plex response was interrupted.".to_owned())?;
-    if bytes.len() as u64 > limit {
-        return Err("The Plex response exceeded the size limit.".into());
-    }
-    Ok(bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     #[test]
     fn validates_trust_boundaries_and_decodes_plex() {
-        let plex = Plex::new("http://localhost:32400", "secret", "test-client").unwrap();
+        let plex = Plex::new("http://localhost:32400", "secret", "test-client", false).unwrap();
         assert!(plex.url("/library/parts/1/file.mkv").is_ok());
         for path in [
             "https://evil.test/file",
@@ -417,24 +407,45 @@ mod tests {
         ] {
             assert!(plex.url(path).is_err());
         }
-        assert!(Plex::new("file:///tmp/test", "secret", "test").is_err());
-        assert!(Plex::new("http://localhost:32400/?token=secret", "secret", "test").is_err());
-        assert!(Plex::new("http://localhost:32400", "bad\r\nHeader: value", "test").is_err());
+        assert!(Plex::new("file:///tmp/test", "secret", "test", false).is_err());
+        assert!(
+            Plex::new(
+                "http://localhost:32400/?token=secret",
+                "secret",
+                "test",
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            Plex::new(
+                "http://localhost:32400",
+                "bad\r\nHeader: value",
+                "test",
+                false
+            )
+            .is_err()
+        );
         assert!(metadata_path("../1").is_err());
         assert!(section_path("1?token=x").is_err());
         let response: Response = serde_json::from_str(r#"{"MediaContainer":{"offset":36,"totalSize":80,"Metadata":[{"ratingKey":"42","title":"Test","type":"movie","Media":[{"videoCodec":"hevc","Part":[{"key":"/library/parts/4/file.mkv"}]}]}]}}"#).unwrap();
-        assert!(response.container.items[0].playable());
-        assert_eq!(
-            response.container.items[0].media[0].parts[0].key.as_deref(),
-            Some("/library/parts/4/file.mkv")
-        );
         let page = Page {
-            items: response.container.items,
+            items: response
+                .container
+                .items
+                .into_iter()
+                .map(Item::from)
+                .collect(),
             offset: 36,
             total: Some(80),
         };
+        assert!(page.items[0].playable());
+        assert_eq!(
+            page.items[0].versions[0].stream.direct_file(),
+            Ok("/library/parts/4/file.mkv")
+        );
         assert!(page.has_next());
-        assert!(read_limited(&b"1234"[..], 3).is_err());
+        assert!(http::read_limited(&b"1234"[..], 3).is_err());
     }
 
     #[test]
@@ -476,15 +487,26 @@ mod tests {
                 }
             }
         });
-        let plex = Plex::new(&format!("http://{address}"), "test-secret", "integration").unwrap();
+        let plex = Plex::new(
+            &format!("http://{address}"),
+            "test-secret",
+            "integration",
+            false,
+        )
+        .unwrap();
+        let library = Library {
+            id: "1".into(),
+            title: "Movies".into(),
+            kind: Kind::Movie,
+        };
         let page = plex
-            .browse("/library/sections/1/all", "quiet orbit", 36)
+            .browse(&Browse::Library(library), "quiet orbit", 36)
             .unwrap();
         assert_eq!(page.offset, 36);
         assert_eq!(page.items[0].title, "Quiet Orbit");
         assert!(!page.has_next());
-        assert!(plex.sections().unwrap_err().contains("redirected"));
-        assert!(plex.sections().unwrap_err().contains("denied access"));
+        assert!(plex.libraries().unwrap_err().contains("redirected"));
+        assert!(plex.libraries().unwrap_err().contains("denied access"));
         server.join().unwrap();
     }
 
@@ -520,11 +542,17 @@ mod tests {
                 .unwrap();
             }
         });
-        let plex = Plex::new(&format!("http://{address}"), "test-secret", "integration").unwrap();
-        let sections = [("1", "movie"), ("2", "show")].map(|(key, kind)| Section {
-            key: key.into(),
+        let plex = Plex::new(
+            &format!("http://{address}"),
+            "test-secret",
+            "integration",
+            false,
+        )
+        .unwrap();
+        let sections = [("1", Kind::Movie), ("2", Kind::Series)].map(|(id, kind)| Library {
+            id: id.into(),
             title: String::new(),
-            kind: kind.into(),
+            kind,
         });
         let titles: Vec<_> = plex
             .recently_released(&sections)

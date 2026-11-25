@@ -56,6 +56,10 @@ For a development connection to your own server, `PLEX_URL` and `PLEX_TOKEN` ove
 
 The screenshot tests exercise egui layout and interaction. Use a Windows app build for testing native video output, hardware decoding and actual Plex sign-in.
 
+### Media source plugins
+
+The Perfuse library exposes `media::MediaSource` and shared types for libraries, items, versions and playback progress. The compiled-in Plex plugin in `src/plugins/plex/` translates Plex responses into those types and supplies authenticated direct-play requests. Plugin registration lives in `src/plugins/mod.rs`.
+
 ## Package a release
 
 Build the release executable first, then use Inno Setup 6.7.3 with the version from `Cargo.toml`. The installer is written to `dist`.

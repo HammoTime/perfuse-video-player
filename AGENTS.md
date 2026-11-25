@@ -4,7 +4,7 @@
 
 - Perfuse is a small, open-source **native Windows desktop client**, written in Rust. Plex is the first server integration.
 - Deliver a runnable native Windows `.exe`.
-- Keep the feature set and architecture simple. Reuse established playback components; do not implement codecs, an audio clock, or a general media-server abstraction speculatively.
+- Keep the feature set and architecture simple. Reuse established playback components. Plex is a compiled-in plugin backed by the shared Rust media interface.
 - Playback must stay **inside Perfuse**, using native libmpv/FFmpeg. Do not restore the previous external `mpv.exe` process, separate player window, or JSON IPC implementation.
 - The user requested **at least five minutes of read-ahead**. The current configuration targets 300 seconds with a disk-backed packet cache. Preserve it unless explicitly changing caching behavior.
 - The user explicitly asked to stop spending time testing the five-minute cache and leave practical playback/cache evaluation to them. Do not run the optional cache integration check or add cache benchmarks by default. Run focused checks when needed for an actual reported fault.
@@ -17,8 +17,9 @@
 | --- | --- |
 | `src/main.rs` | eframe/egui native app, library navigation, search, artwork textures, details/version picker, embedded video layout and controls |
 | `src/ui_tests.rs` | Headless egui_kittest tests of the real app loop: login interaction, bounds and offscreen image comparisons |
-| `src/plex.rs` | Blocking reqwest Plex client, JSON models, pagination, metadata, artwork, URL/header validation, playback timeline updates |
-| `src/auth.rs` | Plex browser PIN sign-in, cancellable polling and validated account server discovery |
+| `src/lib.rs`, `src/media.rs` | Shared media source interface and library, item, version and playback types |
+| `src/plugins/plex/mod.rs` | Plex client implementation, API response mapping, pagination, artwork, URL and header validation, and playback timeline updates |
+| `src/plugins/plex/auth.rs` | Plex browser PIN sign-in, cancellable polling and validated account server discovery |
 | `src/session.rs` | Windows Credential Manager session storage, restore and removal; no plaintext token files |
 | `src/player.rs` | Playback worker, controls/events, libmpv configuration, buffering, resume, progress reporting and shutdown |
 | `src/icons.rs` | Bundled `assets/` SVG icons (embedded in the exe, `currentColor` rendered white then tinted); rasterised app window icon and the large taskbar icon from the exe resource |

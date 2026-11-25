@@ -1,7 +1,7 @@
 //! Non-sensitive UI preferences (such as sidebar library ordering).
 //! Never stores tokens, credentials, or raw server URLs.
 
-use crate::plex::Section;
+use perfuse::media::{Kind, Library};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -111,7 +111,7 @@ pub fn save_library_order(server: &str, order: &LibraryOrder) {
 }
 
 /// Applies the chosen library sort or custom drag order to Plex's raw section list.
-pub fn apply_library_order(server_sections: &[Section], order: &LibraryOrder) -> Vec<Section> {
+pub fn apply_library_order(server_sections: &[Library], order: &LibraryOrder) -> Vec<Library> {
     let mut result = server_sections.to_vec();
     match order.sort {
         LibrarySort::Server => result,
@@ -121,7 +121,7 @@ pub fn apply_library_order(server_sections: &[Section], order: &LibraryOrder) ->
                     .to_lowercase()
                     .cmp(&b.title.to_lowercase())
                     .then_with(|| a.title.cmp(&b.title))
-                    .then_with(|| a.key.cmp(&b.key))
+                    .then_with(|| a.id.cmp(&b.id))
             });
             result
         }
@@ -131,22 +131,22 @@ pub fn apply_library_order(server_sections: &[Section], order: &LibraryOrder) ->
                     .to_lowercase()
                     .cmp(&a.title.to_lowercase())
                     .then_with(|| b.title.cmp(&a.title))
-                    .then_with(|| a.key.cmp(&b.key))
+                    .then_with(|| a.id.cmp(&b.id))
             });
             result
         }
         LibrarySort::TypeThenName => {
             result.sort_by(|a, b| {
-                let rank = |kind: &str| match kind {
-                    "movie" => 0,
-                    "show" => 1,
+                let rank = |kind: Kind| match kind {
+                    Kind::Movie => 0,
+                    Kind::Series => 1,
                     _ => 2,
                 };
-                rank(&a.kind)
-                    .cmp(&rank(&b.kind))
+                rank(a.kind)
+                    .cmp(&rank(b.kind))
                     .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
                     .then_with(|| a.title.cmp(&b.title))
-                    .then_with(|| a.key.cmp(&b.key))
+                    .then_with(|| a.id.cmp(&b.id))
             });
             result
         }
@@ -157,7 +157,7 @@ pub fn apply_library_order(server_sections: &[Section], order: &LibraryOrder) ->
                 if let Some(index) = server_sections
                     .iter()
                     .enumerate()
-                    .position(|(i, s)| !used[i] && s.key == *key)
+                    .position(|(i, s)| !used[i] && s.id == *key)
                 {
                     used[index] = true;
                     ordered.push(server_sections[index].clone());
@@ -177,27 +177,27 @@ pub fn apply_library_order(server_sections: &[Section], order: &LibraryOrder) ->
 mod tests {
     use super::*;
 
-    fn sample_sections() -> Vec<Section> {
+    fn sample_sections() -> Vec<Library> {
         vec![
-            Section {
-                key: "3".into(),
+            Library {
+                id: "3".into(),
                 title: "TV Shows".into(),
-                kind: "show".into(),
+                kind: Kind::Series,
             },
-            Section {
-                key: "1".into(),
+            Library {
+                id: "1".into(),
                 title: "Movies".into(),
-                kind: "movie".into(),
+                kind: Kind::Movie,
             },
-            Section {
-                key: "2".into(),
+            Library {
+                id: "2".into(),
                 title: "anime".into(),
-                kind: "show".into(),
+                kind: Kind::Series,
             },
-            Section {
-                key: "4".into(),
+            Library {
+                id: "4".into(),
                 title: "Documentaries".into(),
-                kind: "movie".into(),
+                kind: Kind::Movie,
             },
         ]
     }
@@ -205,7 +205,7 @@ mod tests {
     #[test]
     fn sorts_libraries_by_each_mode_and_preserves_new_sections_in_custom_order() {
         let sections = sample_sections();
-        let titles = |list: Vec<Section>| list.into_iter().map(|s| s.title).collect::<Vec<_>>();
+        let titles = |list: Vec<Library>| list.into_iter().map(|s| s.title).collect::<Vec<_>>();
 
         assert_eq!(
             titles(apply_library_order(&sections, &LibraryOrder::default())),

@@ -52,8 +52,8 @@ pub struct Login {
 }
 
 impl Login {
-    #[cfg(test)]
-    pub(crate) fn test_channel() -> (Self, mpsc::Sender<Event>) {
+    #[doc(hidden)]
+    pub fn test_channel() -> (Self, mpsc::Sender<Event>) {
         let (tx, events) = mpsc::channel();
         (
             Self {
@@ -198,7 +198,7 @@ fn decode<T: DeserializeOwned>(
             ),
         });
     }
-    let bytes = crate::plex::read_limited(response, 2 * 1024 * 1024)?;
+    let bytes = crate::http::read_limited(response, 2 * 1024 * 1024)?;
     serde_json::from_slice(&bytes)
         .map_err(|_| "Plex returned an unexpected sign-in response.".into())
 }
@@ -222,7 +222,7 @@ fn usable_servers(servers: Vec<Server>, client_id: &str) -> Vec<Server> {
             }
             let token = server.access_token.as_deref()?;
             server.connections.retain(|connection| {
-                crate::plex::Plex::new(&connection.uri, token, client_id).is_ok()
+                super::Plex::new(&connection.uri, token, client_id, false).is_ok()
             });
             // Prefer secure local connections, then secure remote connections. No endpoint probing.
             server

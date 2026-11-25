@@ -1,11 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod auth;
-mod cache;
 mod icons;
 mod mpv;
 mod player;
-mod plex;
 mod prefs;
 mod runtime;
 mod session;
@@ -17,7 +14,10 @@ mod ui_tests;
 
 use eframe::egui::{self, Color32, RichText, Vec2};
 use icons::Icon;
-use plex::{Item, Page, Plex, Section};
+use perfuse::{
+    media::{Browse, Item, Kind, Library, Page, Source, Stream},
+    plugins::plex::{self, auth},
+};
 use std::{
     collections::HashMap,
     sync::{
@@ -55,9 +55,7 @@ const RESIZE_CORNER: f32 = 12.0;
 const HOME_CARD_WIDTH: f32 = 232.0;
 
 fn main() -> eframe::Result {
-    if let Some(dir) = cache::dir() {
-        thread::spawn(move || cache::trim(&dir));
-    }
+    thread::spawn(perfuse::trim_artwork_cache);
     let mut viewport = egui::ViewportBuilder::default();
     if let Some(icon) = icons::app_icon() {
         viewport = viewport.with_icon(icon);
@@ -94,7 +92,7 @@ fn main() -> eframe::Result {
 #[derive(Clone)]
 struct Location {
     title: String,
-    path: String,
+    browse: Browse,
     search: String,
     offset: usize,
     previous_pages: Vec<usize>,
@@ -103,7 +101,7 @@ struct Location {
 }
 
 enum Reply {
-    Connected(Plex, Vec<Section>, session::Session),
+    Connected(Source, Vec<Library>, session::Session),
     /// A page plus optional Home Continue Watching and Recently Released rows.
     Page {
         page: Page,
@@ -140,9 +138,9 @@ struct App {
     server: String,
     token: String,
     client_id: String,
-    plex: Option<Plex>,
-    server_sections: Vec<Section>,
-    sections: Vec<Section>,
+    source: Option<Source>,
+    server_sections: Vec<Library>,
+    sections: Vec<Library>,
     library_order: prefs::LibraryOrder,
     dragging_section: Option<usize>,
     selected_library: Option<String>,
@@ -237,7 +235,8 @@ impl App {
         });
         let (tx, rx) = mpsc::channel();
         Self {
-            server: std::env::var("PLEX_URL").unwrap_or_else(|_| "http://localhost:32400".into()),
+            server: std::env::var("PLEX_URL")
+                .unwrap_or_else(|_| plex::PLUGIN.default_address.into()),
             token: std::env::var("PLEX_TOKEN").unwrap_or_default(),
             client_id: format!(
                 "perfuse-{}-{}",
@@ -247,7 +246,7 @@ impl App {
                     .unwrap_or_default()
                     .as_nanos()
             ),
-            plex: None,
+            source: None,
             server_sections: vec![],
             sections: vec![],
             library_order: prefs::LibraryOrder::default(),
@@ -333,6 +332,12 @@ impl App {
                 self.client_id = saved.client_id;
                 if std::env::var_os("PLEX_URL").is_none() {
                     self.server = saved.server;
+                } else if std::env::var_os("PLEX_TOKEN").is_none()
+                    && reqwest::Url::parse(self.server.trim()).ok()
+                        != reqwest::Url::parse(saved.server.trim()).ok()
+                {
+                    // Keep the saved token scoped to its original server.
+                    return;
                 }
                 if std::env::var_os("PLEX_TOKEN").is_none() {
                     self.token = saved.token;
@@ -466,26 +471,18 @@ impl App {
 
     fn connect(&mut self, ctx: &egui::Context) {
         let generation = self.begin();
-        let (server, token, id) = (
-            self.server.clone(),
-            self.token.clone(),
-            self.client_id.clone(),
-        );
+        let session = session::Session {
+            server: self.server.clone(),
+            token: self.token.clone(),
+            client_id: self.client_id.clone(),
+        };
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         thread::spawn(move || {
-            let result = Plex::new(&server, &token, &id)
-                .and_then(|plex| {
-                    plex.sections().map(|sections| {
-                        Reply::Connected(
-                            plex,
-                            sections,
-                            session::Session {
-                                server,
-                                token,
-                                client_id: id,
-                            },
-                        )
-                    })
+            let result = session::open(&session)
+                .and_then(|source| {
+                    source
+                        .libraries()
+                        .map(|sections| Reply::Connected(source, sections, session))
                 })
                 .unwrap_or_else(Reply::Failed);
             let _ = tx.send((generation, result));
@@ -494,7 +491,7 @@ impl App {
     }
 
     fn load_page(&mut self, ctx: &egui::Context, recently_added_only: bool) {
-        let (Some(plex), Some(location)) = (self.plex.clone(), self.location.clone()) else {
+        let (Some(source), Some(location)) = (self.source.clone(), self.location.clone()) else {
             return;
         };
         let generation = self.begin();
@@ -506,7 +503,9 @@ impl App {
                 .iter()
                 .chain(self.released.iter())
                 .flat_map(|item| {
-                    let art = (item.kind == "movie").then(|| item.art.clone()).flatten();
+                    let art = (item.kind == Kind::Movie)
+                        .then(|| item.art.clone())
+                        .flatten();
                     [item.thumb.clone(), art].into_iter().flatten()
                 })
                 .collect();
@@ -522,26 +521,27 @@ impl App {
         let sections = self.sections.clone();
         let (tx, ctx, current) = (self.tx.clone(), ctx.clone(), self.generation.clone());
         thread::spawn(move || {
-            match plex.browse(&location.path, &location.search, location.offset) {
+            match source.browse(&location.browse, &location.search, location.offset) {
                 Ok(page) => {
                     let mut unavailable = vec![];
-                    let home_rows =
-                        if location.path == "/library/recentlyAdded" && !recently_added_only {
-                            let on_deck = plex
-                                .browse("/library/onDeck", "", 0)
-                                .map(|page| page.items)
-                                .unwrap_or_else(|_| {
-                                    unavailable.push("Continue Watching");
-                                    vec![]
-                                });
-                            let released = plex.recently_released(&sections).unwrap_or_else(|_| {
-                                unavailable.push("Recently Released");
+                    let home_rows = if matches!(location.browse, Browse::RecentlyAdded)
+                        && !recently_added_only
+                    {
+                        let on_deck = source
+                            .browse(&Browse::ContinueWatching, "", 0)
+                            .map(|page| page.items)
+                            .unwrap_or_else(|_| {
+                                unavailable.push("Continue Watching");
                                 vec![]
                             });
-                            Some((on_deck, released))
-                        } else {
-                            None
-                        };
+                        let released = source.recently_released(&sections).unwrap_or_else(|_| {
+                            unavailable.push("Recently Released");
+                            vec![]
+                        });
+                        Some((on_deck, released))
+                    } else {
+                        None
+                    };
                     let notice = (!unavailable.is_empty()).then(|| {
                         format!("{} is unavailable from this server. You can still browse your libraries.", unavailable.join(" and "))
                     });
@@ -562,7 +562,7 @@ impl App {
                             on_deck
                                 .iter()
                                 .chain(released.iter())
-                                .filter(|item| item.kind == "movie")
+                                .filter(|item| item.kind == Kind::Movie)
                                 .filter_map(|item| item.art.clone()),
                         );
                     }
@@ -589,7 +589,7 @@ impl App {
                         return;
                     }
                     ctx.request_repaint();
-                    load_artwork(&plex, art, generation, &current, &tx, &ctx);
+                    load_artwork(&source, art, generation, &current, &tx, &ctx);
                 }
                 Err(error) => {
                     let _ = tx.send((generation, Reply::Failed(error)));
@@ -599,37 +599,25 @@ impl App {
         });
     }
 
-    fn library(&mut self, section: &Section, ctx: &egui::Context) {
-        match plex::section_path(&section.key) {
-            Ok(path) => {
-                self.selected_library = Some(section.key.clone());
-                self.history.clear();
-                self.search.clear();
-                self.location = Some(Location {
-                    title: section.title.clone(),
-                    path,
-                    search: String::new(),
-                    offset: 0,
-                    previous_pages: vec![],
-                    library: true,
-                    parent: None,
-                });
-                self.load_page(ctx, false);
-            }
-            Err(error) => self.error = Some(error),
-        }
+    fn library(&mut self, section: &Library, ctx: &egui::Context) {
+        self.selected_library = Some(section.id.clone());
+        self.history.clear();
+        self.search.clear();
+        self.location = Some(Location {
+            title: section.title.clone(),
+            browse: Browse::Library(section.clone()),
+            search: String::new(),
+            offset: 0,
+            previous_pages: vec![],
+            library: true,
+            parent: None,
+        });
+        self.load_page(ctx, false);
     }
 
     fn open_item(&mut self, item: &Item, ctx: &egui::Context) {
-        let path = match plex::metadata_path(&item.rating_key) {
-            Ok(path) => path,
-            Err(error) => {
-                self.error = Some(error);
-                return;
-            }
-        };
         if item.playable() {
-            let Some(plex) = self.plex.clone() else {
+            let Some(source) = self.source.clone() else {
                 return;
             };
             let generation = self.begin();
@@ -637,11 +625,11 @@ impl App {
             let (tx, ctx, id, current) = (
                 self.tx.clone(),
                 ctx.clone(),
-                item.rating_key.clone(),
+                item.id.clone(),
                 self.generation.clone(),
             );
             thread::spawn(move || {
-                match plex.metadata(&id) {
+                match source.item(&id) {
                     Ok(item) => {
                         let art: Vec<_> = [item.art.clone(), item.thumb.clone()]
                             .into_iter()
@@ -649,7 +637,7 @@ impl App {
                             .collect();
                         let _ = tx.send((generation, Reply::Details(item)));
                         ctx.request_repaint();
-                        load_artwork(&plex, art, generation, &current, &tx, &ctx);
+                        load_artwork(&source, art, generation, &current, &tx, &ctx);
                     }
                     Err(error) => {
                         let _ = tx.send((generation, Reply::Failed(error)));
@@ -657,14 +645,14 @@ impl App {
                 }
                 ctx.request_repaint();
             });
-        } else if matches!(item.kind.as_str(), "show" | "season") {
+        } else if matches!(item.kind, Kind::Series | Kind::Season) {
             if let Some(location) = self.location.take() {
                 self.history.push(location);
             }
             self.search.clear();
             self.location = Some(Location {
                 title: item.title.clone(),
-                path: format!("{path}/children"),
+                browse: Browse::Children(item.id.clone()),
                 search: String::new(),
                 offset: 0,
                 previous_pages: vec![],
@@ -714,7 +702,7 @@ impl App {
                 continue;
             }
             match reply {
-                Reply::Connected(plex, sections, session) => {
+                Reply::Connected(source, sections, session) => {
                     self.busy = false;
                     let save_error = if self.remember {
                         match session::save(&session) {
@@ -730,7 +718,7 @@ impl App {
                     self.server = session.server;
                     self.token = session.token;
                     self.client_id = session.client_id;
-                    self.plex = Some(plex);
+                    self.source = Some(source);
                     self.server_sections = sections;
                     self.library_order = prefs::load_library_order(&self.server);
                     self.sections =
@@ -1009,7 +997,7 @@ impl App {
         self.connection_open = false;
         self.location = Some(Location {
             title: "Home".into(),
-            path: "/library/recentlyAdded".into(),
+            browse: Browse::RecentlyAdded,
             search: String::new(),
             offset: 0,
             previous_pages: vec![],
@@ -1070,7 +1058,7 @@ impl App {
         let section = self.sections.remove(from);
         self.sections.insert(to, section);
         self.library_order.sort = prefs::LibrarySort::Custom;
-        self.library_order.custom_keys = self.sections.iter().map(|s| s.key.clone()).collect();
+        self.library_order.custom_keys = self.sections.iter().map(|s| s.id.clone()).collect();
         prefs::save_library_order(&self.server, &self.library_order);
     }
 
@@ -1257,7 +1245,7 @@ impl App {
                         }
                     });
                     let mut pending_move: Option<(usize, usize)> = None;
-                    let mut open_section: Option<Section> = None;
+                    let mut open_section: Option<Library> = None;
                     let can_reorder = self.sections.len() > 1;
                     let section_count = self.sections.len();
                     egui::ScrollArea::vertical()
@@ -1267,8 +1255,8 @@ impl App {
                             let mut row_rects = Vec::with_capacity(section_count);
                             for (index, section) in self.sections.iter().enumerate() {
                                 let selected = !self.connection_open
-                                    && self.selected_library.as_ref() == Some(&section.key);
-                                let icon = if section.kind == "show" {
+                                    && self.selected_library.as_ref() == Some(&section.id);
+                                let icon = if section.kind == Kind::Series {
                                     Icon::TvShows
                                 } else {
                                     Icon::Movies
@@ -1694,8 +1682,8 @@ impl App {
                                 .color(MUTED),
                         );
                     }
-                    let episodes =
-                        !page.items.is_empty() && page.items.iter().all(|i| i.kind == "episode");
+                    let episodes = !page.items.is_empty()
+                        && page.items.iter().all(|i| i.kind == Kind::Episode);
                     if episodes {
                         for item in &page.items {
                             egui::Frame::new()
@@ -1796,8 +1784,8 @@ impl App {
                 hero(ui, &item, &self.covers, "ORIGINAL QUALITY");
                 ui.add_space(28.0);
                 ui.horizontal_wrapped(|ui| {
-                    if !item.media.is_empty() {
-                        let offset = item.view_offset.unwrap_or(0);
+                    if !item.versions.is_empty() {
+                        let offset = item.resume_ms.unwrap_or(0);
                         let (resume, restart) = Pill::pair(
                             ui,
                             if offset > 0 {
@@ -1831,11 +1819,11 @@ impl App {
                     } else {
                         ui.label("No media file is available for this item.");
                     }
-                    if item.view_count > 0 {
+                    if item.watched {
                         badge(ui, Icon::Watched, "Watched", GREEN);
                     }
                 });
-                if let (Some(offset), Some(duration)) = (item.view_offset, item.duration)
+                if let (Some(offset), Some(duration)) = (item.resume_ms, item.duration_ms)
                     && offset > 0
                     && duration > 0
                 {
@@ -1865,12 +1853,12 @@ impl App {
                     .inner_margin(28)
                     .show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
-                        if !item.media.is_empty() {
-                            self.version = self.version.min(item.media.len() - 1);
+                        if !item.versions.is_empty() {
+                            self.version = self.version.min(item.versions.len() - 1);
                             egui::ComboBox::from_label("Version")
-                                .selected_text(item.media[self.version].label())
+                                .selected_text(item.versions[self.version].label())
                                 .show_ui(ui, |ui| {
-                                    for (index, media) in item.media.iter().enumerate() {
+                                    for (index, media) in item.versions.iter().enumerate() {
                                         ui.selectable_value(
                                             &mut self.version,
                                             index,
@@ -1879,7 +1867,7 @@ impl App {
                                     }
                                 });
                             ui.separator();
-                            let media = &item.media[self.version];
+                            let media = &item.versions[self.version];
                             info_row(
                                 ui,
                                 "Video",
@@ -1895,7 +1883,7 @@ impl App {
                                 "Container",
                                 media.container.as_deref().unwrap_or("Not provided"),
                             );
-                            if media.parts.len() != 1 {
+                            if matches!(media.stream, Stream::Multipart) {
                                 ui.colored_label(
                                     ACCENT,
                                     "This version has multiple parts and cannot be played yet.",
@@ -1929,7 +1917,7 @@ impl App {
         if self.runtime_rx.is_some() {
             return;
         }
-        let (Some(item), Some(plex)) = (self.detail.clone(), self.plex.clone()) else {
+        let (Some(item), Some(source)) = (self.detail.clone(), self.source.clone()) else {
             return;
         };
         if self.player.is_some() {
@@ -1944,18 +1932,18 @@ impl App {
         };
         self.playing_title = item.title.clone();
         self.playing_format = item
-            .media
+            .versions
             .get(self.version)
             .map(|m| m.label())
             .unwrap_or_default();
         self.playing_seconds = if self.resume {
-            item.view_offset.unwrap_or(0) as f64 / 1000.0
+            item.resume_ms.unwrap_or(0) as f64 / 1000.0
         } else {
             0.0
         };
         self.paused = false;
         self.speed = 1.0;
-        self.playing_duration = item.duration.unwrap_or(0) as f64 / 1000.0;
+        self.playing_duration = item.duration_ms.unwrap_or(0) as f64 / 1000.0;
         self.buffered = 0.0;
         self.seek_position = None;
         self.notice = None;
@@ -1964,7 +1952,7 @@ impl App {
         self.overlay_hovered = false;
         self.player = Some(player::Player::start(
             Some(surface.id()),
-            plex,
+            source,
             item,
             self.version,
             self.resume,
@@ -2036,7 +2024,7 @@ impl App {
             ui.add_space(24.0);
             if ui.add_enabled(!self.busy, Pill::secondary(Icon::SignOut, "Sign out & forget this device")).clicked() && self.forget_saved() {
                 self.generation.fetch_add(1, Ordering::Relaxed);
-                self.plex = None;
+                self.source = None;
                 self.token.clear();
                 self.server_sections.clear();
                 self.sections.clear();
@@ -2726,7 +2714,7 @@ impl eframe::App for App {
         if !self.fullscreen && !mini {
             self.titlebar(ctx);
         }
-        if self.plex.is_some() && self.player.is_none() {
+        if self.source.is_some() && self.player.is_none() {
             self.sidebar(ctx);
         }
         if !mini && (self.error.is_some() || self.notice.is_some() || self.runtime_status.is_some())
@@ -2777,7 +2765,7 @@ impl eframe::App for App {
                 surface.reclaim_keyboard();
             }
             self.playback_controls(ctx, mini);
-        } else if self.plex.is_some()
+        } else if self.source.is_some()
             && !self.connection_open
             && self.detail.is_none()
             && (self.page.as_ref().is_some_and(Page::has_next)
@@ -2821,14 +2809,14 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
-                    .fill(if self.plex.is_some() {
+                    .fill(if self.source.is_some() {
                         Color32::from_rgb(13, 13, 16)
                     } else {
                         Color32::BLACK
                     })
                     .inner_margin(if self.player.is_some() {
                         egui::Margin::ZERO
-                    } else if self.plex.is_some() {
+                    } else if self.source.is_some() {
                         egui::Margin::symmetric(48, 38)
                     } else {
                         egui::Margin::same(20)
@@ -2838,7 +2826,7 @@ impl eframe::App for App {
                 if self.player.is_some() {
                     let rect = ui.available_rect_before_wrap();
                     ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
-                } else if self.plex.is_none() {
+                } else if self.source.is_none() {
                     // Short windows tighten the card so discovered servers stay in view.
                     let roomy = ui.available_height() > 640.0;
                     let space =
@@ -2908,7 +2896,7 @@ impl eframe::App for App {
 /// Sends cached artwork straight away, then fetches the rest from the server.
 /// The worker stops as soon as navigation starts a newer generation.
 fn load_artwork(
-    plex: &Plex,
+    source: &Source,
     paths: Vec<String>,
     generation: u64,
     current: &AtomicU64,
@@ -2926,7 +2914,7 @@ fn load_artwork(
         if current.load(Ordering::Relaxed) != generation {
             return;
         }
-        match plex.cached_artwork(&path) {
+        match source.cached_artwork(&path) {
             Some(image) => {
                 if !send(path, image) {
                     return;
@@ -2939,7 +2927,7 @@ fn load_artwork(
         if current.load(Ordering::Relaxed) != generation {
             return;
         }
-        if let Ok(image) = plex.artwork(&path)
+        if let Ok(image) = source.artwork(&path)
             && !send(path, image)
         {
             return;
@@ -3462,7 +3450,7 @@ fn info_row(ui: &mut egui::Ui, label: &str, value: &str) {
 }
 
 fn cover(ui: &mut egui::Ui, item: &Item, covers: &Artwork, size: Vec2) -> egui::Response {
-    let path = if size.x > size.y && item.kind == "movie" {
+    let path = if size.x > size.y && item.kind == Kind::Movie {
         item.art
             .as_ref()
             .filter(|path| covers.contains(path))
@@ -3524,7 +3512,7 @@ fn continue_card(ui: &mut egui::Ui, item: &Item, covers: &Artwork) -> bool {
         clicked |= response
             .on_hover_text(format!("Resume {}", item.title))
             .clicked();
-        if let (Some(offset), Some(duration)) = (item.view_offset, item.duration)
+        if let (Some(offset), Some(duration)) = (item.resume_ms, item.duration_ms)
             && duration > 0
         {
             let track = egui::Rect::from_min_size(
@@ -3553,13 +3541,13 @@ fn continue_card(ui: &mut egui::Ui, item: &Item, covers: &Artwork) -> bool {
             )
             .clicked();
         let subtitle = item
-            .duration
+            .duration_ms
             .map(|duration| {
                 format!(
                     "{}  ·  {} min left",
                     item.subtitle(),
                     duration
-                        .saturating_sub(item.view_offset.unwrap_or(0))
+                        .saturating_sub(item.resume_ms.unwrap_or(0))
                         .div_ceil(60_000)
                 )
             })
@@ -3584,11 +3572,7 @@ fn released_card(ui: &mut egui::Ui, item: &Item, covers: &Artwork) -> bool {
                     .wrap_mode(egui::TextWrapMode::Truncate),
             )
             .clicked();
-        let subtitle = match item
-            .originally_available_at
-            .as_deref()
-            .and_then(release_date)
-        {
+        let subtitle = match item.release_date.as_deref().and_then(release_date) {
             Some(date) => format!("{}  ·  {date}", item.subtitle()),
             None => item.subtitle(),
         };
@@ -3618,7 +3602,7 @@ fn poster(ui: &mut egui::Ui, item: &Item, covers: &Artwork, width: f32) -> bool 
         let rect = response.rect;
         clicked |= response.on_hover_text(&item.title).clicked();
         if let Some(resolution) = item
-            .media
+            .versions
             .first()
             .and_then(|m| m.video_resolution.as_deref())
         {
@@ -3635,7 +3619,7 @@ fn poster(ui: &mut egui::Ui, item: &Item, covers: &Artwork, width: f32) -> bool 
             ui.painter()
                 .galley(badge.min + Vec2::new(4.0, 3.0), galley, Color32::WHITE);
         }
-        if let (Some(offset), Some(duration)) = (item.view_offset, item.duration)
+        if let (Some(offset), Some(duration)) = (item.resume_ms, item.duration_ms)
             && offset > 0
             && duration > 0
         {
@@ -3657,7 +3641,7 @@ fn poster(ui: &mut egui::Ui, item: &Item, covers: &Artwork, width: f32) -> bool 
                 ACCENT,
             );
         }
-        if item.view_count > 0 {
+        if item.watched {
             let center = rect.left_top() + Vec2::splat(18.0);
             // The icon's check is cut out, so give it a dark backing on bright art.
             ui.painter()
@@ -3731,13 +3715,13 @@ fn hero(ui: &mut egui::Ui, item: &Item, covers: &Artwork, eyebrow: &str) {
                 RichText::new(format!(
                     "{}{}",
                     item.subtitle(),
-                    item.duration
+                    item.duration_ms
                         .map(|d| format!(" · {} min", d / 60_000))
                         .unwrap_or_default()
                 ))
                 .color(MUTED),
             );
-            if let Some(media) = item.media.first() {
+            if let Some(media) = item.versions.first() {
                 ui.label(RichText::new(media.label()).size(12.0).strong());
             }
             ui.add_space(8.0);
@@ -3852,16 +3836,16 @@ mod tests {
         let mut app = App::new(&ctx);
         let item = Item {
             title: "A long title that needs to wrap in a narrow window".into(),
-            kind: "movie".into(),
+            kind: Kind::Movie,
             summary: "A synopsis for checking the responsive native layout. ".repeat(8),
-            duration: Some(7_200_000),
-            view_offset: Some(600_000),
+            duration_ms: Some(7_200_000),
+            resume_ms: Some(600_000),
             ..Default::default()
         };
-        app.sections.push(Section {
-            key: "1".into(),
+        app.sections.push(Library {
+            id: "1".into(),
             title: "Movies".into(),
-            kind: "movie".into(),
+            kind: Kind::Movie,
         });
         app.selected_library = Some("1".into());
         app.page = Some(Page {

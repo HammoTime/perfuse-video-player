@@ -2,12 +2,70 @@
 //! named by a hash of the server origin and artwork path (never the token),
 //! and are trimmed oldest-first when the folder grows past its limit.
 
+use reqwest::blocking::RequestBuilder;
 use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
     time::SystemTime,
 };
+
+pub struct Artwork {
+    dir: Option<PathBuf>,
+}
+
+impl Artwork {
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            dir: if enabled { dir() } else { None },
+        }
+    }
+
+    pub fn cached(&self, server: &str, path: &str) -> Option<image::RgbaImage> {
+        let dir = self.dir.as_deref()?;
+        let bytes = read(dir, server, path)?;
+        let image = decode(&bytes);
+        if image.is_err() {
+            remove(dir, server, path);
+        }
+        image.ok()
+    }
+
+    pub fn fetch(
+        &self,
+        server: &str,
+        path: &str,
+        request: RequestBuilder,
+    ) -> Result<image::RgbaImage, String> {
+        let response = request
+            .send()
+            .map_err(|_| "Artwork unavailable.".to_owned())?;
+        if !response.status().is_success() {
+            return Err("Artwork unavailable.".into());
+        }
+        let bytes = crate::http::read_limited(response, 8 * 1024 * 1024)?;
+        let image = decode(&bytes)?;
+        if let Some(dir) = &self.dir {
+            write(dir, server, path, &bytes);
+        }
+        Ok(image)
+    }
+}
+
+fn decode(bytes: &[u8]) -> Result<image::RgbaImage, String> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|_| "Unknown artwork format.".to_owned())?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(2048);
+    limits.max_image_height = Some(2048);
+    limits.max_alloc = Some(32 * 1024 * 1024);
+    reader.limits(limits);
+    reader
+        .decode()
+        .map(|image| image.into_rgba8())
+        .map_err(|_| "Cannot decode artwork.".to_owned())
+}
 
 const LIMIT_BYTES: u64 = 512 * 1024 * 1024;
 const TRIM_TO_BYTES: u64 = 384 * 1024 * 1024;

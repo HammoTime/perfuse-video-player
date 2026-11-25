@@ -1,21 +1,12 @@
 //! The complete session lives in Windows Credential Manager, never a plaintext file.
-use serde::{Deserialize, Serialize};
+pub use perfuse::plugins::Credentials as Session;
+use perfuse::{media::Source, plugins::plex};
 
-// Deliberately no Debug: this structure contains the Plex token.
-#[derive(Deserialize, Serialize)]
-pub struct Session {
-    pub server: String,
-    pub token: String,
-    pub client_id: String,
-}
-
-impl Session {
-    fn validate(&self) -> Result<(), String> {
-        if self.client_id.is_empty() || self.client_id.len() > 200 {
-            return Err("The saved device identifier is invalid. Sign in again.".into());
-        }
-        crate::plex::Plex::new(&self.server, &self.token, &self.client_id).map(|_| ())
+pub fn open(session: &Session) -> Result<Source, String> {
+    if session.client_id.is_empty() || session.client_id.len() > 200 {
+        return Err("The saved device identifier is invalid. Sign in again.".into());
     }
+    (plex::PLUGIN.open)(session, !cfg!(test))
 }
 
 #[cfg(windows)]
@@ -78,12 +69,12 @@ mod windows {
         // SAFETY: free exactly the allocation returned by CredReadW, after copying its data.
         unsafe { CredFree(credential.cast()) };
         let session = result?;
-        session.validate()?;
+        super::open(&session)?;
         Ok(Some(session))
     }
 
     fn write(target: &str, session: &Session) -> Result<(), String> {
-        session.validate()?;
+        super::open(session)?;
         let mut bytes = serde_json::to_vec(session)
             .map_err(|_| "Could not prepare the saved sign-in.".to_owned())?;
         if bytes.len() > CRED_MAX_CREDENTIAL_BLOB_SIZE as usize {
@@ -167,7 +158,7 @@ pub fn load() -> Result<Option<Session>, String> {
 }
 #[cfg(not(windows))]
 pub fn save(session: &Session) -> Result<(), String> {
-    session.validate()?;
+    open(session)?;
     Err("Saved sign-in currently requires Windows Credential Manager.".into())
 }
 #[cfg(not(windows))]
@@ -186,11 +177,11 @@ mod tests {
             token: "synthetic".into(),
             client_id: "perfuse-test".into(),
         };
-        assert!(session.validate().is_ok());
+        assert!(open(&session).is_ok());
         session.server = "https://user:password@example.test/?token=secret".into();
-        assert!(session.validate().is_err());
+        assert!(open(&session).is_err());
         session.server = "https://plex.example.test".into();
         session.token = "bad\r\nHeader: injected".into();
-        assert!(session.validate().is_err());
+        assert!(open(&session).is_err());
     }
 }

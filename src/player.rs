@@ -1,7 +1,5 @@
-use crate::{
-    mpv::{self, Mpv},
-    plex::{Item, Plex},
-};
+use crate::mpv::{self, Mpv};
+use perfuse::media::{Item, MediaSource, PlaybackState, Progress, Source};
 use std::{
     sync::mpsc::{self, Receiver, Sender},
     thread,
@@ -52,7 +50,7 @@ impl Player {
     // A window ID is required for product playback; None is a headless integration test.
     pub fn start(
         window: Option<u64>,
-        plex: Plex,
+        source: Source,
         item: Item,
         version: usize,
         resume: bool,
@@ -60,7 +58,15 @@ impl Player {
         let (control, receiver) = mpsc::channel();
         let (tx, events) = mpsc::channel();
         let worker = thread::spawn(move || {
-            let result = play(window, &plex, &item, version, resume, &receiver, &tx);
+            let result = play(
+                window,
+                source.as_ref(),
+                &item,
+                version,
+                resume,
+                &receiver,
+                &tx,
+            );
             crate::runtime::cleanup();
             let _ = tx.send(Event::Finished(result));
         });
@@ -114,6 +120,7 @@ fn configure(mpv: &Mpv, window: Option<u64>) -> Result<(), String> {
         ("hwdec", "auto-safe"),
         ("tls-verify", "yes"),
         ("network-timeout", "15"),
+        ("stream-lavf-o", "max_redirects=0"),
         ("access-references", "no"),
         ("ytdl", "no"),
         ("input-default-bindings", "no"),
@@ -144,53 +151,40 @@ fn configure(mpv: &Mpv, window: Option<u64>) -> Result<(), String> {
 
 fn play(
     window: Option<u64>,
-    plex: &Plex,
+    source: &dyn MediaSource,
     item: &Item,
     version: usize,
     resume: bool,
     control: &Receiver<Control>,
     events: &Sender<Event>,
 ) -> Result<(), String> {
-    let media = item
-        .media
+    let version = item
+        .versions
         .get(version)
         .ok_or("No playable version is available.")?;
-    if media.parts.len() != 1 {
-        return Err("Multipart titles are not supported yet. Choose a single-file version.".into());
-    }
-    let key = media.parts[0]
-        .key
-        .as_deref()
-        .ok_or("Plex did not provide a direct-play file.")?;
-    let url = plex.url(key)?;
-    if !url.path().starts_with("/library/parts/") {
-        return Err("Plex did not return a library media file.".into());
-    }
+    let playback = source.playback(item, version)?;
     let mpv = Mpv::new()?;
     configure(&mpv, window)?;
-    // Append a single header without comma-list parsing; never put the token in a URL.
+    // Append each header without comma-list parsing or putting tokens in the URL.
     mpv.set("http-header-fields", "")?;
-    mpv.command(&[
-        "change-list",
-        "http-header-fields",
-        "append",
-        &plex.player_header(),
-    ])?;
+    for header in &playback.headers {
+        mpv.command(&["change-list", "http-header-fields", "append", header])?;
+    }
     let start = if resume {
-        item.view_offset.unwrap_or(0) as f64 / 1000.0
+        item.resume_ms.unwrap_or(0) as f64 / 1000.0
     } else {
         0.0
     };
     mpv.command(&[
         "loadfile",
-        url.as_str(),
+        playback.url.as_str(),
         "replace",
         "-1",
         &format!("start={start}"),
     ])?;
 
     let mut seconds = start;
-    let mut duration = item.duration.unwrap_or(0) as f64 / 1000.0;
+    let mut duration = item.duration_ms.unwrap_or(0) as f64 / 1000.0;
     let mut paused = false;
     let mut loaded = false;
     let mut last_report = Instant::now();
@@ -198,6 +192,17 @@ fn play(
     let started = Instant::now();
     let mut result = Ok(());
     let mut warned = false;
+    let report = |state, seconds, duration| {
+        source.report(
+            item,
+            version,
+            Progress {
+                state,
+                position_ms: milliseconds(seconds),
+                duration_ms: milliseconds(duration),
+            },
+        )
+    };
     'playback: loop {
         while let Ok(command) = control.try_recv() {
             let request = match command {
@@ -255,16 +260,12 @@ fn play(
             break;
         }
         if loaded && last_report.elapsed() >= Duration::from_secs(10) {
-            if plex
-                .timeline(
-                    &item.rating_key,
-                    if paused { "paused" } else { "playing" },
-                    milliseconds(seconds),
-                    milliseconds(duration),
-                )
-                .is_err()
-                && !warned
-            {
+            let state = if paused {
+                PlaybackState::Paused
+            } else {
+                PlaybackState::Playing
+            };
+            if report(state, seconds, duration).is_err() && !warned {
                 let _ = events.send(Event::Warning(
                     "Playback continues, but progress could not be saved to Plex.".into(),
                 ));
@@ -274,16 +275,7 @@ fn play(
         }
     }
     drop(mpv);
-    if loaded
-        && plex
-            .timeline(
-                &item.rating_key,
-                "stopped",
-                milliseconds(seconds),
-                milliseconds(duration),
-            )
-            .is_err()
-    {
+    if loaded && report(PlaybackState::Stopped, seconds, duration).is_err() {
         let _ = events.send(Event::Warning(
             "Playback stopped, but the final progress update could not reach Plex.".into(),
         ));
@@ -323,9 +315,18 @@ mod tests {
         );
         assert_eq!(engine.get("options/cache-on-disk").as_deref(), Some("yes"));
         drop(engine);
-        let plex = Plex::new("http://127.0.0.1:32499", "demo", "perfuse-embedded-test").unwrap();
-        let item = plex.metadata("200").unwrap();
-        let player = Player::start(None, plex.clone(), item, 0, false);
+        use perfuse::plugins::{Credentials, plex::PLUGIN};
+        let source = (PLUGIN.open)(
+            &Credentials {
+                server: "http://127.0.0.1:32499".into(),
+                token: "demo".into(),
+                client_id: "perfuse-embedded-test".into(),
+            },
+            false,
+        )
+        .unwrap();
+        let item = source.item("200").unwrap();
+        let player = Player::start(None, source.clone(), item, 0, false);
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut cache_ready = false;
         loop {
@@ -357,10 +358,10 @@ mod tests {
             cache_ready,
             "five minutes of media was not actually buffered"
         );
-        let resumed = plex.metadata("200").unwrap();
-        let saved = resumed.view_offset.unwrap() as f64 / 1000.0;
+        let resumed = source.item("200").unwrap();
+        let saved = resumed.resume_ms.unwrap() as f64 / 1000.0;
         assert!(saved >= 2.0);
-        let player = Player::start(None, plex.clone(), resumed, 0, true);
+        let player = Player::start(None, source.clone(), resumed, 0, true);
         loop {
             assert!(Instant::now() < deadline, "resume timed out");
             match player.events.recv_timeout(Duration::from_secs(10)).unwrap() {
@@ -371,6 +372,6 @@ mod tests {
             }
         }
         drop(player);
-        assert!(plex.metadata("200").unwrap().view_offset.unwrap() as f64 > saved * 1000.0);
+        assert!(source.item("200").unwrap().resume_ms.unwrap() as f64 > saved * 1000.0);
     }
 }

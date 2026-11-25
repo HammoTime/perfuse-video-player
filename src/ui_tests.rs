@@ -4,6 +4,7 @@ use egui_kittest::{
     Harness,
     kittest::{NodeT, Queryable},
 };
+use perfuse::media::{PAGE_SIZE, Version};
 
 fn login(size: [f32; 2]) -> Harness<'static, App> {
     app_harness(size, 0.25)
@@ -260,22 +261,31 @@ fn library_art(index: usize, [width, height]: [usize; 2]) -> egui::ColorImage {
     egui::ColorImage::new([width, height], pixels)
 }
 
+fn fixture_source(server: &str) -> Source {
+    session::open(&session::Session {
+        server: server.into(),
+        token: "synthetic".into(),
+        client_id: "ui-test".into(),
+    })
+    .unwrap()
+}
+
 // Review the real library without network requests, credentials or desktop windows.
 fn library(size: [f32; 2], screen: &str) -> Harness<'static, App> {
     let mut harness = app_harness(size, 0.25);
     let ctx = harness.ctx.clone();
     let app = harness.state_mut();
-    app.plex = Some(Plex::new("http://127.0.0.1:32499", "synthetic", "ui-test").unwrap());
+    app.source = Some(fixture_source("http://127.0.0.1:32499"));
     app.sections = vec![
-        Section {
-            key: "1".into(),
+        Library {
+            id: "1".into(),
             title: "Movies".into(),
-            kind: "movie".into(),
+            kind: Kind::Movie,
         },
-        Section {
-            key: "2".into(),
+        Library {
+            id: "2".into(),
             title: "TV Shows".into(),
-            kind: "show".into(),
+            kind: Kind::Series,
         },
     ];
     let titles = [
@@ -299,12 +309,17 @@ fn library(size: [f32; 2], screen: &str) -> Harness<'static, App> {
         app.covers.insert(path.clone(), ctx.load_texture(&path, library_art(index, [160, 240]), Default::default()));
         app.covers.insert(art.clone(), ctx.load_texture(&art, library_art(index, [320, 180]), Default::default()));
         Item {
-            rating_key: (index + 1).to_string(), title: (*title).into(), kind: "movie".into(),
+            id: (index + 1).to_string(), title: (*title).into(), kind: Kind::Movie,
             year: Some(2020 + index as u32 % 6), thumb: Some(path), art: Some(art),
             summary: "A journey along a forgotten coastline brings two strangers together, and changes the way they see the world.".into(),
-            duration: Some(7_200_000), view_offset: (index < 3).then_some(1_200_000 + index as u64 * 900_000),
-            view_count: u32::from(index == 5),
-            media: vec![plex::Media { video_resolution: Some("4k".into()), video_codec: Some("hevc".into()), ..Default::default() }],
+            duration_ms: Some(7_200_000), resume_ms: (index < 3).then_some(1_200_000 + index as u64 * 900_000),
+            watched: index == 5,
+            versions: vec![Version {
+                video_resolution: Some("4k".into()),
+                video_codec: Some("hevc".into()),
+                stream: Stream::Multipart,
+                ..Default::default()
+            }],
             ..Default::default()
         }
     }).collect();
@@ -312,12 +327,11 @@ fn library(size: [f32; 2], screen: &str) -> Harness<'static, App> {
     app.selected_library = (!home).then(|| "1".into());
     app.location = Some(Location {
         title: if home { "Home" } else { "Movies" }.into(),
-        path: if home {
-            "/library/recentlyAdded"
+        browse: if home {
+            Browse::RecentlyAdded
         } else {
-            "/library/sections/1/all"
-        }
-        .into(),
+            Browse::Library(app.sections[0].clone())
+        },
         search: String::new(),
         offset: 0,
         previous_pages: vec![],
@@ -342,8 +356,8 @@ fn library(size: [f32; 2], screen: &str) -> Harness<'static, App> {
             app.selected_library = Some("2".into());
             app.location.as_mut().unwrap().title = "TV Shows".into();
             for item in &mut app.page.as_mut().unwrap().items {
-                item.kind = "show".into();
-                item.media.clear();
+                item.kind = Kind::Series;
+                item.versions.clear();
             }
         }
         "empty" => app.page.as_mut().unwrap().items.clear(),
@@ -360,9 +374,9 @@ fn library(size: [f32; 2], screen: &str) -> Harness<'static, App> {
             location.library = false;
             location.parent = Some(parent);
             for (index, item) in app.page.as_mut().unwrap().items.iter_mut().enumerate() {
-                item.kind = "episode".into();
-                item.grandparent_title = Some("The Quiet Earth".into());
-                item.parent_index = Some(1);
+                item.kind = Kind::Episode;
+                item.series_title = Some("The Quiet Earth".into());
+                item.season_number = Some(1);
                 item.index = Some(index as u32 + 1);
             }
         }
@@ -738,7 +752,7 @@ fn cancelled_and_failed_login_can_be_retried() {
     harness.state_mut().login = Some(pending);
     events
         .send(auth::Event::Browser(
-            "https://app.plex.tv/auth#?code=synthetic".into(),
+            "https://app.source.tv/auth#?code=synthetic".into(),
         ))
         .unwrap();
     harness.run_steps(2);
@@ -841,7 +855,7 @@ fn login_snapshots() {
                 let (pending, _events) = auth::Login::test_channel();
                 harness.state_mut().login = Some(pending);
                 harness.state_mut().login_url =
-                    Some("https://app.plex.tv/auth#?code=synthetic".into());
+                    Some("https://app.source.tv/auth#?code=synthetic".into());
             }
             "login-expired" => {
                 harness.state_mut().error =
@@ -858,12 +872,11 @@ fn login_snapshots() {
             }
             "login-settings" | "login-libraries" => {
                 let app = harness.state_mut();
-                app.plex =
-                    Some(Plex::new("http://127.0.0.1:32499", "synthetic", "ui-test").unwrap());
-                app.sections.push(Section {
-                    key: "1".into(),
+                app.source = Some(fixture_source("http://127.0.0.1:32499"));
+                app.sections.push(Library {
+                    id: "1".into(),
                     title: "Movies".into(),
-                    kind: "movie".into(),
+                    kind: Kind::Movie,
                 });
                 app.connection_open = true;
                 app.runtime_installed.libraries = runtime_versions_fixture();
@@ -1082,20 +1095,20 @@ fn always_on_top_toggle_and_mini_player_shows_only_play_button() {
 fn sidebar_libraries_can_be_sorted_and_reordered() {
     let mut harness = library([1000.0, 700.0], "home");
     let sections = vec![
-        Section {
-            key: "3".into(),
+        Library {
+            id: "3".into(),
             title: "TV Shows".into(),
-            kind: "show".into(),
+            kind: Kind::Series,
         },
-        Section {
-            key: "1".into(),
+        Library {
+            id: "1".into(),
             title: "Movies".into(),
-            kind: "movie".into(),
+            kind: Kind::Movie,
         },
-        Section {
-            key: "2".into(),
+        Library {
+            id: "2".into(),
             title: "Anime".into(),
-            kind: "show".into(),
+            kind: Kind::Series,
         },
     ];
     harness.state_mut().server_sections = sections.clone();
@@ -1293,16 +1306,16 @@ fn home_pagination_only_changes_recently_added_and_carousels_scroll_with_arrows(
     {
         let items = harness.state().page.as_ref().unwrap().items.clone();
         let app = harness.state_mut();
-        app.plex = Some(Plex::new(&format!("http://{address}"), "synthetic", "ui-test").unwrap());
+        app.source = Some(fixture_source(&format!("http://{address}")));
         app.home_loaded = true;
         app.on_deck = items[..2].to_vec();
         app.released = items[2..4].to_vec();
         let mut page_one = Vec::new();
-        for index in 0..plex::PAGE_SIZE {
+        for index in 0..PAGE_SIZE {
             page_one.push(Item {
-                rating_key: (index + 1).to_string(),
+                id: (index + 1).to_string(),
                 title: format!("Page One Item {}", index + 1),
-                kind: "movie".into(),
+                kind: Kind::Movie,
                 ..Default::default()
             });
         }
