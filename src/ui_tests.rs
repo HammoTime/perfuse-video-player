@@ -898,3 +898,434 @@ fn login_snapshots() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+#[test]
+fn window_edges_and_corners_resize_unless_maximized_or_fullscreen() {
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1000.0, 700.0));
+    assert_eq!(
+        resize_direction(rect, egui::pos2(2.0, 2.0), true),
+        Some(egui::ResizeDirection::NorthWest)
+    );
+    assert_eq!(
+        resize_direction(rect, egui::pos2(998.0, 2.0), true),
+        Some(egui::ResizeDirection::NorthEast)
+    );
+    assert_eq!(
+        resize_direction(rect, egui::pos2(2.0, 698.0), true),
+        Some(egui::ResizeDirection::SouthWest)
+    );
+    assert_eq!(
+        resize_direction(rect, egui::pos2(998.0, 698.0), true),
+        Some(egui::ResizeDirection::SouthEast)
+    );
+    assert_eq!(
+        resize_direction(rect, egui::pos2(500.0, 2.0), true),
+        Some(egui::ResizeDirection::North)
+    );
+    assert_eq!(resize_direction(rect, egui::pos2(500.0, 2.0), false), None);
+    assert_eq!(
+        resize_direction(rect, egui::pos2(2.0, 2.0), false),
+        Some(egui::ResizeDirection::West)
+    );
+    assert_eq!(
+        resize_direction(rect, egui::pos2(500.0, 698.0), true),
+        Some(egui::ResizeDirection::South)
+    );
+    assert_eq!(
+        resize_direction(rect, egui::pos2(2.0, 350.0), true),
+        Some(egui::ResizeDirection::West)
+    );
+    assert_eq!(
+        resize_direction(rect, egui::pos2(998.0, 350.0), true),
+        Some(egui::ResizeDirection::East)
+    );
+    assert_eq!(resize_direction(rect, egui::pos2(500.0, 350.0), true), None);
+
+    let mut harness = login([1000.0, 700.0]);
+    harness.run_steps(2);
+    for (pos, expected_dir, expected_cursor) in [
+        (
+            egui::pos2(2.0, 350.0),
+            egui::ResizeDirection::West,
+            egui::CursorIcon::ResizeHorizontal,
+        ),
+        (
+            egui::pos2(998.0, 698.0),
+            egui::ResizeDirection::SouthEast,
+            egui::CursorIcon::ResizeNwSe,
+        ),
+        (
+            egui::pos2(500.0, 2.0),
+            egui::ResizeDirection::North,
+            egui::CursorIcon::ResizeVertical,
+        ),
+    ] {
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::PointerMoved(pos));
+        harness.step();
+        assert_eq!(
+            harness.output().platform_output.cursor_icon,
+            expected_cursor
+        );
+        harness.input_mut().events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+        let commands = &harness.output().viewport_output[&egui::ViewportId::ROOT].commands;
+        assert!(
+            commands.iter().any(
+                |c| matches!(c, egui::ViewportCommand::BeginResize(dir) if *dir == expected_dir)
+            ),
+            "expected BeginResize({expected_dir:?}) at {pos:?}, got {commands:?}"
+        );
+        harness.input_mut().events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+    }
+
+    // Fullscreen windows must not emit resize commands on edge presses.
+    harness.state_mut().fullscreen = true;
+    let pos = egui::pos2(2.0, 350.0);
+    harness
+        .input_mut()
+        .events
+        .push(egui::Event::PointerMoved(pos));
+    harness.input_mut().events.push(egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: egui::Modifiers::NONE,
+    });
+    harness.step();
+    let commands = &harness.output().viewport_output[&egui::ViewportId::ROOT].commands;
+    assert!(
+        !commands
+            .iter()
+            .any(|c| matches!(c, egui::ViewportCommand::BeginResize(_)))
+    );
+}
+
+#[test]
+fn always_on_top_toggle_and_mini_player_shows_only_play_button() {
+    let mut harness = playback([860.0, 620.0]);
+    harness.run_steps(3);
+    assert!(!harness.state().always_on_top);
+    harness.get_by_label("Always on top").click();
+    harness.step();
+    assert!(harness.state().always_on_top);
+    let commands = &harness.output().viewport_output[&egui::ViewportId::ROOT].commands;
+    assert!(commands.iter().any(|c| matches!(
+        c,
+        egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop)
+    )));
+    harness.run_steps(2);
+    harness.get_by_label("Disable always on top").click();
+    harness.step();
+    assert!(!harness.state().always_on_top);
+    let commands = &harness.output().viewport_output[&egui::ViewportId::ROOT].commands;
+    assert!(commands.iter().any(|c| matches!(
+        c,
+        egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal)
+    )));
+
+    // Compact picture-in-picture size shows only the Play/Pause button.
+    for size in [[320.0, 180.0], [240.0, 135.0]] {
+        let mut harness = playback(size);
+        harness.run_steps(3);
+        let screen = harness.ctx.content_rect();
+        let pause = harness.get_by_label("Pause").rect();
+        assert!(screen.contains_rect(pause), "Pause is clipped at {size:?}");
+        for hidden in [
+            "Back 10s",
+            "Forward 10s",
+            "Fullscreen",
+            "Audio track",
+            "Subtitles",
+            "Previous chapter",
+            "Next chapter",
+            "Volume",
+            "Always on top",
+            "Close window",
+            "Minimize",
+            "Maximize",
+        ] {
+            assert!(
+                harness.query_by_label(hidden).is_none(),
+                "{hidden} should be hidden at {size:?}"
+            );
+        }
+        harness.state_mut().paused = true;
+        harness.run_steps(2);
+        let play = harness.get_by_label("Play").rect();
+        assert!(screen.contains_rect(play), "Play is clipped at {size:?}");
+        assert!(harness.query_by_label("Pause").is_none());
+
+        // Growing back restores the titlebar and full playback controls.
+        harness.set_size(Vec2::new(860.0, 620.0));
+        harness.run_steps(3);
+        assert!(harness.query_by_label("Back 10s").is_some());
+        assert!(harness.query_by_label("Fullscreen").is_some());
+        assert!(harness.query_by_label("Always on top").is_some());
+    }
+}
+
+#[test]
+fn sidebar_libraries_can_be_sorted_and_reordered() {
+    let mut harness = library([1000.0, 700.0], "home");
+    let sections = vec![
+        Section {
+            key: "3".into(),
+            title: "TV Shows".into(),
+            kind: "show".into(),
+        },
+        Section {
+            key: "1".into(),
+            title: "Movies".into(),
+            kind: "movie".into(),
+        },
+        Section {
+            key: "2".into(),
+            title: "Anime".into(),
+            kind: "show".into(),
+        },
+    ];
+    harness.state_mut().server_sections = sections.clone();
+    harness.state_mut().sections = sections;
+    harness.run_steps(3);
+
+    let order = |harness: &Harness<'_, App>| -> Vec<String> {
+        harness
+            .state()
+            .sections
+            .iter()
+            .map(|s| s.title.clone())
+            .collect()
+    };
+
+    harness.get_by_label("Sort libraries").click();
+    harness.run_steps(2);
+    harness.get_by_label("Name (A–Z)").click();
+    harness.run_steps(2);
+    assert_eq!(order(&harness), ["Anime", "Movies", "TV Shows"]);
+    let anime_y = harness.get_by_label("Anime").rect().center().y;
+    let movies_y = harness.get_by_label("Movies").rect().center().y;
+    let tv_y = harness.get_by_label("TV Shows").rect().center().y;
+    assert!(anime_y < movies_y && movies_y < tv_y);
+
+    harness.get_by_label("Sort libraries").click();
+    harness.run_steps(2);
+    harness.get_by_label("Name (Z–A)").click();
+    harness.run_steps(2);
+    assert_eq!(order(&harness), ["TV Shows", "Movies", "Anime"]);
+
+    harness.get_by_label("Sort libraries").click();
+    harness.run_steps(2);
+    harness.get_by_label("Movies, then TV").click();
+    harness.run_steps(2);
+    assert_eq!(order(&harness), ["Movies", "Anime", "TV Shows"]);
+
+    harness.get_by_label("Sort libraries").click();
+    harness.run_steps(2);
+    harness.get_by_label("Server order").click();
+    harness.run_steps(2);
+    assert_eq!(order(&harness), ["TV Shows", "Movies", "Anime"]);
+
+    // Drag the last library ("Anime") to the top of the list.
+    let from = harness.get_by_label("Anime").rect().center();
+    let to = egui::pos2(from.x, harness.get_by_label("TV Shows").rect().top() + 2.0);
+    harness
+        .input_mut()
+        .events
+        .push(egui::Event::PointerMoved(from));
+    harness.input_mut().events.push(egui::Event::PointerButton {
+        pos: from,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: egui::Modifiers::NONE,
+    });
+    harness.step();
+    harness
+        .input_mut()
+        .events
+        .push(egui::Event::PointerMoved(to));
+    harness.run_steps(2);
+    harness.input_mut().events.push(egui::Event::PointerButton {
+        pos: to,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: egui::Modifiers::NONE,
+    });
+    harness.run_steps(2);
+    assert_eq!(order(&harness), ["Anime", "TV Shows", "Movies"]);
+    assert_eq!(
+        harness.state().library_order.sort,
+        prefs::LibrarySort::Custom
+    );
+}
+
+#[test]
+fn home_pagination_only_changes_recently_added_and_carousels_scroll_with_arrows() {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    // Horizontal arrows scroll Continue Watching and Recently Released.
+    let mut harness = library([860.0, 620.0], "home");
+    {
+        let items = harness.state().page.as_ref().unwrap().items.clone();
+        let app = harness.state_mut();
+        app.home_loaded = true;
+        app.on_deck = items[..5].to_vec();
+        app.released = items[5..10].to_vec();
+    }
+    harness.run_steps(4);
+    assert!(
+        harness
+            .get_by_label("Scroll Continue Watching back")
+            .accesskit_node()
+            .is_disabled()
+    );
+    assert!(
+        !harness
+            .get_by_label("Scroll Continue Watching forward")
+            .accesskit_node()
+            .is_disabled()
+    );
+    harness
+        .get_by_label("Scroll Continue Watching forward")
+        .click();
+    harness.run_steps(20);
+    assert!(harness.state().carousel_offsets["continue"].0 > 100.0);
+    assert!(
+        !harness
+            .get_by_label("Scroll Continue Watching back")
+            .accesskit_node()
+            .is_disabled()
+    );
+    harness
+        .get_by_label("Scroll Continue Watching back")
+        .click();
+    harness.run_steps(20);
+    assert!(harness.state().carousel_offsets["continue"].0 < 1.0);
+
+    harness
+        .get_by_label("Scroll Recently Released forward")
+        .click();
+    harness.run_steps(20);
+    assert!(harness.state().carousel_offsets["released"].0 > 100.0);
+
+    // Next page on Home only requests and updates Recently Added.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let seen = requests.clone();
+    let server = thread::spawn(move || {
+        for expected_start in ["36", "0"] {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                assert_eq!(stream.read(&mut byte).unwrap(), 1);
+                request.push(byte[0]);
+            }
+            let text = String::from_utf8(request).unwrap().to_lowercase();
+            assert!(
+                text.starts_with("get /library/recentlyadded "),
+                "unexpected request during Home pagination: {text}"
+            );
+            assert!(
+                text.contains(&format!("x-plex-container-start: {expected_start}\r\n")),
+                "expected offset {expected_start} in {text}"
+            );
+            seen.fetch_add(1, Ordering::Relaxed);
+            let body = if expected_start == "36" {
+                r#"{"MediaContainer":{"offset":36,"totalSize":38,"Metadata":[{"ratingKey":"37","title":"Page Two Film","type":"movie","year":2026},{"ratingKey":"38","title":"Second Page Encore","type":"movie","year":2026}]}}"#
+            } else {
+                r#"{"MediaContainer":{"offset":0,"totalSize":38,"Metadata":[{"ratingKey":"1","title":"Page One Film","type":"movie","year":2025}]}}"#
+            };
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        }
+    });
+
+    let mut harness = library([1440.0, 900.0], "home");
+    {
+        let items = harness.state().page.as_ref().unwrap().items.clone();
+        let app = harness.state_mut();
+        app.plex = Some(Plex::new(&format!("http://{address}"), "synthetic", "ui-test").unwrap());
+        app.home_loaded = true;
+        app.on_deck = items[..2].to_vec();
+        app.released = items[2..4].to_vec();
+        let mut page_one = Vec::new();
+        for index in 0..plex::PAGE_SIZE {
+            page_one.push(Item {
+                rating_key: (index + 1).to_string(),
+                title: format!("Page One Item {}", index + 1),
+                kind: "movie".into(),
+                ..Default::default()
+            });
+        }
+        app.page = Some(Page {
+            items: page_one,
+            offset: 0,
+            total: Some(38),
+        });
+    }
+    let deck_art = harness.state().on_deck[0].thumb.clone().unwrap();
+    let released_art = harness.state().released[0].thumb.clone().unwrap();
+    harness.run_steps(3);
+
+    harness.get_by_label("Next page").click();
+    for _ in 0..100 {
+        harness.step();
+        if !harness.state().busy {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!harness.state().busy);
+    assert_eq!(harness.state().page.as_ref().unwrap().offset, 36);
+    assert_eq!(harness.state().on_deck.len(), 2);
+    assert_eq!(harness.state().released.len(), 2);
+    assert!(harness.state().covers.contains(&deck_art));
+    assert!(harness.state().covers.contains(&released_art));
+    assert!(harness.query_by_label("Continue Watching").is_some());
+    assert!(harness.query_by_label("Recently Released").is_some());
+    assert!(harness.query_by_label("Page Two Film").is_some());
+
+    harness.get_by_label("Previous Recently Added page").click();
+    for _ in 0..100 {
+        harness.step();
+        if !harness.state().busy {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!harness.state().busy);
+    assert_eq!(harness.state().page.as_ref().unwrap().offset, 0);
+    assert!(harness.query_by_label("Continue Watching").is_some());
+    assert!(harness.query_by_label("Page One Film").is_some());
+    assert_eq!(requests.load(Ordering::Relaxed), 2);
+    server.join().unwrap();
+}

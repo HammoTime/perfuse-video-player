@@ -61,7 +61,7 @@ The screenshot tests exercise egui layout and interaction. Use a Windows app bui
 Build the release executable first, then use Inno Setup 6.7.3 with the version from `Cargo.toml`. The installer is written to `dist`.
 
 ```powershell
-ISCC.exe /DPerfuseVersion=0.2.0 installer/perfuse.iss
+ISCC.exe /DPerfuseVersion=0.3.0 installer/perfuse.iss
 ```
 
 The **Release Perfuse** workflow builds the x64 MSVC executable and publishes the installer to GitHub Releases. Push a supported version tag to release that exact version, or run the workflow on a branch and select **normal**, **alpha** or **beta**. Leave the commit field blank to release the branch tip. Stable releases must point to a commit on `main` or `master`.

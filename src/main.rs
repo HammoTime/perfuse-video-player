@@ -6,6 +6,7 @@ mod icons;
 mod mpv;
 mod player;
 mod plex;
+mod prefs;
 mod runtime;
 mod session;
 mod updates;
@@ -45,6 +46,13 @@ const FULLSCREEN_CONTROLS_SECONDS: f64 = 2.0;
 const FULLSCREEN_REVEAL_SECONDS: f64 = 1.0;
 // Allow for the native video's 200ms pointer sampling cadence.
 const FULLSCREEN_MOTION_GAP_SECONDS: f64 = 0.35;
+const MIN_BROWSE_SIZE: Vec2 = Vec2::new(860.0, 620.0);
+const MIN_PLAYBACK_SIZE: Vec2 = Vec2::new(240.0, 135.0);
+const MINI_PLAYER_WIDTH: f32 = 540.0;
+const MINI_PLAYER_HEIGHT: f32 = 380.0;
+const RESIZE_BORDER: f32 = 6.0;
+const RESIZE_CORNER: f32 = 12.0;
+const HOME_CARD_WIDTH: f32 = 232.0;
 
 fn main() -> eframe::Result {
     if let Some(dir) = cache::dir() {
@@ -59,7 +67,7 @@ fn main() -> eframe::Result {
         eframe::NativeOptions {
             viewport: viewport
                 .with_inner_size([1440.0, 900.0])
-                .with_min_inner_size([860.0, 620.0])
+                .with_min_inner_size(MIN_BROWSE_SIZE)
                 .with_decorations(false)
                 // Only the controls viewport is transparent. The default GL
                 // config still has 8 alpha bits for that viewport's rendering.
@@ -96,8 +104,12 @@ struct Location {
 
 enum Reply {
     Connected(Plex, Vec<Section>, session::Session),
-    /// A page plus Home's Continue Watching and Recently Released rows.
-    Page(Page, Vec<Item>, Vec<Item>, Option<String>),
+    /// A page plus optional Home Continue Watching and Recently Released rows.
+    Page {
+        page: Page,
+        home_rows: Option<(Vec<Item>, Vec<Item>)>,
+        notice: Option<String>,
+    },
     Details(Item),
     Cover(String, egui::ColorImage),
     ArtworkDone,
@@ -129,14 +141,19 @@ struct App {
     token: String,
     client_id: String,
     plex: Option<Plex>,
+    server_sections: Vec<Section>,
     sections: Vec<Section>,
+    library_order: prefs::LibraryOrder,
+    dragging_section: Option<usize>,
     selected_library: Option<String>,
     location: Option<Location>,
     history: Vec<Location>,
     search: String,
     page: Option<Page>,
+    home_loaded: bool,
     on_deck: Vec<Item>,
     released: Vec<Item>,
+    carousel_offsets: HashMap<&'static str, (f32, f32)>,
     covers: Artwork,
     detail: Option<Item>,
     version: usize,
@@ -157,6 +174,9 @@ struct App {
     volume: f64,
     seek_position: Option<f64>,
     fullscreen: bool,
+    always_on_top: bool,
+    overlay_focused: bool,
+    overlay_hovered: bool,
     last_playback_interaction: f64,
     video_pointer: Option<(i32, i32)>,
     reveal_motion: Option<(f64, f64)>,
@@ -228,14 +248,19 @@ impl App {
                     .as_nanos()
             ),
             plex: None,
+            server_sections: vec![],
             sections: vec![],
+            library_order: prefs::LibraryOrder::default(),
+            dragging_section: None,
             selected_library: None,
             location: None,
             history: vec![],
             search: String::new(),
             page: None,
+            home_loaded: false,
             on_deck: vec![],
             released: vec![],
+            carousel_offsets: HashMap::new(),
             covers: Artwork::default(),
             detail: None,
             version: 0,
@@ -256,6 +281,9 @@ impl App {
             volume: 100.0,
             seek_position: None,
             fullscreen: false,
+            always_on_top: false,
+            overlay_focused: true,
+            overlay_hovered: false,
             last_playback_interaction: 0.0,
             video_pointer: None,
             reveal_motion: None,
@@ -465,57 +493,79 @@ impl App {
         });
     }
 
-    fn load_page(&mut self, ctx: &egui::Context) {
+    fn load_page(&mut self, ctx: &egui::Context, recently_added_only: bool) {
         let (Some(plex), Some(location)) = (self.plex.clone(), self.location.clone()) else {
             return;
         };
         let generation = self.begin();
         self.page = None;
-        self.covers.clear();
-        self.covers.loading = true;
         self.detail = None;
-        self.on_deck.clear();
-        self.released.clear();
+        if recently_added_only {
+            let keep: std::collections::HashSet<String> = self
+                .on_deck
+                .iter()
+                .chain(self.released.iter())
+                .flat_map(|item| {
+                    let art = (item.kind == "movie").then(|| item.art.clone()).flatten();
+                    [item.thumb.clone(), art].into_iter().flatten()
+                })
+                .collect();
+            self.covers.retain(&keep);
+        } else {
+            self.covers.clear();
+            self.home_loaded = false;
+            self.on_deck.clear();
+            self.released.clear();
+            self.carousel_offsets.clear();
+        }
+        self.covers.loading = true;
         let sections = self.sections.clone();
         let (tx, ctx, current) = (self.tx.clone(), ctx.clone(), self.generation.clone());
         thread::spawn(move || {
             match plex.browse(&location.path, &location.search, location.offset) {
                 Ok(page) => {
                     let mut unavailable = vec![];
-                    let (on_deck, released) = if location.path == "/library/recentlyAdded" {
-                        let on_deck = plex
-                            .browse("/library/onDeck", "", 0)
-                            .map(|page| page.items)
-                            .unwrap_or_else(|_| {
-                                unavailable.push("Continue Watching");
+                    let home_rows =
+                        if location.path == "/library/recentlyAdded" && !recently_added_only {
+                            let on_deck = plex
+                                .browse("/library/onDeck", "", 0)
+                                .map(|page| page.items)
+                                .unwrap_or_else(|_| {
+                                    unavailable.push("Continue Watching");
+                                    vec![]
+                                });
+                            let released = plex.recently_released(&sections).unwrap_or_else(|_| {
+                                unavailable.push("Recently Released");
                                 vec![]
                             });
-                        let released = plex.recently_released(&sections).unwrap_or_else(|_| {
-                            unavailable.push("Recently Released");
-                            vec![]
-                        });
-                        (on_deck, released)
-                    } else {
-                        (vec![], vec![])
-                    };
+                            Some((on_deck, released))
+                        } else {
+                            None
+                        };
                     let notice = (!unavailable.is_empty()).then(|| {
                         format!("{} is unavailable from this server. You can still browse your libraries.", unavailable.join(" and "))
                     });
                     let mut art: Vec<_> = page
                         .items
                         .iter()
-                        .chain(on_deck.iter())
-                        .chain(released.iter())
                         .filter_map(|item| item.thumb.clone())
                         .collect();
-                    // Landscape Home cards prefer movie backdrops.
-                    art.extend(
-                        on_deck
-                            .iter()
-                            .chain(released.iter())
-                            .filter(|item| item.kind == "movie")
-                            .filter_map(|item| item.art.clone()),
-                    );
+                    if let Some((on_deck, released)) = &home_rows {
+                        art.extend(
+                            on_deck
+                                .iter()
+                                .chain(released.iter())
+                                .filter_map(|item| item.thumb.clone()),
+                        );
+                        // Landscape Home cards prefer movie backdrops.
+                        art.extend(
+                            on_deck
+                                .iter()
+                                .chain(released.iter())
+                                .filter(|item| item.kind == "movie")
+                                .filter_map(|item| item.art.clone()),
+                        );
+                    }
                     if let Some(parent) = &location.parent {
                         art.extend(
                             [parent.thumb.clone(), parent.art.clone()]
@@ -526,7 +576,14 @@ impl App {
                     let mut seen = std::collections::HashSet::new();
                     art.retain(|path| seen.insert(path.clone()));
                     if tx
-                        .send((generation, Reply::Page(page, on_deck, released, notice)))
+                        .send((
+                            generation,
+                            Reply::Page {
+                                page,
+                                home_rows,
+                                notice,
+                            },
+                        ))
                         .is_err()
                     {
                         return;
@@ -557,7 +614,7 @@ impl App {
                     library: true,
                     parent: None,
                 });
-                self.load_page(ctx);
+                self.load_page(ctx, false);
             }
             Err(error) => self.error = Some(error),
         }
@@ -614,7 +671,7 @@ impl App {
                 library: false,
                 parent: Some(item.clone()),
             });
-            self.load_page(ctx);
+            self.load_page(ctx, false);
         }
     }
 
@@ -674,9 +731,15 @@ impl App {
                     self.token = session.token;
                     self.client_id = session.client_id;
                     self.plex = Some(plex);
-                    self.sections = sections;
+                    self.server_sections = sections;
+                    self.library_order = prefs::load_library_order(&self.server);
+                    self.sections =
+                        prefs::apply_library_order(&self.server_sections, &self.library_order);
+                    self.dragging_section = None;
                     self.location = None;
                     self.page = None;
+                    self.home_loaded = false;
+                    self.carousel_offsets.clear();
                     self.covers.clear();
                     self.detail = None;
                     self.selected_library = None;
@@ -690,15 +753,24 @@ impl App {
                         self.error = Some(error);
                     }
                 }
-                Reply::Page(page, on_deck, released, notice) => {
+                Reply::Page {
+                    page,
+                    home_rows,
+                    notice,
+                } => {
                     self.busy = false;
                     if let Some(location) = &mut self.location {
                         location.offset = page.offset;
                     }
                     self.page = Some(page);
-                    self.on_deck = on_deck;
-                    self.released = released;
-                    self.notice = notice;
+                    if let Some((on_deck, released)) = home_rows {
+                        self.home_loaded = true;
+                        self.on_deck = on_deck;
+                        self.released = released;
+                        self.notice = notice;
+                    } else if self.selected_library.is_some() {
+                        self.notice = notice;
+                    }
                 }
                 Reply::Details(item) => {
                     self.busy = false;
@@ -798,6 +870,16 @@ impl App {
         if let Some(result) = finished {
             self.player = None;
             self.surface = None;
+            self.overlay_focused = true;
+            self.overlay_hovered = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(MIN_BROWSE_SIZE));
+            let size = ctx.content_rect().size();
+            if size.x < MIN_BROWSE_SIZE.x || size.y < MIN_BROWSE_SIZE.y {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(
+                    size.x.max(MIN_BROWSE_SIZE.x),
+                    size.y.max(MIN_BROWSE_SIZE.y),
+                )));
+            }
             if self.fullscreen {
                 self.fullscreen = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
@@ -934,7 +1016,7 @@ impl App {
             library: false,
             parent: None,
         });
-        self.load_page(ctx);
+        self.load_page(ctx, false);
     }
 
     fn back(&mut self, ctx: &egui::Context) {
@@ -945,8 +1027,66 @@ impl App {
         } else if let Some(location) = self.history.pop() {
             self.search = location.search.clone();
             self.location = Some(location);
-            self.load_page(ctx);
+            self.load_page(ctx, false);
         }
+    }
+
+    fn set_always_on_top(&mut self, ctx: &egui::Context, enabled: bool) {
+        self.always_on_top = enabled;
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::WindowLevel(if enabled {
+                egui::WindowLevel::AlwaysOnTop
+            } else {
+                egui::WindowLevel::Normal
+            }),
+        );
+    }
+
+    fn is_mini_player(&self, ctx: &egui::Context) -> bool {
+        if self.player.is_none() || self.fullscreen {
+            return false;
+        }
+        let size = ctx.content_rect().size();
+        size.x < MINI_PLAYER_WIDTH || size.y < MINI_PLAYER_HEIGHT
+    }
+
+    fn set_library_sort(&mut self, sort: prefs::LibrarySort) {
+        if self.server_sections.is_empty() && !self.sections.is_empty() {
+            self.server_sections = self.sections.clone();
+        }
+        self.library_order.sort = sort;
+        self.sections = prefs::apply_library_order(&self.server_sections, &self.library_order);
+        prefs::save_library_order(&self.server, &self.library_order);
+    }
+
+    fn move_section(&mut self, from: usize, to: usize) {
+        if from >= self.sections.len() || to >= self.sections.len() || from == to {
+            return;
+        }
+        if self.server_sections.is_empty() {
+            self.server_sections = self.sections.clone();
+        }
+        let section = self.sections.remove(from);
+        self.sections.insert(to, section);
+        self.library_order.sort = prefs::LibrarySort::Custom;
+        self.library_order.custom_keys = self.sections.iter().map(|s| s.key.clone()).collect();
+        prefs::save_library_order(&self.server, &self.library_order);
+    }
+
+    fn page_previous(&mut self, ctx: &egui::Context) {
+        if let Some(location) = &mut self.location {
+            location.offset = location.previous_pages.pop().unwrap_or(0);
+        }
+        self.load_page(ctx, self.selected_library.is_none());
+    }
+
+    fn page_next(&mut self, ctx: &egui::Context) {
+        if let (Some(location), Some(page)) = (&mut self.location, &self.page) {
+            location.previous_pages.push(location.offset);
+            location.offset = page.offset + page.items.len();
+        }
+        self.load_page(ctx, self.selected_library.is_none());
     }
 
     fn titlebar(&mut self, ctx: &egui::Context) {
@@ -960,20 +1100,22 @@ impl App {
             .show(ctx, |ui| {
                 let bar = ui.max_rect();
                 let drag_rect = egui::Rect::from_min_max(
-                    bar.min + Vec2::new(84.0, 0.0),
-                    bar.max - Vec2::new(150.0, 0.0),
+                    bar.min + Vec2::new(84.0, RESIZE_BORDER),
+                    bar.max - Vec2::new(196.0, 0.0),
                 );
-                let drag = ui.interact(
-                    drag_rect,
-                    ui.id().with("drag"),
-                    egui::Sense::click_and_drag(),
-                );
-                if drag.drag_started() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                }
-                if drag.double_clicked() {
-                    let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                if drag_rect.is_positive() {
+                    let drag = ui.interact(
+                        drag_rect,
+                        ui.id().with("drag"),
+                        egui::Sense::click_and_drag(),
+                    );
+                    if drag.drag_started() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                    }
+                    if drag.double_clicked() {
+                        let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                    }
                 }
                 ui.horizontal_centered(|ui| {
                     if self.player.is_none() {
@@ -1025,6 +1167,17 @@ impl App {
                         {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                         }
+                        let pin_label = if self.always_on_top {
+                            "Disable always on top"
+                        } else {
+                            "Always on top"
+                        };
+                        if ui
+                            .add(IconButton::new(Icon::Pin, pin_label).active(self.always_on_top))
+                            .clicked()
+                        {
+                            self.set_always_on_top(ctx, !self.always_on_top);
+                        }
                     });
                 });
             });
@@ -1056,16 +1209,64 @@ impl App {
                         self.home(ctx);
                     }
                     ui.add_space(34.0);
+                    let mut requested_sort = None;
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
                         ui.add_space(SIDEBAR_ICON_INSET);
                         ui.label(RichText::new("LIBRARIES").size(12.0).strong().color(MUTED));
+                        if self.sections.len() > 1 {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let sort_btn = ui.add(
+                                        IconButton::new(Icon::Sort, "Sort libraries")
+                                            .size(24.0)
+                                            .active(
+                                                self.library_order.sort
+                                                    != prefs::LibrarySort::Server,
+                                            ),
+                                    );
+                                    egui::Popup::menu(&sort_btn).show(|ui| {
+                                        for (mode, label) in [
+                                            (prefs::LibrarySort::Server, "Server order"),
+                                            (prefs::LibrarySort::NameAsc, "Name (A–Z)"),
+                                            (prefs::LibrarySort::NameDesc, "Name (Z–A)"),
+                                            (prefs::LibrarySort::TypeThenName, "Movies, then TV"),
+                                        ] {
+                                            if ui
+                                                .selectable_label(
+                                                    self.library_order.sort == mode,
+                                                    label,
+                                                )
+                                                .clicked()
+                                            {
+                                                requested_sort = Some(mode);
+                                            }
+                                        }
+                                        if self.library_order.sort == prefs::LibrarySort::Custom {
+                                            let _ = ui.selectable_label(true, "Custom order");
+                                        }
+                                        ui.separator();
+                                        ui.label(
+                                            RichText::new("Drag libraries to reorder")
+                                                .small()
+                                                .color(MUTED),
+                                        );
+                                    });
+                                },
+                            );
+                        }
                     });
+                    let mut pending_move: Option<(usize, usize)> = None;
+                    let mut open_section: Option<Section> = None;
+                    let can_reorder = self.sections.len() > 1;
+                    let section_count = self.sections.len();
                     egui::ScrollArea::vertical()
                         .id_salt("sidebar_libraries")
                         .max_height((ui.available_height() - 180.0).max(80.0))
                         .show(ui, |ui| {
-                            for section in self.sections.clone() {
+                            let mut row_rects = Vec::with_capacity(section_count);
+                            for (index, section) in self.sections.iter().enumerate() {
                                 let selected = !self.connection_open
                                     && self.selected_library.as_ref() == Some(&section.key);
                                 let icon = if section.kind == "show" {
@@ -1073,12 +1274,116 @@ impl App {
                                 } else {
                                     Icon::Movies
                                 };
-                                if nav(ui, icon, &section.title, selected).clicked() && !self.busy {
-                                    self.connection_open = false;
-                                    self.library(&section, ctx);
+                                let dragging_this = self.dragging_section == Some(index);
+                                let response = nav_item(
+                                    ui,
+                                    icon,
+                                    &section.title,
+                                    selected,
+                                    can_reorder,
+                                    dragging_this,
+                                );
+                                row_rects.push(response.rect);
+                                if can_reorder
+                                    && response.drag_started_by(egui::PointerButton::Primary)
+                                {
+                                    self.dragging_section = Some(index);
+                                }
+                                if response.clicked()
+                                    && self.dragging_section.is_none()
+                                    && !self.busy
+                                {
+                                    open_section = Some(section.clone());
+                                }
+                                if can_reorder {
+                                    response.context_menu(|ui| {
+                                        if ui
+                                            .add_enabled(index > 0, egui::Button::new("Move up"))
+                                            .clicked()
+                                        {
+                                            pending_move = Some((index, index - 1));
+                                            ui.close();
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                index + 1 < section_count,
+                                                egui::Button::new("Move down"),
+                                            )
+                                            .clicked()
+                                        {
+                                            pending_move = Some((index, index + 1));
+                                            ui.close();
+                                        }
+                                        ui.separator();
+                                        if ui.button("Sort A–Z").clicked() {
+                                            requested_sort = Some(prefs::LibrarySort::NameAsc);
+                                            ui.close();
+                                        }
+                                        if ui.button("Sort Z–A").clicked() {
+                                            requested_sort = Some(prefs::LibrarySort::NameDesc);
+                                            ui.close();
+                                        }
+                                        if ui.button("Server order").clicked() {
+                                            requested_sort = Some(prefs::LibrarySort::Server);
+                                            ui.close();
+                                        }
+                                    });
+                                }
+                            }
+                            if let Some(from) = self.dragging_section {
+                                if from >= row_rects.len() {
+                                    self.dragging_section = None;
+                                } else {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                                    let pointer_y = ui
+                                        .ctx()
+                                        .input(|i| i.pointer.latest_pos())
+                                        .map(|p| p.y)
+                                        .unwrap_or_else(|| row_rects[from].center().y);
+                                    let drop_slot = row_rects
+                                        .iter()
+                                        .position(|rect| pointer_y < rect.center().y)
+                                        .unwrap_or(row_rects.len());
+                                    if drop_slot != from && drop_slot != from + 1 {
+                                        let y = if drop_slot == 0 {
+                                            row_rects[0].top()
+                                        } else if drop_slot == row_rects.len() {
+                                            row_rects[drop_slot - 1].bottom()
+                                        } else {
+                                            (row_rects[drop_slot - 1].bottom()
+                                                + row_rects[drop_slot].top())
+                                                * 0.5
+                                        };
+                                        ui.painter().hline(
+                                            row_rects[0].x_range(),
+                                            y,
+                                            egui::Stroke::new(2.0_f32, ACCENT),
+                                        );
+                                    }
+                                    if !ui.ctx().input(|i| i.pointer.primary_down()) {
+                                        let to = if drop_slot > from {
+                                            drop_slot - 1
+                                        } else {
+                                            drop_slot
+                                        };
+                                        if to != from {
+                                            pending_move = Some((from, to));
+                                        }
+                                        self.dragging_section = None;
+                                    }
                                 }
                             }
                         });
+                    if let Some(sort) = requested_sort {
+                        self.set_library_sort(sort);
+                    }
+                    if let Some((from, to)) = pending_move {
+                        self.move_section(from, to);
+                    }
+                    if let Some(section) = open_section {
+                        self.connection_open = false;
+                        self.library(&section, ctx);
+                    }
                     ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                         ui.add_space(4.0);
                         if nav(
@@ -1110,7 +1415,77 @@ impl App {
             location.offset = 0;
             location.previous_pages.clear();
         }
-        self.load_page(ctx);
+        self.load_page(ctx, false);
+    }
+
+    fn horizontal_carousel_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        id: &'static str,
+        heading: &str,
+        items: &[Item],
+        render_card: fn(&mut egui::Ui, &Item, &Artwork) -> bool,
+    ) -> Option<Item> {
+        let viewport = ui.available_width();
+        let spacing = ui.spacing().item_spacing.x;
+        let estimated_content = if items.is_empty() {
+            0.0
+        } else {
+            items.len() as f32 * HOME_CARD_WIDTH + (items.len() - 1) as f32 * spacing
+        };
+        let (offset_x, content_width) = self
+            .carousel_offsets
+            .get(id)
+            .copied()
+            .unwrap_or((0.0, estimated_content));
+        let max_offset = (content_width.max(estimated_content) - viewport).max(0.0);
+        let scrollable = max_offset > 1.0;
+        let mut scroll_delta = 0.0_f32;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(heading).size(22.0).strong());
+            if scrollable {
+                let pitch = HOME_CARD_WIDTH + spacing;
+                let step = (viewport / pitch).floor().max(1.0) * pitch;
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let forward_label = format!("Scroll {heading} forward");
+                    if ui
+                        .add_enabled(
+                            offset_x < max_offset - 1.0,
+                            IconButton::new(Icon::PageNext, &forward_label),
+                        )
+                        .clicked()
+                    {
+                        scroll_delta = -step.min((max_offset - offset_x).max(0.0));
+                    }
+                    let back_label = format!("Scroll {heading} back");
+                    if ui
+                        .add_enabled(
+                            offset_x > 1.0,
+                            IconButton::new(Icon::PagePrevious, &back_label),
+                        )
+                        .clicked()
+                    {
+                        scroll_delta = step.min(offset_x.max(0.0));
+                    }
+                });
+            }
+        });
+        let mut picked = None;
+        let output = egui::ScrollArea::horizontal().id_salt(id).show(ui, |ui| {
+            if scroll_delta != 0.0 {
+                ui.scroll_with_delta(Vec2::new(scroll_delta, 0.0));
+            }
+            ui.horizontal_top(|ui| {
+                for item in items {
+                    if render_card(ui, item, &self.covers) && !self.busy {
+                        picked = Some(item.clone());
+                    }
+                }
+            });
+        });
+        self.carousel_offsets
+            .insert(id, (output.state.offset.x, output.content_size.x));
+        picked
     }
 
     fn collection(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1137,7 +1512,7 @@ impl App {
                     .add_enabled(!self.busy, IconButton::new(Icon::Refresh, "Refresh"))
                     .clicked()
                 {
-                    self.load_page(ctx);
+                    self.load_page(ctx, false);
                 }
                 if self.busy {
                     ui.spinner();
@@ -1208,82 +1583,215 @@ impl App {
             return;
         }
         let mut picked = None;
-        egui::ScrollArea::vertical().id_salt(("collection", &title)).auto_shrink([false, false]).show(ui, |ui| {
-            if let Some(parent) = self.location.as_ref().and_then(|l| l.parent.as_ref()) {
-                hero(ui, parent, &self.covers, "TV LIBRARY");
-                ui.add_space(38.0);
-            }
-            if let Some(page) = &self.page {
-                if home && page.offset == 0 {
-                    ui.label(RichText::new("Continue Watching").size(22.0).strong());
+        let mut page_action: i8 = 0;
+        let show_home_rows = home
+            && (self.home_loaded
+                || self.page.is_some()
+                || !self.on_deck.is_empty()
+                || !self.released.is_empty());
+        egui::ScrollArea::vertical()
+            .id_salt(("collection", &title))
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if let Some(parent) = self.location.as_ref().and_then(|l| l.parent.as_ref()) {
+                    hero(ui, parent, &self.covers, "TV LIBRARY");
+                    ui.add_space(38.0);
+                }
+                if show_home_rows {
                     if self.on_deck.is_empty() {
-                        ui.label(RichText::new("Nothing to continue. Start a film or episode from your library.").color(MUTED));
+                        ui.label(RichText::new("Continue Watching").size(22.0).strong());
+                        ui.label(
+                            RichText::new(
+                                "Nothing to continue. Start a film or episode from your library.",
+                            )
+                            .color(MUTED),
+                        );
                     } else {
-                        egui::ScrollArea::horizontal().id_salt("continue").show(ui, |ui| {
-                            ui.horizontal_top(|ui| {
-                                for item in &self.on_deck {
-                                    if continue_card(ui, item, &self.covers) && !self.busy { picked = Some(item.clone()); }
-                                }
-                            });
-                        });
+                        let on_deck = self.on_deck.clone();
+                        if let Some(item) = self.horizontal_carousel_row(
+                            ui,
+                            "continue",
+                            "Continue Watching",
+                            &on_deck,
+                            continue_card,
+                        ) {
+                            picked = Some(item);
+                        }
                     }
                     ui.add_space(48.0);
                     if !self.released.is_empty() {
-                        ui.label(RichText::new("Recently Released").size(22.0).strong());
-                        egui::ScrollArea::horizontal().id_salt("released").show(ui, |ui| {
-                            ui.horizontal_top(|ui| {
-                                for item in &self.released {
-                                    if released_card(ui, item, &self.covers) && !self.busy { picked = Some(item.clone()); }
-                                }
-                            });
-                        });
+                        let released = self.released.clone();
+                        if let Some(item) = self.horizontal_carousel_row(
+                            ui,
+                            "released",
+                            "Recently Released",
+                            &released,
+                            released_card,
+                        ) {
+                            picked = Some(item);
+                        }
                         ui.add_space(48.0);
                     }
                 }
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(if home { "Recently Added" } else if self.location.as_ref().is_some_and(|l| !l.library) { "Seasons & Episodes" } else if self.location.as_ref().is_some_and(|l| !l.search.is_empty()) { "Search Results" } else { "All Titles" }).size(22.0).strong());
-                    if !page.items.is_empty() {
-                        ui.label(RichText::new(format!("{}–{}{}", page.offset + 1, page.offset + page.items.len(), page.total.map(|n| format!(" of {n}")).unwrap_or_default())).size(13.0).color(MUTED));
-                    }
-                });
-                ui.add_space(14.0);
-                if page.items.is_empty() {
-                    ui.add_space(34.0);
-                    ui.heading("No titles found");
-                    ui.label(RichText::new("Try another search, or choose a different library.").color(MUTED));
-                }
-                let episodes = !page.items.is_empty() && page.items.iter().all(|i| i.kind == "episode");
-                if episodes {
-                    for item in &page.items {
-                        egui::Frame::new().fill(PANEL).corner_radius(18).inner_margin(24).show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                if cover(ui, item, &self.covers, Vec2::new(112.0, 64.0)).clicked() && !self.busy { picked = Some(item.clone()); }
-                                ui.vertical(|ui| {
-                                    ui.set_width(ui.available_width());
-                                    ui.label(RichText::new(item.subtitle()).small().color(ACCENT));
-                                    if ui.add(egui::Button::new(RichText::new(&item.title).strong()).frame(false).wrap_mode(egui::TextWrapMode::Truncate)).clicked() && !self.busy { picked = Some(item.clone()); }
-                                    ui.add(egui::Label::new(RichText::new(&item.summary).small().color(MUTED)).truncate());
-                                });
-                            });
-                        });
-                    }
-                } else {
-                    let columns = ((ui.available_width() + 18.0) / 176.0).floor().max(1.0) as usize;
-                    let width = ((ui.available_width() - 18.0 * (columns - 1) as f32) / columns as f32).min(210.0);
-                    egui::Grid::new("posters").num_columns(columns).spacing([18.0, 22.0]).show(ui, |ui| {
-                        for (index, item) in page.items.iter().enumerate() {
-                            if poster(ui, item, &self.covers, width) && !self.busy { picked = Some(item.clone()); }
-                            if (index + 1) % columns == 0 { ui.end_row(); }
+                if let Some(page) = &self.page {
+                    let has_previous = self
+                        .location
+                        .as_ref()
+                        .is_some_and(|l| !l.previous_pages.is_empty());
+                    let has_next = page.has_next();
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(if home {
+                                "Recently Added"
+                            } else if self.location.as_ref().is_some_and(|l| !l.library) {
+                                "Seasons & Episodes"
+                            } else if self.location.as_ref().is_some_and(|l| !l.search.is_empty()) {
+                                "Search Results"
+                            } else {
+                                "All Titles"
+                            })
+                            .size(22.0)
+                            .strong(),
+                        );
+                        if !page.items.is_empty() {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{}–{}{}",
+                                    page.offset + 1,
+                                    page.offset + page.items.len(),
+                                    page.total.map(|n| format!(" of {n}")).unwrap_or_default()
+                                ))
+                                .size(13.0)
+                                .color(MUTED),
+                            );
+                        }
+                        if home && (has_previous || has_next) {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .add_enabled(
+                                            !self.busy && has_next,
+                                            IconButton::new(
+                                                Icon::PageNext,
+                                                "Next Recently Added page",
+                                            ),
+                                        )
+                                        .clicked()
+                                    {
+                                        page_action = 1;
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            !self.busy && has_previous,
+                                            IconButton::new(
+                                                Icon::PagePrevious,
+                                                "Previous Recently Added page",
+                                            ),
+                                        )
+                                        .clicked()
+                                    {
+                                        page_action = -1;
+                                    }
+                                },
+                            );
                         }
                     });
+                    ui.add_space(14.0);
+                    if page.items.is_empty() {
+                        ui.add_space(34.0);
+                        ui.heading("No titles found");
+                        ui.label(
+                            RichText::new("Try another search, or choose a different library.")
+                                .color(MUTED),
+                        );
+                    }
+                    let episodes =
+                        !page.items.is_empty() && page.items.iter().all(|i| i.kind == "episode");
+                    if episodes {
+                        for item in &page.items {
+                            egui::Frame::new()
+                                .fill(PANEL)
+                                .corner_radius(18)
+                                .inner_margin(24)
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        if cover(ui, item, &self.covers, Vec2::new(112.0, 64.0))
+                                            .clicked()
+                                            && !self.busy
+                                        {
+                                            picked = Some(item.clone());
+                                        }
+                                        ui.vertical(|ui| {
+                                            ui.set_width(ui.available_width());
+                                            ui.label(
+                                                RichText::new(item.subtitle())
+                                                    .small()
+                                                    .color(ACCENT),
+                                            );
+                                            if ui
+                                                .add(
+                                                    egui::Button::new(
+                                                        RichText::new(&item.title).strong(),
+                                                    )
+                                                    .frame(false)
+                                                    .wrap_mode(egui::TextWrapMode::Truncate),
+                                                )
+                                                .clicked()
+                                                && !self.busy
+                                            {
+                                                picked = Some(item.clone());
+                                            }
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(&item.summary)
+                                                        .small()
+                                                        .color(MUTED),
+                                                )
+                                                .truncate(),
+                                            );
+                                        });
+                                    });
+                                });
+                        }
+                    } else {
+                        let columns =
+                            ((ui.available_width() + 18.0) / 176.0).floor().max(1.0) as usize;
+                        let width = ((ui.available_width() - 18.0 * (columns - 1) as f32)
+                            / columns as f32)
+                            .min(210.0);
+                        egui::Grid::new("posters")
+                            .num_columns(columns)
+                            .spacing([18.0, 22.0])
+                            .show(ui, |ui| {
+                                for (index, item) in page.items.iter().enumerate() {
+                                    if poster(ui, item, &self.covers, width) && !self.busy {
+                                        picked = Some(item.clone());
+                                    }
+                                    if (index + 1) % columns == 0 {
+                                        ui.end_row();
+                                    }
+                                }
+                            });
+                    }
+                    ui.add_space(38.0);
+                } else if self.busy {
+                    if show_home_rows {
+                        ui.label(RichText::new("Recently Added").size(22.0).strong());
+                        ui.add_space(14.0);
+                        ui.label(RichText::new("Loading Recently Added…").color(MUTED));
+                    } else {
+                        ui.label(RichText::new("Loading your library…").color(MUTED));
+                    }
+                } else {
+                    ui.label("Use Refresh to try loading this page again, or select a library.");
                 }
-                ui.add_space(38.0);
-            } else if self.busy {
-                ui.label(RichText::new("Loading your library…").color(MUTED));
-            } else {
-                ui.label("Use Refresh to try loading this page again, or select a library.");
-            }
-        });
+            });
+        if page_action < 0 {
+            self.page_previous(ctx);
+        } else if page_action > 0 {
+            self.page_next(ctx);
+        }
         if let Some(item) = picked {
             self.open_item(&item, ctx);
         }
@@ -1425,7 +1933,7 @@ impl App {
         play
     }
 
-    fn start_playback(&mut self, frame: &eframe::Frame) {
+    fn start_playback(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
         if runtime::needed() {
             self.request_runtime_setup();
             return;
@@ -1464,6 +1972,8 @@ impl App {
         self.seek_position = None;
         self.notice = None;
         self.error = None;
+        self.overlay_focused = true;
+        self.overlay_hovered = false;
         self.player = Some(player::Player::start(
             Some(surface.id()),
             plex,
@@ -1473,6 +1983,7 @@ impl App {
         ));
         self.surface = Some(surface);
         self.connection_open = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(MIN_PLAYBACK_SIZE));
     }
 
     fn settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1539,10 +2050,14 @@ impl App {
                 self.generation.fetch_add(1, Ordering::Relaxed);
                 self.plex = None;
                 self.token.clear();
+                self.server_sections.clear();
                 self.sections.clear();
+                self.dragging_section = None;
                 self.page = None;
+                self.home_loaded = false;
                 self.on_deck.clear();
                 self.released.clear();
+                self.carousel_offsets.clear();
                 self.location = None;
                 self.history.clear();
                 self.selected_library = None;
@@ -1742,8 +2257,20 @@ impl App {
                 });
             (i.time, moved || native_moved, active)
         });
-        let visible =
-            !self.fullscreen || now - self.last_playback_interaction < FULLSCREEN_CONTROLS_SECONDS;
+        if !self.fullscreen {
+            self.last_playback_interaction = now;
+            self.reveal_motion = None;
+            // Unfocused always-on-top windows hide controls until hovered so
+            // picture-in-picture stays unobstructed while using other apps.
+            if self.surface.is_some() && self.always_on_top && !self.overlay_focused {
+                return self.overlay_hovered
+                    || active
+                    || egui::Popup::is_any_open(ctx)
+                    || self.runtime_prompt.is_some();
+            }
+            return true;
+        }
+        let visible = now - self.last_playback_interaction < FULLSCREEN_CONTROLS_SECONDS;
         let reveal = if visible {
             self.reveal_motion = None;
             moved
@@ -1763,19 +2290,14 @@ impl App {
             }
             false
         };
-        if !self.fullscreen
-            || reveal
-            || active
-            || egui::Popup::is_any_open(ctx)
-            || self.runtime_prompt.is_some()
-        {
+        if reveal || active || egui::Popup::is_any_open(ctx) || self.runtime_prompt.is_some() {
             self.last_playback_interaction = now;
             self.reveal_motion = None;
         }
-        !self.fullscreen || now - self.last_playback_interaction < FULLSCREEN_CONTROLS_SECONDS
+        now - self.last_playback_interaction < FULLSCREEN_CONTROLS_SECONDS
     }
 
-    fn playback_controls(&mut self, ctx: &egui::Context) {
+    fn playback_controls(&mut self, ctx: &egui::Context, mini: bool) {
         let controls_visible = self.playback_controls_visible(ctx);
         self.controls_opacity = ctx.animate_value_with_time(
             egui::Id::new("playback_controls_fade"),
@@ -1786,7 +2308,7 @@ impl App {
         let bounds = ctx.available_rect();
         if self.surface.is_none() {
             // The headless app-loop tests use the same overlay layout.
-            self.playback_overlay(ctx, bounds, opacity);
+            self.playback_overlay(ctx, bounds, opacity, mini);
         } else {
             // A native video child covers its parent's GL drawing. Use an owned,
             // transparent viewport for controls, keeping the video embedded.
@@ -1806,18 +2328,24 @@ impl App {
                     .with_inner_size(bounds.size()),
                 |overlay, class| {
                     if class == egui::ViewportClass::Embedded {
-                        self.playback_overlay(overlay, bounds, opacity);
+                        self.playback_overlay(overlay, bounds, opacity, mini);
                     } else {
-                        let ready = self
+                        let state = self
                             .surface
                             .as_ref()
-                            .is_some_and(|s| s.prepare_overlay(&title));
+                            .map(|s| s.prepare_overlay(&title))
+                            .unwrap_or_default();
+                        self.overlay_focused = state.focused;
+                        self.overlay_hovered = state.hovered;
+                        // Keep the transparent overlay mounted while always-on-top
+                        // (windowed) so hovering PiP never steals focus via ShowWindow.
+                        let keep_pip_overlay = state.topmost && !self.fullscreen;
                         overlay.send_viewport_cmd(egui::ViewportCommand::Visible(
-                            ready && opacity > 0.0,
+                            state.ready && (opacity > 0.0 || keep_pip_overlay),
                         ));
                         self.playback_controls_visible(overlay);
-                        self.playback_overlay(overlay, overlay.content_rect(), opacity);
-                        if opacity > 0.0 {
+                        self.playback_overlay(overlay, overlay.content_rect(), opacity, mini);
+                        if !mini && opacity > 0.0 {
                             self.update_notification(overlay, 82.0);
                         }
                     }
@@ -1833,10 +2361,58 @@ impl App {
         }
     }
 
-    fn playback_overlay(&mut self, ctx: &egui::Context, bounds: egui::Rect, opacity: f32) {
+    fn playback_overlay(
+        &mut self,
+        ctx: &egui::Context,
+        bounds: egui::Rect,
+        opacity: f32,
+        mini: bool,
+    ) {
         let Some(player) = &self.player else {
             return;
         };
+        if self.surface.is_some() {
+            self.handle_window_resize(ctx, egui::ViewportId::ROOT, mini);
+        }
+        if mini {
+            let drag_rect = bounds.shrink(RESIZE_BORDER);
+            if drag_rect.is_positive() {
+                egui::Area::new(egui::Id::new("mini_drag"))
+                    .order(egui::Order::Background)
+                    .movable(false)
+                    .fixed_pos(drag_rect.min)
+                    .show(ctx, |ui| {
+                        let (_, response) =
+                            ui.allocate_exact_size(drag_rect.size(), egui::Sense::drag());
+                        if response.drag_started_by(egui::PointerButton::Primary) {
+                            ctx.send_viewport_cmd_to(
+                                egui::ViewportId::ROOT,
+                                egui::ViewportCommand::StartDrag,
+                            );
+                        }
+                    });
+            }
+            if opacity > 0.0 {
+                egui::Area::new(egui::Id::new("mini_play"))
+                    .order(egui::Order::Foreground)
+                    .movable(false)
+                    .pivot(egui::Align2::CENTER_CENTER)
+                    .fixed_pos(bounds.center())
+                    .show(ctx, |ui| {
+                        ui.set_opacity(opacity);
+                        let size = (bounds.height().min(bounds.width()) * 0.32).clamp(40.0, 56.0);
+                        let (icon, label) = if self.paused {
+                            (Icon::Play, "Play")
+                        } else {
+                            (Icon::Pause, "Pause")
+                        };
+                        if ui.add(MiniPlayButton { icon, label, size }).clicked() {
+                            player.pause();
+                        }
+                    });
+            }
+            return;
+        }
         if opacity > 0.0 {
             egui::Area::new(egui::Id::new("playing_header"))
                 .order(egui::Order::Foreground)
@@ -2112,6 +2688,30 @@ impl App {
             });
         }
     }
+    fn handle_window_resize(
+        &self,
+        ctx: &egui::Context,
+        target: egui::ViewportId,
+        allow_top: bool,
+    ) -> bool {
+        if self.fullscreen || ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
+            return false;
+        }
+        if ctx.dragged_id().is_some() {
+            return false;
+        }
+        let pos = ctx.input(|i| i.pointer.hover_pos().or_else(|| i.pointer.interact_pos()));
+        let Some(dir) = pos.and_then(|pos| resize_direction(ctx.content_rect(), pos, allow_top))
+        else {
+            return false;
+        };
+        ctx.set_cursor_icon(resize_cursor(dir));
+        if ctx.input(|i| i.pointer.primary_pressed()) {
+            ctx.send_viewport_cmd_to(target, egui::ViewportCommand::BeginResize(dir));
+            return true;
+        }
+        false
+    }
 }
 
 impl eframe::App for App {
@@ -2131,13 +2731,15 @@ impl eframe::App for App {
         if self.player.is_some() || self.busy || self.login.is_some() || self.runtime_rx.is_some() {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
-        if !self.fullscreen {
+        let mini = self.is_mini_player(ctx);
+        if !self.fullscreen && !mini {
             self.titlebar(ctx);
         }
         if self.plex.is_some() && self.player.is_none() {
             self.sidebar(ctx);
         }
-        if self.error.is_some() || self.notice.is_some() || self.runtime_status.is_some() {
+        if !mini && (self.error.is_some() || self.notice.is_some() || self.runtime_status.is_some())
+        {
             egui::TopBottomPanel::bottom("messages")
                 .frame(
                     egui::Frame::new()
@@ -2183,7 +2785,7 @@ impl eframe::App for App {
                 surface.place(ctx.available_rect(), ctx.pixels_per_point());
                 surface.reclaim_keyboard();
             }
-            self.playback_controls(ctx);
+            self.playback_controls(ctx, mini);
         } else if self.plex.is_some()
             && !self.connection_open
             && self.detail.is_none()
@@ -2216,17 +2818,10 @@ impl eframe::App for App {
                             .add_enabled(!self.busy && previous, previous_button)
                             .clicked()
                         {
-                            if let Some(location) = &mut self.location {
-                                location.offset = location.previous_pages.pop().unwrap_or(0);
-                            }
-                            self.load_page(ctx);
+                            self.page_previous(ctx);
                         }
                         if ui.add_enabled(!self.busy && next, next_button).clicked() {
-                            if let (Some(location), Some(page)) = (&mut self.location, &self.page) {
-                                location.previous_pages.push(location.offset);
-                                location.offset = page.offset + page.items.len();
-                            }
-                            self.load_page(ctx);
+                            self.page_next(ctx);
                         }
                     });
                 });
@@ -2307,12 +2902,15 @@ impl eframe::App for App {
                 }
             });
         if play {
-            self.start_playback(frame);
+            self.start_playback(ctx, frame);
         }
         if self.surface.is_none() {
-            self.update_notification(ctx, 58.0);
+            if !mini {
+                self.update_notification(ctx, 58.0);
+            }
             self.runtime_dialog(ctx);
         }
+        self.handle_window_resize(ctx, egui::ViewportId::ROOT, true);
     }
 }
 
@@ -2386,6 +2984,10 @@ impl Artwork {
         self.textures.clear();
     }
 
+    fn retain(&mut self, keep: &std::collections::HashSet<String>) {
+        self.textures.retain(|path, _| keep.contains(path));
+    }
+
     fn contains(&self, path: &str) -> bool {
         self.textures.contains_key(path)
     }
@@ -2423,8 +3025,23 @@ fn placeholder(ui: &egui::Ui, rect: egui::Rect, radius: f32) {
 }
 
 fn nav(ui: &mut egui::Ui, icon: Icon, title: &str, selected: bool) -> egui::Response {
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 42.0), egui::Sense::click());
+    nav_item(ui, icon, title, selected, false, false)
+}
+
+fn nav_item(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    title: &str,
+    selected: bool,
+    draggable: bool,
+    dragging: bool,
+) -> egui::Response {
+    let sense = if draggable {
+        egui::Sense::click_and_drag()
+    } else {
+        egui::Sense::click()
+    };
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 42.0), sense);
     response.widget_info(|| {
         egui::WidgetInfo::selected(
             egui::WidgetType::SelectableLabel,
@@ -2433,18 +3050,20 @@ fn nav(ui: &mut egui::Ui, icon: Icon, title: &str, selected: bool) -> egui::Resp
             title,
         )
     });
-    if selected || response.hovered() || response.has_focus() {
+    if selected || dragging || response.hovered() || response.has_focus() {
         ui.painter().rect_filled(
             rect,
             8.0,
-            if selected {
+            if dragging {
+                CONTROL_PRESSED
+            } else if selected {
                 Color32::from_rgb(23, 42, 64)
             } else {
                 PANEL
             },
         );
     }
-    if response.has_focus() {
+    if response.has_focus() || dragging {
         ui.painter().rect_stroke(
             rect,
             8.0,
@@ -2456,14 +3075,14 @@ fn nav(ui: &mut egui::Ui, icon: Icon, title: &str, selected: bool) -> egui::Resp
         ui,
         rect.left_center() + Vec2::new(SIDEBAR_ICON_INSET + 10.0, 0.0),
         20.0,
-        if selected { ACCENT } else { MUTED },
+        if selected || dragging { ACCENT } else { MUTED },
     );
     ui.painter().with_clip_rect(rect.shrink(4.0)).text(
         rect.left_center() + Vec2::new(SIDEBAR_TEXT_INSET, 0.0),
         egui::Align2::LEFT_CENTER,
         title,
         egui::FontId::proportional(14.0),
-        if selected {
+        if selected || dragging {
             Color32::WHITE
         } else {
             Color32::from_gray(195)
@@ -2659,6 +3278,7 @@ struct IconButton<'a> {
     icon: Icon,
     label: &'a str,
     size: f32,
+    active: bool,
 }
 
 impl<'a> IconButton<'a> {
@@ -2667,11 +3287,17 @@ impl<'a> IconButton<'a> {
             icon,
             label,
             size: 32.0,
+            active: false,
         }
     }
 
     fn size(mut self, size: f32) -> Self {
         self.size = size;
+        self
+    }
+
+    fn active(mut self, active: bool) -> Self {
+        self.active = active;
         self
     }
 }
@@ -2684,8 +3310,17 @@ impl egui::Widget for IconButton<'_> {
         });
         if ui.is_rect_visible(rect) {
             let radius = self.size / 2.0;
-            ui.painter()
-                .circle_filled(rect.center(), radius, control_fill(&response));
+            let fill = if self.active {
+                if response.hovered() {
+                    Color32::from_rgb(39, 72, 114)
+                } else {
+                    CONTROL_PRESSED
+                }
+            } else {
+                control_fill(&response)
+            };
+            let ink = if self.active { ACCENT } else { TEXT };
+            ui.painter().circle_filled(rect.center(), radius, fill);
             if response.has_focus() {
                 ui.painter().circle_stroke(
                     rect.center(),
@@ -2694,11 +3329,106 @@ impl egui::Widget for IconButton<'_> {
                 );
             }
             self.icon
-                .paint(ui, rect.center(), (self.size * 0.56).round(), TEXT);
+                .paint(ui, rect.center(), (self.size * 0.56).round(), ink);
         }
         response
             .on_hover_text(self.label)
             .on_hover_cursor(egui::CursorIcon::PointingHand)
+    }
+}
+
+/// Centered circular primary Play/Pause button for compact picture-in-picture playback.
+struct MiniPlayButton<'a> {
+    icon: Icon,
+    label: &'a str,
+    size: f32,
+}
+
+impl egui::Widget for MiniPlayButton<'_> {
+    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
+        let (rect, response) = ui.allocate_exact_size(Vec2::splat(self.size), egui::Sense::click());
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), self.label)
+        });
+        if ui.is_rect_visible(rect) {
+            let radius = self.size / 2.0;
+            let fill = if response.is_pointer_button_down_on() {
+                Color32::from_rgb(212, 212, 219)
+            } else if response.hovered() {
+                Color32::from_rgb(237, 237, 242)
+            } else {
+                Color32::WHITE
+            };
+            ui.painter()
+                .circle_filled(rect.center(), radius + 4.0, Color32::from_black_alpha(96));
+            ui.painter().circle_filled(rect.center(), radius, fill);
+            if response.has_focus() {
+                ui.painter().circle_stroke(
+                    rect.center(),
+                    radius + 3.0,
+                    egui::Stroke::new(2.0_f32, ACCENT),
+                );
+            }
+            self.icon.paint(
+                ui,
+                rect.center(),
+                (self.size * 0.48).round(),
+                Color32::BLACK,
+            );
+        }
+        response
+            .on_hover_text(self.label)
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+    }
+}
+
+fn resize_direction(
+    rect: egui::Rect,
+    pos: egui::Pos2,
+    allow_top: bool,
+) -> Option<egui::ResizeDirection> {
+    use egui::ResizeDirection::*;
+    if !rect.contains(pos) {
+        return None;
+    }
+    let left = pos.x - rect.left() < RESIZE_BORDER;
+    let right = rect.right() - pos.x < RESIZE_BORDER;
+    let top = allow_top && pos.y - rect.top() < RESIZE_BORDER;
+    let bottom = rect.bottom() - pos.y < RESIZE_BORDER;
+    if !(left || right || top || bottom) {
+        return None;
+    }
+    let near_left = pos.x - rect.left() < RESIZE_CORNER;
+    let near_right = rect.right() - pos.x < RESIZE_CORNER;
+    let near_top = allow_top && pos.y - rect.top() < RESIZE_CORNER;
+    let near_bottom = rect.bottom() - pos.y < RESIZE_CORNER;
+    Some(
+        match (
+            left || near_left,
+            right || near_right,
+            top || near_top,
+            bottom || near_bottom,
+        ) {
+            (true, _, true, _) => NorthWest,
+            (_, true, true, _) => NorthEast,
+            (true, _, _, true) => SouthWest,
+            (_, true, _, true) => SouthEast,
+            (true, _, _, _) => West,
+            (_, true, _, _) => East,
+            (_, _, true, _) => North,
+            (_, _, _, true) => South,
+            _ => return None,
+        },
+    )
+}
+
+fn resize_cursor(direction: egui::ResizeDirection) -> egui::CursorIcon {
+    use egui::ResizeDirection::*;
+    match direction {
+        North | South => egui::CursorIcon::ResizeVertical,
+        East | West => egui::CursorIcon::ResizeHorizontal,
+        NorthWest | SouthEast => egui::CursorIcon::ResizeNwSe,
+        NorthEast | SouthWest => egui::CursorIcon::ResizeNeSw,
     }
 }
 

@@ -1,5 +1,13 @@
 //! The video surface is a child of Perfuse's native window, never a second process/window.
 
+#[derive(Clone, Copy, Default)]
+pub struct OverlayState {
+    pub ready: bool,
+    pub focused: bool,
+    pub hovered: bool,
+    pub topmost: bool,
+}
+
 #[cfg(windows)]
 pub struct Surface(windows_sys::Win32::Foundation::HWND);
 
@@ -97,34 +105,39 @@ impl Surface {
     }
 
     /// Attach the transparent controls viewport to this app, not the desktop.
-    pub fn prepare_overlay(&self, title: &str) -> bool {
-        use windows_sys::Win32::{Foundation::RECT, UI::WindowsAndMessaging::*};
+    /// Mirrors the parent window's always-on-top state without ever making the
+    /// overlay globally topmost on its own.
+    pub fn prepare_overlay(&self, title: &str) -> OverlayState {
+        use windows_sys::Win32::{
+            Foundation::{POINT, RECT},
+            UI::WindowsAndMessaging::*,
+        };
         let title: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
         // SAFETY: all handles are checked before use. Only an overlay in this
         // process is modified; both windows live on eframe's UI thread.
         unsafe {
             let overlay = FindWindowW(std::ptr::null(), title.as_ptr());
             if overlay.is_null() {
-                return false;
+                return OverlayState::default();
             }
             let mut process = 0;
             GetWindowThreadProcessId(overlay, &mut process);
             if process != std::process::id() {
-                return false;
+                return OverlayState::default();
             }
             let parent = GetParent(self.0);
             if parent.is_null() {
-                return false;
+                return OverlayState::default();
             }
             if GetWindowLongPtrW(overlay, GWLP_HWNDPARENT) != parent as isize {
                 // Configure alpha before showing or marking this overlay ready.
                 if !enable_overlay_alpha(overlay) {
-                    return false;
+                    return OverlayState::default();
                 }
                 SetWindowLongPtrW(overlay, GWLP_HWNDPARENT, parent as isize);
             }
             if GetWindowLongPtrW(overlay, GWLP_HWNDPARENT) != parent as isize {
-                return false;
+                return OverlayState::default();
             }
             let mut rect = RECT {
                 left: 0,
@@ -133,19 +146,55 @@ impl Surface {
                 bottom: 0,
             };
             if GetWindowRect(self.0, &mut rect) == 0 {
-                return false;
+                return OverlayState::default();
             }
+            let parent_topmost =
+                (GetWindowLongPtrW(parent, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST) != 0;
+            let overlay_topmost =
+                (GetWindowLongPtrW(overlay, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST) != 0;
+            let (insert_after, flags) = if parent_topmost != overlay_topmost {
+                (
+                    if parent_topmost {
+                        HWND_TOPMOST
+                    } else {
+                        HWND_NOTOPMOST
+                    },
+                    SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+                )
+            } else {
+                (
+                    std::ptr::null_mut(),
+                    SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER,
+                )
+            };
             SetWindowPos(
                 overlay,
-                std::ptr::null_mut(),
+                insert_after,
                 rect.left,
                 rect.top,
                 rect.right - rect.left,
                 rect.bottom - rect.top,
-                SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER,
+                flags,
             );
+            let not_minimized = IsIconic(parent) == 0;
             let foreground = GetForegroundWindow();
-            IsIconic(parent) == 0 && (foreground == parent || foreground == overlay)
+            let focused = not_minimized && (foreground == parent || foreground == overlay);
+            let mut cursor = POINT { x: 0, y: 0 };
+            let hovered = not_minimized && GetCursorPos(&mut cursor) != 0 && {
+                let hit = WindowFromPoint(cursor);
+                if hit.is_null() {
+                    false
+                } else {
+                    let root = GetAncestor(hit, GA_ROOT);
+                    root == parent || root == overlay
+                }
+            };
+            OverlayState {
+                ready: not_minimized && (focused || parent_topmost),
+                focused,
+                hovered,
+                topmost: parent_topmost,
+            }
         }
     }
 
@@ -190,8 +239,8 @@ impl Surface {
     pub fn pointer_position(&self) -> Option<(i32, i32)> {
         None
     }
-    pub fn prepare_overlay(&self, _: &str) -> bool {
-        false
+    pub fn prepare_overlay(&self, _: &str) -> OverlayState {
+        OverlayState::default()
     }
     pub fn reclaim_keyboard(&self) {}
     pub fn place(&self, _: egui_rect::Rect, _: f32) {}
@@ -259,7 +308,11 @@ mod tests {
                 std::ptr::null(),
             ));
             assert!(!surface.0.is_null());
-            assert!(!surface.prepare_overlay("Perfuse overlay that does not exist"));
+            assert!(
+                !surface
+                    .prepare_overlay("Perfuse overlay that does not exist")
+                    .ready
+            );
             for (x, y) in [(100, 100), (300, 240)] {
                 SetWindowPos(
                     parent.0,
@@ -270,10 +323,15 @@ mod tests {
                     620,
                     SWP_NOACTIVATE | SWP_NOZORDER,
                 );
-                surface.prepare_overlay(&title);
+                let state = surface.prepare_overlay(&title);
+                assert!(!state.topmost);
                 assert_eq!(
                     GetWindowLongPtrW(overlay.0, GWLP_HWNDPARENT),
                     parent.0 as isize
+                );
+                assert_eq!(
+                    GetWindowLongPtrW(overlay.0, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST,
+                    0
                 );
                 let mut video = RECT {
                     left: 0,
@@ -290,6 +348,38 @@ mod tests {
                 );
                 assert_eq!(IsWindowVisible(overlay.0), 0);
             }
+            // Topmost mirrors the parent window and clears again when disabled.
+            SetWindowPos(
+                parent.0,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+            );
+            let state = surface.prepare_overlay(&title);
+            assert!(state.topmost);
+            assert!(state.ready);
+            assert_ne!(
+                GetWindowLongPtrW(overlay.0, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST,
+                0
+            );
+            SetWindowPos(
+                parent.0,
+                HWND_NOTOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+            );
+            let state = surface.prepare_overlay(&title);
+            assert!(!state.topmost);
+            assert_eq!(
+                GetWindowLongPtrW(overlay.0, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST,
+                0
+            );
         }
     }
 }
