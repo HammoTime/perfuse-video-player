@@ -1,0 +1,129 @@
+﻿name: Release Perfuse
+
+on:
+  workflow_dispatch:
+    inputs:
+      family:
+        description: Release family
+        type: choice
+        options:
+          - normal
+          - alpha
+          - beta
+        default: normal
+      commit:
+        description: Optional full commit SHA on the selected branch (defaults to its tip)
+        type: string
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: perfuse-release
+  queue: max
+
+jobs:
+  version:
+    if: ${{ !github.event.deleted }}
+    runs-on: windows-2022
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      commit: ${{ steps.version.outputs.commit }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - id: version
+        env:
+          RELEASE_FAMILY: ${{ inputs.family }}
+          RELEASE_COMMIT: ${{ inputs.commit }}
+        run: python tools/release-version.py
+
+  build:
+    needs: version
+    runs-on: windows-2022
+    env:
+      PERFUSE_VERSION: ${{ needs.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .release-tools
+          persist-credentials: false
+          sparse-checkout: |
+            installer
+            tools
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python .release-tools/tools/release-version.py "$PERFUSE_VERSION"
+        shell: bash
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --locked --release --target x86_64-pc-windows-msvc
+      - name: Package Windows installer
+        shell: pwsh
+        run: |
+          $compiler = Join-Path $env:RUNNER_TEMP 'inno-setup'
+          $setup = Join-Path $env:RUNNER_TEMP 'innosetup-6.7.3.exe'
+          Invoke-WebRequest -Uri 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe' -OutFile $setup
+          if ((Get-FileHash -LiteralPath $setup).Hash -ne '9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732') {
+            throw 'Inno Setup download checksum mismatch.'
+          }
+          $result = Start-Process -FilePath $setup -ArgumentList '/PORTABLE=1', '/CURRENTUSER', '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$compiler`"" -WindowStyle Hidden -Wait -PassThru
+          if ($result.ExitCode -ne 0) { exit $result.ExitCode }
+          $iscc = Join-Path $compiler 'ISCC.exe'
+          $exe = (Resolve-Path "target/x86_64-pc-windows-msvc/release/perfuse.exe").Path
+          & $iscc "/O$(Join-Path $PWD 'dist')" "/DPerfuseExe=$exe" "/DPerfuseVersion=$($env:PERFUSE_VERSION.Substring(1))" .release-tools/installer/perfuse.iss
+          exit $LASTEXITCODE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: [version, build]
+    runs-on: windows-2022
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.version.outputs.tag }}
+      COMMIT: ${{ needs.version.outputs.commit }}
+      PRERELEASE: ${{ needs.version.outputs.prerelease }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish GitHub release
+        shell: bash
+        run: |
+          repo="repos/$GITHUB_REPOSITORY"
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            if ! gh api --method POST "$repo/git/refs" -f "ref=refs/tags/$TAG" -f "sha=$COMMIT" > /dev/null; then
+              echo "Checking whether the tag already exists at the selected commit."
+            fi
+          fi
+          if [[ "$(gh api "$repo/commits/tags/$TAG" --jq .sha)" != "$COMMIT" ]]; then
+            echo "::error::The release tag points to a different commit."
+            exit 1
+          fi
+          options=(--verify-tag)
+          if [[ "$PRERELEASE" == true ]]; then
+            options+=(--prerelease --latest=false)
+          elif [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            options+=(--latest)
+          fi
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --generate-notes "${options[@]}"

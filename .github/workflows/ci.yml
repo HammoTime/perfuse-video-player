@@ -1,0 +1,47 @@
+name: Rust
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - name: Compare offscreen login snapshots
+        env:
+          WGPU_BACKEND: dx12
+        run: cargo test --locked ui_tests::login_snapshots -- --ignored
+      - name: Upload rendered UI and visual diffs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: login-ui
+          if-no-files-found: ignore
+          include-hidden-files: true
+          path: |
+            .artifacts/ui/login-*.png
+            tests/snapshots/**/login-*.new.png
+            tests/snapshots/**/login-*.diff.png
+      - name: Compare offscreen library snapshots
+        env:
+          WGPU_BACKEND: dx12
+        run: cargo test --locked ui_tests::library_snapshots -- --ignored
+      - name: Upload library UI and visual diffs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: library-ui
+          if-no-files-found: ignore
+          include-hidden-files: true
+          path: |
+            .artifacts/ui/
+            tests/snapshots/**/*.new.png
+            tests/snapshots/**/*.diff.png

@@ -1,0 +1,16 @@
+/target/
+/dist/
+/.tools/
+/.artifacts/
+.env
+*.log
+tests/snapshots/**/*.new.png
+tests/snapshots/**/*.diff.png
+tests/snapshots/**/*.old.png
+
+# Other generated Rust artifacts
+/debug/
+**/*.rs.bk
+*.pdb
+**/mutants.out*/
+rustc-ice-*.txt
