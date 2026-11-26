@@ -857,7 +857,7 @@ fn library_snapshots() {
                 title: "Lectures".into(),
                 kind: Kind::Series,
             });
-            app.servers[0].items = app.on_deck.clone();
+            app.servers[0].items = app.page.as_ref().unwrap().items.clone();
             app.servers[0].artwork = app.covers.clone();
             let session = session::Session {
                 kind: ServerKind::Plex,
@@ -1981,7 +1981,7 @@ fn home_pagination_only_changes_recently_added_and_carousels_scroll_with_arrows(
         .get_by_label("Scroll Continue Watching forward")
         .click();
     harness.run_steps(20);
-    assert!(harness.state().carousel_offsets["continue"].0 > 100.0);
+    assert!(harness.state().carousel_offsets["continue"] > 100.0);
     assert!(
         !harness
             .get_by_label("Scroll Continue Watching back")
@@ -1992,13 +1992,38 @@ fn home_pagination_only_changes_recently_added_and_carousels_scroll_with_arrows(
         .get_by_label("Scroll Continue Watching back")
         .click();
     harness.run_steps(20);
-    assert!(harness.state().carousel_offsets["continue"].0 < 1.0);
+    assert!(harness.state().carousel_offsets["continue"] < 1.0);
 
     harness
         .get_by_label("Scroll Recently Released forward")
         .click();
     harness.run_steps(20);
-    assert!(harness.state().carousel_offsets["released"].0 > 100.0);
+    assert!(harness.state().carousel_offsets["released"] > 100.0);
+
+    let mut overview = library([860.0, 900.0], "home");
+    let app = overview.state_mut();
+    app.overview = true;
+    app.servers[0].items = app.page.as_ref().unwrap().items.clone();
+    overview.run_steps(4);
+    let first = overview.get_by_label("Open The Quiet Earth").rect();
+    let mut previous = first;
+    for label in [
+        "Open After Hours",
+        "Open A Place Between the Stars and the Sea",
+        "Open Wild Coast",
+    ] {
+        let row = overview.get_by_label(label).rect();
+        assert!(row.top() > previous.bottom() && (row.left() - first.left()).abs() < 1.0);
+        previous = row;
+    }
+    let next_page = overview.get_by_label("Open Small Hours").rect();
+    assert_eq!(next_page.top(), first.top());
+    assert!(next_page.left() > first.right());
+    overview
+        .get_by_label("Scroll Continue Watching forward")
+        .click();
+    overview.run_steps(20);
+    assert!(overview.state().carousel_offsets["overview_continue"] > 100.0);
 
     // Next page on Home only requests and updates Recently Added.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2090,20 +2115,19 @@ fn home_pagination_only_changes_recently_added_and_carousels_scroll_with_arrows(
         .get_by_role_and_label(egui::accesskit::Role::Button, "Home")
         .rect();
     let settings_nav = harness.get_by_label("Servers & settings").rect();
-    assert!((home_nav.left() - 28.0).abs() < 1.5);
+    // Home paints its icon 20 points inside the button. The provider glyph
+    // occupies the first 16 points of the sidebar content.
+    assert_eq!(home_nav.left() + 20.0, settings_nav.left() + 8.0);
     assert!((home_nav.top() - 72.0 - 28.0).abs() < 2.0);
     assert!((screen.bottom() - settings_nav.bottom() - 28.0).abs() < 2.0);
 
-    let prev_page_btn = harness.get_by_label("Previous page").rect();
-    let sidebar_right = home_nav.right() + 28.0;
-    let prev_left_pad = prev_page_btn.left() - sidebar_right;
-    let prev_bottom_pad = screen.bottom() - prev_page_btn.bottom();
-    assert!(
-        (prev_left_pad - 28.0).abs() < 2.5 && (prev_bottom_pad - 28.0).abs() < 2.5,
-        "pagination margins should be equal (28pt): left={prev_left_pad} bottom={prev_bottom_pad}"
-    );
-
-    harness.get_by_label("Next page").click();
+    assert!(harness.query_by_label("Previous page").is_none());
+    assert!(harness.query_by_label("Next page").is_none());
+    harness
+        .get_by_label("Next Recently Added page")
+        .scroll_to_me();
+    harness.run_steps(4);
+    harness.get_by_label("Next Recently Added page").click();
     for _ in 0..100 {
         harness.step();
         if !harness.state().busy {
@@ -2131,9 +2155,8 @@ fn home_pagination_only_changes_recently_added_and_carousels_scroll_with_arrows(
         .accesskit_node()
         .is_disabled();
     assert!(
-        !prev_disabled && prev_rect.bottom() <= prev_page_btn.top() - 28.0,
-        "Previous Recently Added page not clickable: disabled={prev_disabled} rect={prev_rect:?} pagination_top={}",
-        prev_page_btn.top() - 28.0
+        !prev_disabled && screen.contains_rect(prev_rect),
+        "Previous Recently Added page not clickable: disabled={prev_disabled} rect={prev_rect:?}"
     );
     harness.get_by_label("Previous Recently Added page").click();
     for _ in 0..100 {

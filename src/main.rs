@@ -42,6 +42,12 @@ const GREEN: Color32 = Color32::from_rgb(126, 226, 160);
 const ERROR_TEXT: Color32 = Color32::from_rgb(255, 160, 150);
 const TEXT: Color32 = Color32::from_rgb(235, 235, 245);
 const SIDEBAR_TEXT_INSET: f32 = 40.0;
+const SIDEBAR_NAV_MARGIN: egui::Margin = egui::Margin {
+    left: 16,
+    right: 0,
+    top: 0,
+    bottom: 0,
+};
 const SIDEBAR_ICON_INSET: f32 = 10.0;
 const UPDATE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 // Button state fills from assets/buttons.
@@ -174,7 +180,7 @@ struct App {
     home_loaded: bool,
     on_deck: Vec<Item>,
     released: Vec<Item>,
-    carousel_offsets: HashMap<&'static str, (f32, f32)>,
+    carousel_offsets: HashMap<&'static str, f32>,
     covers: Artwork,
     detail: Option<Item>,
     version: usize,
@@ -1029,20 +1035,31 @@ impl App {
                 egui::Frame::new().show(ui, |ui| {
                     ui.set_min_height(ui.available_height());
                     ui.set_width(ui.available_width());
-                    if nav(
-                        ui,
-                        Icon::Home,
-                        "Home",
-                        self.overview && !self.connection_open,
-                    )
-                    .clicked()
+                    let row_spacing = ui.spacing().item_spacing.y;
+                    ui.spacing_mut().item_spacing.y = 24.0;
+                    // Center the Home glyph on the 16-point provider icons below.
+                    if egui::Frame::new()
+                        .inner_margin(egui::Margin {
+                            left: -12,
+                            ..Default::default()
+                        })
+                        .show(ui, |ui| {
+                            nav(
+                                ui,
+                                Icon::Home,
+                                "Home",
+                                self.overview && !self.connection_open,
+                            )
+                        })
+                        .inner
+                        .clicked()
                         && !self.busy
                     {
                         self.overview = true;
                         self.connection_open = false;
                         self.detail = None;
                     }
-                    ui.add_space(24.0);
+                    ui.spacing_mut().item_spacing.y = row_spacing;
                     egui::ScrollArea::vertical()
                         .id_salt("server_groups")
                         .max_height((ui.available_height() - 130.0).max(60.0))
@@ -1128,10 +1145,7 @@ impl App {
                 .as_ref()
                 .is_some_and(|location| matches!(location.browse, Browse::RecentlyAdded));
         egui::Frame::new()
-            .inner_margin(egui::Margin {
-                left: 16,
-                ..Default::default()
-            })
+            .inner_margin(SIDEBAR_NAV_MARGIN)
             .show(ui, |ui| {
                 let home = nav(ui, Icon::Home, "Home", server_home);
                 let label = format!("{} Home", self.servers[i].name());
@@ -1288,74 +1302,6 @@ impl App {
         self.load_page(ctx, false);
     }
 
-    fn horizontal_carousel_row(
-        &mut self,
-        ui: &mut egui::Ui,
-        id: &'static str,
-        heading: &str,
-        items: &[Item],
-        render_card: fn(&mut egui::Ui, &Item, &Artwork) -> bool,
-    ) -> Option<Item> {
-        let viewport = ui.available_width();
-        let spacing = ui.spacing().item_spacing.x;
-        let estimated_content = if items.is_empty() {
-            0.0
-        } else {
-            items.len() as f32 * HOME_CARD_WIDTH + (items.len() - 1) as f32 * spacing
-        };
-        let (offset_x, content_width) = self
-            .carousel_offsets
-            .get(id)
-            .copied()
-            .unwrap_or((0.0, estimated_content));
-        let max_offset = (content_width.max(estimated_content) - viewport).max(0.0);
-        let scrollable = max_offset > 1.0;
-        let mut scroll_delta = 0.0_f32;
-        control_row(ui, 32.0, |ui| {
-            ui.label(RichText::new(heading).size(22.0).strong());
-            if scrollable {
-                let pitch = HOME_CARD_WIDTH + spacing;
-                let step = (viewport / pitch).floor().max(1.0) * pitch;
-                let back_label = format!("Scroll {heading} back");
-                if ui
-                    .add_enabled(
-                        offset_x > 1.0,
-                        IconButton::new(Icon::PagePrevious, &back_label),
-                    )
-                    .clicked()
-                {
-                    scroll_delta = step.min(offset_x.max(0.0));
-                }
-                let forward_label = format!("Scroll {heading} forward");
-                if ui
-                    .add_enabled(
-                        offset_x < max_offset - 1.0,
-                        IconButton::new(Icon::PageNext, &forward_label),
-                    )
-                    .clicked()
-                {
-                    scroll_delta = -step.min((max_offset - offset_x).max(0.0));
-                }
-            }
-        });
-        let mut picked = None;
-        let output = egui::ScrollArea::horizontal().id_salt(id).show(ui, |ui| {
-            if scroll_delta != 0.0 {
-                ui.scroll_with_delta(Vec2::new(scroll_delta, 0.0));
-            }
-            ui.horizontal_top(|ui| {
-                for item in items {
-                    if render_card(ui, item, &self.covers) && !self.busy {
-                        picked = Some(item.clone());
-                    }
-                }
-            });
-        });
-        self.carousel_offsets
-            .insert(id, (output.state.offset.x, output.content_size.x));
-        picked
-    }
-
     fn collection(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.spacing_mut().item_spacing.y = 12.0;
         let home = self.selected_library.is_none();
@@ -1482,29 +1428,35 @@ impl App {
                             .color(MUTED),
                         );
                     } else {
-                        let on_deck = self.on_deck.clone();
-                        if let Some(item) = self.horizontal_carousel_row(
+                        home_carousel(
                             ui,
                             "continue",
                             "Continue Watching",
-                            &on_deck,
-                            continue_card,
-                        ) {
-                            picked = Some(item);
-                        }
+                            self.carousel_offsets.entry("continue").or_default(),
+                            &self.on_deck,
+                            1,
+                            |ui, item| {
+                                if continue_card(ui, item, &self.covers) && !self.busy {
+                                    picked = Some(item.clone());
+                                }
+                            },
+                        );
                     }
                     ui.add_space(48.0);
                     if !self.released.is_empty() {
-                        let released = self.released.clone();
-                        if let Some(item) = self.horizontal_carousel_row(
+                        home_carousel(
                             ui,
                             "released",
                             "Recently Released",
-                            &released,
-                            released_card,
-                        ) {
-                            picked = Some(item);
-                        }
+                            self.carousel_offsets.entry("released").or_default(),
+                            &self.released,
+                            1,
+                            |ui, item| {
+                                if released_card(ui, item, &self.covers) && !self.busy {
+                                    picked = Some(item.clone());
+                                }
+                            },
+                        );
                         ui.add_space(48.0);
                     }
                 }
@@ -2730,6 +2682,7 @@ impl eframe::App for App {
         } else if self.source.is_some()
             && !self.connection_open
             && !self.overview
+            && self.selected_library.is_some()
             && self.detail.is_none()
             && (self.page.as_ref().is_some_and(Page::has_next)
                 || self
@@ -3476,6 +3429,74 @@ fn cover(ui: &mut egui::Ui, item: &Item, covers: &Artwork, size: Vec2) -> egui::
         );
     }
     response
+}
+
+fn home_carousel<T>(
+    ui: &mut egui::Ui,
+    id: &'static str,
+    heading: &str,
+    offset_x: &mut f32,
+    items: &[T],
+    rows: usize,
+    mut card: impl FnMut(&mut egui::Ui, &T),
+) {
+    let viewport = ui.available_width();
+    let spacing = ui.spacing().item_spacing.x;
+    let pitch = HOME_CARD_WIDTH + spacing;
+    let visible_columns = ((viewport + spacing) / pitch).floor().max(1.0) as usize;
+    let page_size = visible_columns * rows;
+    let columns =
+        items.len() / page_size * visible_columns + (items.len() % page_size).min(visible_columns);
+    let max_offset = (columns as f32 * pitch - spacing - viewport).max(0.0);
+    let mut scroll_delta = 0.0_f32;
+    control_row(ui, 32.0, |ui| {
+        ui.label(RichText::new(heading).size(22.0).strong());
+        if max_offset > 1.0 {
+            let step = visible_columns as f32 * pitch;
+            let back_label = format!("Scroll {heading} back");
+            if ui
+                .add_enabled(
+                    *offset_x > 1.0,
+                    IconButton::new(Icon::PagePrevious, &back_label),
+                )
+                .clicked()
+            {
+                scroll_delta = step.min(offset_x.max(0.0));
+            }
+            let forward_label = format!("Scroll {heading} forward");
+            if ui
+                .add_enabled(
+                    *offset_x < max_offset - 1.0,
+                    IconButton::new(Icon::PageNext, &forward_label),
+                )
+                .clicked()
+            {
+                scroll_delta = -step.min((max_offset - *offset_x).max(0.0));
+            }
+        }
+    });
+    let output = egui::ScrollArea::horizontal()
+        .id_salt(id)
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+        .show(ui, |ui| {
+            if scroll_delta != 0.0 {
+                ui.scroll_with_delta(Vec2::new(scroll_delta, 0.0));
+            }
+            ui.horizontal_top(|ui| {
+                for page in items.chunks(page_size) {
+                    ui.vertical(|ui| {
+                        for row in page.chunks(visible_columns) {
+                            ui.horizontal_top(|ui| {
+                                for item in row {
+                                    card(ui, item);
+                                }
+                            });
+                        }
+                    });
+                }
+            });
+        });
+    *offset_x = output.state.offset.x;
 }
 
 fn continue_card(ui: &mut egui::Ui, item: &Item, covers: &Artwork) -> bool {

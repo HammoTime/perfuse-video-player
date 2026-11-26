@@ -785,24 +785,33 @@ impl App {
                 watching.sort_by_key(|(_, _, entry)| std::cmp::Reverse(entry.last_viewed_at));
                 if !watching.is_empty() {
                     ui.add_space(20.0);
-                    ui.heading("Continue Watching");
-                    egui::ScrollArea::horizontal().show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            for (i, s, entry) in watching {
-                                ui.push_id((i, &entry.id), |ui| {
-                                    ui.vertical(|ui| {
-                                        if continue_card(ui, entry, &s.artwork) {
-                                            item = Some((i, entry.clone()));
-                                        }
-                                        ui.horizontal(|ui| {
-                                            ui.add(s.icon().image(13.0, MUTED));
-                                            ui.small(s.name());
-                                        });
+                    home_carousel(
+                        ui,
+                        "overview_continue",
+                        "Continue Watching",
+                        self.carousel_offsets
+                            .entry("overview_continue")
+                            .or_default(),
+                        &watching,
+                        4,
+                        |ui, &(i, server, entry)| {
+                            ui.push_id((i, &entry.id), |ui| {
+                                ui.vertical(|ui| {
+                                    ui.set_width(HOME_CARD_WIDTH);
+                                    if continue_card(ui, entry, &server.artwork) {
+                                        item = Some((i, entry.clone()));
+                                    }
+                                    ui.horizontal(|ui| {
+                                        ui.add(server.icon().image(13.0, MUTED));
+                                        ui.add(
+                                            egui::Label::new(RichText::new(server.name()).small())
+                                                .truncate(),
+                                        );
                                     });
                                 });
-                            }
-                        });
-                    });
+                            });
+                        },
+                    );
                 }
                 for s in self
                     .servers

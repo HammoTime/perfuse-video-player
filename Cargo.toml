@@ -1,6 +1,6 @@
 [package]
 name = "perfuse"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 rust-version = "1.88"
 description = "A native Plex and Jellyfin desktop client with mpv playback"
