@@ -30,7 +30,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 ```
 
-Ordinary tests use synthetic fixtures for Plex, Jellyfin and the app UI. The UI harness runs the eframe update loop without opening a window or reading saved credentials.
+Ordinary tests use synthetic fixtures for Plex, Jellyfin, Audiobookshelf and the app UI. The UI harness runs the eframe update loop without opening a window or reading saved credentials.
 
 ### Screenshot baselines
 
@@ -52,15 +52,19 @@ python3 tools/demo_server.py
 
 In **Manual server connection**, connect to `http://127.0.0.1:32499` with the token `demo`. The fixture provides synthetic movies, TV episodes, artwork, a generated audio file and in-memory playback progress. With the fixture running and libmpv available, the optional `cargo test --locked embedded_playback_and_cache -- --ignored` checks in-process playback and buffering.
 
-For a development connection to your own Plex server, `PLEX_URL` and `PLEX_TOKEN` override remembered Plex values or prefill its manual form. Both sources accept HTTP(S) server origins without path prefixes. **Remember me** stores the access token in Windows Credential Manager. Removing a server in Settings also removes its saved sign-in.
+For a development connection to your own Plex server, `PLEX_URL` and `PLEX_TOKEN` override remembered Plex values or prefill its manual form. All three sources accept HTTP(S) server origins without path prefixes. **Remember me** stores sign-in credentials in Windows Credential Manager. Removing a server in Settings also removes its saved sign-in.
 
 The screenshot tests exercise egui layout and interaction. Use a Windows app build for testing native video output, hardware decoding and actual account sign-in.
 
 ### Media source plugins
 
-The Perfuse library exposes `media::MediaSource` and shared types for libraries, items, versions and playback progress. The compiled-in plugins in `src/plugins/plex/` and `src/plugins/jellyfin/` translate server responses into those types and supply authenticated direct-play requests. Plugin registration lives in `src/plugins/mod.rs`.
+The Perfuse library exposes `media::MediaSource` and shared types for libraries, items, versions and playback progress. The compiled-in plugins in `src/plugins/plex/`, `src/plugins/jellyfin/` and `src/plugins/audiobookshelf/` translate server responses into those types and supply authenticated direct-play requests. Plugin registration lives in `src/plugins/mod.rs`.
 
 Run `cargo test --locked --lib plugins::jellyfin` for the Jellyfin protocol tests. Their loopback server exercises account sign-in, Quick Connect, library and Home queries, image fetching, version selection and playback reporting. See AGENTS.md for the request paths and credential format.
+
+Run `cargo test --locked --lib plugins::audiobookshelf` for the audiobook protocol fixtures. Book positions and bookmarks use time from the start of the book, including for books split across several audio files.
+
+With a native libmpv DLL available, run `cargo test --locked native_book_resume_seek_and_finish -- --ignored` to check resume, cross-file seeking and end-of-book progress. The test serves two short audio files on loopback and uses null audio output.
 
 ## Package a release
 

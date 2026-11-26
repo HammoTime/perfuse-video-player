@@ -23,7 +23,7 @@ pub static PLUGIN: Plugin = Plugin {
     open: |credentials, cache_artwork| {
         Ok(Arc::new(Plex::new(
             &credentials.server,
-            &credentials.token,
+            credentials.token.fixed()?,
             &credentials.client_id,
             cache_artwork,
         )?))
@@ -82,6 +82,7 @@ impl From<PlexItem> for Item {
     fn from(item: PlexItem) -> Self {
         Self {
             id: item.rating_key,
+            book: None,
             library_id: item.library_section_id.and_then(|v| match v {
                 serde_json::Value::String(s) => Some(s),
                 serde_json::Value::Number(n) => Some(n.to_string()),

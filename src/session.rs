@@ -22,12 +22,53 @@ pub fn origin(server: &str) -> Option<String> {
 mod windows {
     use super::Session;
     use perfuse::plugins::{BUILTIN, ServerKind};
+    use std::{
+        fs::{self, File},
+        os::windows::fs::OpenOptionsExt,
+        path::PathBuf,
+        time::{Duration, Instant},
+    };
     use windows_sys::Win32::{
-        Foundation::{ERROR_NOT_FOUND, GetLastError},
+        Foundation::{ERROR_NOT_FOUND, ERROR_SHARING_VIOLATION, GetLastError},
         Security::Credentials::*,
     };
 
     const TARGET: &str = "Perfuse/PlexSession";
+
+    // An exclusive Windows handle serializes the credential check and update across
+    // app instances. The lock file is empty and Windows releases the handle on exit.
+    fn lock_store() -> Result<File, String> {
+        let base = std::env::var_os("LOCALAPPDATA")
+            .ok_or("Could not locate your local app data folder.")?;
+        let dir = PathBuf::from(base).join("Perfuse");
+        fs::create_dir_all(&dir).map_err(|_| "Could not open the local Perfuse folder.")?;
+        let path = dir.join("credentials.lock");
+        let started = Instant::now();
+        loop {
+            match File::options()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .share_mode(0)
+                .open(&path)
+            {
+                Ok(file) => return Ok(file),
+                Err(error) if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32) => {
+                    if started.elapsed() >= Duration::from_secs(3) {
+                        return Err(
+                            "Another Perfuse instance is updating saved sign-ins. Please retry."
+                                .into(),
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => return Err(
+                    "Could not lock saved sign-ins. Check the local Perfuse folder permissions."
+                        .into(),
+                ),
+            }
+        }
+    }
 
     fn wide(value: &str) -> Vec<u16> {
         value.encode_utf16().chain(Some(0)).collect()
@@ -79,6 +120,9 @@ mod windows {
                     && session.kind == kind
                     && target(&session)? == name
                 {
+                    if kind == ServerKind::Audiobookshelf {
+                        remember(&session, false)?;
+                    }
                     sessions.push(session);
                 }
             }
@@ -91,16 +135,88 @@ mod windows {
         Ok(())
     }
     pub fn save(session: &Session) -> Result<(), String> {
-        write(&target(session)?, session)
+        if session.kind == ServerKind::Audiobookshelf {
+            remember(session, true)
+        } else {
+            write(&target(session)?, session)
+        }
+    }
+
+    fn remember(session: &Session, write_now: bool) -> Result<(), String> {
+        let name = target(session)?;
+        let (kind, server, client_id) = (
+            session.kind,
+            session.server.clone(),
+            session.client_id.clone(),
+        );
+        // Capture only the address and device identity. Capturing the live session here
+        // would keep its shared tokens and their rotation callback alive forever.
+        let save = move |name: &str, token| {
+            write(
+                name,
+                &Session {
+                    kind,
+                    server: server.clone(),
+                    client_id: client_id.clone(),
+                    token,
+                },
+            )
+        };
+        let rotate = save.clone();
+        let rotate_name = name.clone();
+        session.token.remember(
+            |token| {
+                if write_now {
+                    let _store = lock_store()?;
+                    save(&name, token.clone())?;
+                }
+                Ok(())
+            },
+            move |pair, refresh| {
+                let store = lock_store()?;
+                let saved = read(&rotate_name)?.and_then(|session| session.token.snapshot());
+                match saved {
+                    Some(saved) if saved.login == pair.login => {
+                        if saved.revision > pair.revision {
+                            *pair = saved;
+                        } else {
+                            refresh(pair)?;
+                            rotate(&rotate_name, pair.clone().into())?;
+                        }
+                        Ok(())
+                    }
+                    _ => {
+                        // Another instance removed or replaced the login. Only refresh in memory.
+                        drop(store);
+                        refresh(pair)
+                    }
+                }
+            },
+        )
     }
     pub fn clear(session: &Session) -> Result<(), String> {
+        let name = target(session)?;
+        if session.kind == ServerKind::Audiobookshelf {
+            return session.token.forget(|expected| {
+                let _store = lock_store()?;
+                if let Some(saved) = read(&name)?
+                    && match expected {
+                        Some(id) => saved.token.snapshot().is_some_and(|pair| pair.login == id),
+                        None => saved.token.fixed().ok() == session.token.fixed().ok(),
+                    }
+                {
+                    delete(&name)?;
+                }
+                Ok(())
+            });
+        }
         if session.kind == ServerKind::Plex
             && read(TARGET)?
                 .is_some_and(|s| super::origin(&s.server) == super::origin(&session.server))
         {
             delete(TARGET)?;
         }
-        delete(&target(session)?)
+        delete(&name)
     }
 
     fn read(target: &str) -> Result<Option<Session>, String> {
@@ -204,6 +320,11 @@ mod windows {
                 target(&session).unwrap(),
                 "Perfuse/Jellyfin/https://media.example.test"
             );
+            session.kind = ServerKind::Audiobookshelf;
+            assert_eq!(
+                target(&session).unwrap(),
+                "Perfuse/Audiobookshelf/https://media.example.test"
+            );
         }
 
         #[test]
@@ -231,7 +352,7 @@ mod windows {
             let loaded = loaded.unwrap().unwrap();
             assert!(
                 loaded.server == session.server
-                    && loaded.token == session.token
+                    && loaded.token.fixed().unwrap() == session.token.fixed().unwrap()
                     && loaded.client_id == session.client_id
             );
             assert!(read(&target).unwrap().is_none());

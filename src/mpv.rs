@@ -24,6 +24,7 @@ struct EndFile {
 
 pub enum Event {
     None,
+    StartFile(i64),
     Loaded,
     Ended { eof: bool, failed: bool },
     Shutdown,
@@ -167,6 +168,13 @@ impl Mpv {
             };
             match event.id {
                 1 => Event::Shutdown,
+                // mpv_event_start_file has a single int64_t playlist_entry_id.
+                6 => event
+                    .data
+                    .cast::<i64>()
+                    .as_ref()
+                    .copied()
+                    .map_or(Event::None, Event::StartFile),
                 8 => Event::Loaded,
                 7 => {
                     let payload = event.data.cast::<EndFile>().as_ref();

@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod audiobooks;
 mod connection;
 mod icons;
 mod mpv;
@@ -65,6 +66,7 @@ const MINI_PLAYER_HEIGHT: f32 = 380.0;
 const RESIZE_BORDER: f32 = 6.0;
 const RESIZE_CORNER: f32 = 12.0;
 const HOME_CARD_WIDTH: f32 = 232.0;
+const BOOK_CARD_WIDTH: f32 = 184.0;
 
 fn main() -> eframe::Result {
     thread::spawn(perfuse::trim_artwork_cache);
@@ -194,11 +196,12 @@ struct App {
     rx: Receiver<(u64, Reply)>,
     player: Option<player::Player>,
     surface: Option<video::Surface>,
+    book: audiobooks::BookPlayer,
     playing_title: String,
     playing_seconds: f64,
     playing_duration: f64,
     buffered: f64,
-    volume: f64,
+    volume: prefs::Volume,
     seek_position: Option<f64>,
     fullscreen: bool,
     always_on_top: bool,
@@ -314,11 +317,12 @@ impl App {
             rx,
             player: None,
             surface: None,
+            book: Default::default(),
             playing_title: String::new(),
             playing_seconds: 0.0,
             playing_duration: 0.0,
             buffered: 0.0,
-            volume: 100.0,
+            volume: prefs::Volume::load(),
             seek_position: None,
             fullscreen: false,
             always_on_top: false,
@@ -387,7 +391,7 @@ impl App {
                     if !matches && !single_plex {
                         continue;
                     }
-                    saved.token = token;
+                    saved.token = token.into();
                 }
             }
             if let Ok(source) = session::open(&saved) {
@@ -542,6 +546,7 @@ impl App {
         }
         self.covers.loading = true;
         let sections = self.sections.clone();
+        let continue_heading = self.continue_heading();
         let (tx, ctx, current) = (self.tx.clone(), ctx.clone(), self.generation.clone());
         thread::spawn(move || {
             match source.browse(&location.browse, &location.search, location.offset) {
@@ -554,7 +559,7 @@ impl App {
                             .browse(&Browse::ContinueWatching, "", 0)
                             .map(|page| page.items)
                             .unwrap_or_else(|_| {
-                                unavailable.push("Continue Watching");
+                                unavailable.push(continue_heading);
                                 vec![]
                             });
                         let released = source.recently_released(&sections).unwrap_or_else(|_| {
@@ -623,6 +628,7 @@ impl App {
     }
 
     fn library(&mut self, section: &Library, ctx: &egui::Context) {
+        self.book.full = false;
         self.selected_library = Some(section.id.clone());
         self.history.clear();
         self.search.clear();
@@ -740,11 +746,8 @@ impl App {
                         location.offset = page.offset;
                     }
                     let visible = |item: &Item| {
-                        !self.active.is_some_and(|i| {
-                            item.library_id
-                                .as_ref()
-                                .is_some_and(|id| self.servers[i].prefs.hidden.contains(id))
-                        })
+                        self.active
+                            .is_none_or(|i| self.servers[i].item_visible(item))
                     };
                     self.page = Some(page);
                     if let Some((on_deck, released)) = home_rows {
@@ -804,30 +807,48 @@ impl App {
             }
         }
         let mut finished = None;
-        if let Some(player) = &self.player {
-            while let Ok(event) = player.events.try_recv() {
-                match event {
-                    player::Event::Playing {
-                        seconds,
-                        duration,
-                        buffered,
-                        paused,
-                        volume,
-                    } => {
-                        self.playing_seconds = seconds;
-                        self.playing_duration = duration;
-                        self.buffered = buffered;
-                        self.volume = volume;
-                        self.paused = paused;
+        while let Some(event) = self
+            .player
+            .as_ref()
+            .and_then(|player| player.events.try_recv().ok())
+        {
+            match event {
+                player::Event::Playing {
+                    seconds,
+                    duration,
+                    buffered,
+                    paused,
+                    ..
+                } => {
+                    self.playing_seconds = seconds;
+                    self.playing_duration = duration;
+                    self.buffered = buffered;
+                    self.paused = paused;
+                    if !paused || seconds > 0.0 {
+                        self.book.completed = false;
                     }
-                    player::Event::Warning(message) => self.notice = Some(message),
-                    player::Event::Finished(result) => finished = Some(result),
                 }
+                player::Event::BookCompleted => self.book_completed(ctx),
+                player::Event::ChapterSleepExpired(end) => {
+                    self.book_chapter_sleep_expired(ctx, end)
+                }
+                player::Event::Warning(message) => self.notice = Some(message),
+                player::Event::Finished(result) => finished = Some(result),
             }
         }
         if let Some(result) = finished {
             self.player = None;
             self.surface = None;
+            if self.book.is_loaded() {
+                match result {
+                    Ok(()) => self.book_ended(ctx),
+                    Err(error) => {
+                        self.book_finished();
+                        self.error = Some(error);
+                    }
+                }
+                return;
+            }
             self.overlay_focused = true;
             self.overlay_hovered = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(MIN_BROWSE_SIZE));
@@ -874,7 +895,9 @@ impl App {
     }
 
     fn back(&mut self, ctx: &egui::Context) {
-        if self.connection_open {
+        if self.book.full {
+            self.book.full = false;
+        } else if self.connection_open {
             self.connection_open = false;
         } else if self.detail.is_some() {
             self.detail = None;
@@ -905,7 +928,7 @@ impl App {
     }
 
     fn is_mini_player(&self, ctx: &egui::Context) -> bool {
-        if self.player.is_none() || self.fullscreen {
+        if self.player.is_none() || self.book.is_loaded() || self.fullscreen {
             return false;
         }
         let size = ctx.content_rect().size();
@@ -956,11 +979,12 @@ impl App {
                     }
                 }
                 ui.horizontal_centered(|ui| {
-                    if self.player.is_none() {
+                    if self.player.is_none() || self.book.is_loaded() {
                         if ui
                             .add_enabled(
                                 !self.busy
-                                    && (self.detail.is_some()
+                                    && (self.book.full
+                                        || self.detail.is_some()
                                         || self.connection_open
                                         || !self.history.is_empty()
                                         || (!self.servers.is_empty() && !self.overview)),
@@ -1048,13 +1072,14 @@ impl App {
                                 ui,
                                 Icon::Home,
                                 "Home",
-                                self.overview && !self.connection_open,
+                                self.overview && !self.connection_open && !self.book.full,
                             )
                         })
                         .inner
                         .clicked()
                         && !self.busy
                     {
+                        self.book.full = false;
                         self.overview = true;
                         self.connection_open = false;
                         self.detail = None;
@@ -1076,10 +1101,11 @@ impl App {
                             ui,
                             Icon::Settings,
                             "Servers & settings",
-                            self.connection_open,
+                            self.connection_open && !self.book.full,
                         )
                         .clicked()
                         {
+                            self.book.full = false;
                             self.connection_open = true;
                         }
                         self.status_button(ui, ctx);
@@ -1136,6 +1162,7 @@ impl App {
             return;
         }
         let server_home = self.active == Some(i)
+            && !self.book.full
             && !self.overview
             && !self.connection_open
             && self.selected_library.is_none()
@@ -1163,14 +1190,11 @@ impl App {
                 let mut row_rects = Vec::with_capacity(section_count);
                 for (index, section) in sections.iter().enumerate() {
                     let selected = !self.overview
+                        && !self.book.full
                         && self.active == Some(i)
                         && !self.connection_open
                         && self.selected_library.as_ref() == Some(&section.id);
-                    let icon = if section.kind == Kind::Series {
-                        Icon::TvShows
-                    } else {
-                        Icon::Movies
-                    };
+                    let icon = servers::library_icon(section);
                     let dragging_this = self.servers[i].dragging_section == Some(index);
                     let response = nav_item(
                         ui,
@@ -1302,6 +1326,177 @@ impl App {
         self.load_page(ctx, false);
     }
 
+    fn audiobook_server(&self) -> bool {
+        self.active
+            .is_some_and(|i| self.servers[i].session.kind == ServerKind::Audiobookshelf)
+    }
+
+    fn continue_heading(&self) -> &'static str {
+        if self.audiobook_server() {
+            "Continue Listening"
+        } else {
+            "Continue Watching"
+        }
+    }
+
+    fn library_search_fields(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        autofocus: bool,
+    ) -> bool {
+        ui.horizontal(|ui| {
+            let (search, clear) = Pill::pair(
+                ui,
+                Pill::secondary(Icon::Search, "Search"),
+                Pill::secondary(Icon::Clear, "Clear"),
+            );
+            let clearing = !self.search.is_empty();
+            let shown: &[&Pill] = if clearing {
+                &[&search, &clear]
+            } else {
+                &[&search]
+            };
+            // Keep the field usable; narrower rows drop the button labels.
+            let compact = !Pill::labels_fit(ui, shown, 264.0);
+            let (search, clear) = (search.icon_only(compact), clear.icon_only(compact));
+            let spacing = ui.spacing().item_spacing.x;
+            let mut buttons = search.width(ui) + spacing;
+            if clearing {
+                buttons += clear.width(ui) + spacing;
+            }
+            // The text edit adds its 12pt side margins to the desired width.
+            let search_width = (ui.available_width() - buttons - 24.0).max(80.0);
+            let response = ui.add_enabled(
+                !self.busy,
+                egui::TextEdit::singleline(&mut self.search)
+                    .hint_text("Search this library")
+                    .desired_width(search_width)
+                    .margin(Vec2::new(12.0, 10.0)),
+            );
+            if autofocus {
+                response.request_focus();
+            }
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::TextEdit,
+                    ui.is_enabled(),
+                    "Search library",
+                )
+            });
+            let submitted = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if ui.add_enabled(!self.busy, search).clicked() || submitted {
+                self.search_library(ctx);
+                return true;
+            }
+            if clearing && ui.add_enabled(!self.busy, clear).clicked() {
+                self.search.clear();
+                self.search_library(ctx);
+                return true;
+            }
+            false
+        })
+        .inner
+    }
+
+    fn audiobook_collection_header(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        server: usize,
+        title: &str,
+        home: bool,
+    ) {
+        let name = self.servers[server].name();
+        let query = self
+            .location
+            .as_ref()
+            .map_or("", |location| location.search.trim());
+        let filtered = !query.is_empty();
+        let subtitle = if home {
+            let count = self.sections.len();
+            let noun = if count == 1 { "library" } else { "libraries" };
+            format!("Audiobookshelf server · {count} {noun}")
+        } else if let Some(page) = &self.page {
+            let count = match page.total {
+                Some(1) => "1 audiobook".to_owned(),
+                Some(n) => format!("{n} audiobooks"),
+                None => format!(
+                    "{}–{} audiobooks",
+                    page.offset + 1,
+                    page.offset + page.items.len()
+                ),
+            };
+            if filtered {
+                format!("{count} matching “{query}”")
+            } else {
+                count
+            }
+        } else {
+            String::new()
+        };
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = 16.0;
+            let width = (ui.available_width() - 60.0).max(0.0);
+            ui.vertical(|ui| {
+                ui.set_width(width);
+                ui.spacing_mut().item_spacing.y = 8.0;
+                ui.horizontal(|ui| audiobooks::book_crumb(ui, &name, None));
+                ui.add(
+                    egui::Label::new(RichText::new(title).size(30.0).line_height(Some(36.0)))
+                        .truncate(),
+                )
+                .on_hover_text(title);
+                if !subtitle.is_empty() {
+                    ui.label(
+                        RichText::new(subtitle)
+                            .size(15.0)
+                            .line_height(Some(22.5))
+                            .color(MUTED),
+                    );
+                }
+            });
+            if home {
+                if ui
+                    .add_enabled(
+                        !self.busy,
+                        IconButton::new(Icon::Refresh, "Refresh").size(44.0),
+                    )
+                    .clicked()
+                {
+                    self.load_page(ctx, false);
+                }
+            } else {
+                let trigger = ui.add(
+                    IconButton::new(Icon::Search, "Search audiobooks")
+                        .active(filtered)
+                        .size(44.0),
+                );
+                egui::Popup::from_toggle_button_response(&trigger)
+                    .align(egui::RectAlign::BOTTOM_END)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .frame(popover_frame())
+                    .show(|ui| {
+                        ui.set_width(400.0);
+                        if self.library_search_fields(ui, ctx, trigger.clicked()) {
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(
+                                !self.busy,
+                                Pill::secondary(Icon::Refresh, "Refresh library"),
+                            )
+                            .clicked()
+                        {
+                            self.load_page(ctx, false);
+                            ui.close();
+                        }
+                    });
+            }
+        });
+        ui.add_space(28.0);
+    }
+
     fn collection(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.spacing_mut().item_spacing.y = 12.0;
         let home = self.selected_library.is_none();
@@ -1311,95 +1506,60 @@ impl App {
             .map(|l| l.title.as_str())
             .unwrap_or("Your library")
             .to_owned();
-        ui.horizontal(|ui| {
-            let title_width = (ui.available_width() - 110.0).max(80.0);
-            ui.allocate_ui_with_layout(
-                Vec2::new(title_width, 40.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    ui.add(egui::Label::new(RichText::new(&title).size(30.0).strong()).truncate())
-                        .on_hover_text(&title);
-                },
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add_enabled(!self.busy, IconButton::new(Icon::Refresh, "Refresh"))
-                    .clicked()
-                {
-                    self.load_page(ctx, false);
-                }
-                if self.busy {
-                    ui.spinner();
-                }
-            });
-        });
-        if let Some(i) = self.active {
-            let server = &self.servers[i];
-            let kind = server.session.kind.plugin().name;
+        if let Some(i) = self.active.filter(|_| self.audiobook_server()) {
+            self.audiobook_collection_header(ui, ctx, i, &title, home);
+        } else {
             ui.horizontal(|ui| {
-                ui.add(server.icon().image(15.0, MUTED));
-                ui.colored_label(
-                    MUTED,
-                    if home {
-                        format!("{kind} server · {} libraries", self.sections.len())
-                    } else {
-                        format!("{kind} / {}", server.name())
+                let title_width = (ui.available_width() - 110.0).max(80.0);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(title_width, 40.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.add(
+                            egui::Label::new(RichText::new(&title).size(30.0).strong()).truncate(),
+                        )
+                        .on_hover_text(&title);
                     },
                 );
-            });
-        }
-        ui.add_space(34.0);
-        if self.location.as_ref().is_some_and(|l| l.library) {
-            ui.horizontal(|ui| {
-                let (search, clear) = Pill::pair(
-                    ui,
-                    Pill::secondary(Icon::Search, "Search"),
-                    Pill::secondary(Icon::Clear, "Clear"),
-                );
-                let clearing = !self.search.is_empty();
-                let shown: &[&Pill] = if clearing {
-                    &[&search, &clear]
-                } else {
-                    &[&search]
-                };
-                // Keep the field usable; narrower rows drop the button labels.
-                let compact = !Pill::labels_fit(ui, shown, 264.0);
-                let (search, clear) = (search.icon_only(compact), clear.icon_only(compact));
-                let spacing = ui.spacing().item_spacing.x;
-                let mut buttons = search.width(ui) + spacing;
-                if clearing {
-                    buttons += clear.width(ui) + spacing;
-                }
-                // The text edit adds its 12pt side margins to the desired width.
-                let search_width = (ui.available_width() - buttons - 24.0).max(80.0);
-                let response = ui.add_enabled(
-                    !self.busy,
-                    egui::TextEdit::singleline(&mut self.search)
-                        .hint_text("Search this library")
-                        .desired_width(search_width)
-                        .margin(Vec2::new(12.0, 10.0)),
-                );
-                response.widget_info(|| {
-                    egui::WidgetInfo::labeled(
-                        egui::WidgetType::TextEdit,
-                        ui.is_enabled(),
-                        "Search library",
-                    )
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(!self.busy, IconButton::new(Icon::Refresh, "Refresh"))
+                        .clicked()
+                    {
+                        self.load_page(ctx, false);
+                    }
+                    if self.busy {
+                        ui.spinner();
+                    }
                 });
-                let submitted =
-                    response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if ui.add_enabled(!self.busy, search).clicked() || submitted {
-                    self.search_library(ctx);
-                }
-                if clearing && ui.add_enabled(!self.busy, clear).clicked() {
-                    self.search.clear();
-                    self.search_library(ctx);
-                }
             });
-            ui.add_space(28.0);
+            if let Some(i) = self.active {
+                let server = &self.servers[i];
+                let kind = server.session.kind.plugin().name;
+                ui.horizontal(|ui| {
+                    ui.add(server.icon().image(15.0, MUTED));
+                    ui.colored_label(
+                        MUTED,
+                        if home {
+                            format!("{kind} server · {} libraries", self.sections.len())
+                        } else {
+                            format!("{kind} / {}", server.name())
+                        },
+                    );
+                });
+            }
+            ui.add_space(34.0);
+            if self.location.as_ref().is_some_and(|l| l.library) {
+                self.library_search_fields(ui, ctx, false);
+                ui.add_space(28.0);
+            }
         }
         if self.sections.is_empty() {
-            ui.heading("No movie or TV libraries available");
+            ui.heading(if self.audiobook_server() {
+                "No audiobook libraries available"
+            } else {
+                "No movie or TV libraries available"
+            });
             ui.label("Check this user's library access on the server, then reconnect in settings.");
             return;
         }
@@ -1410,6 +1570,18 @@ impl App {
                 || self.page.is_some()
                 || !self.on_deck.is_empty()
                 || !self.released.is_empty());
+        let audiobook_server = self.audiobook_server();
+        let continue_heading = self.continue_heading();
+        let book_status = |item: &Item| {
+            self.source
+                .as_ref()
+                .filter(|source| self.book.is_current(source, &item.id))
+                .map(|_| BookCardPlayback {
+                    paused: self.paused,
+                    elapsed_ms: (self.playing_seconds * 1000.0) as u64,
+                    finished: self.book.completed,
+                })
+        };
         egui::ScrollArea::vertical()
             .id_salt(("collection", &title))
             .auto_shrink([false, false])
@@ -1418,9 +1590,9 @@ impl App {
                     hero(ui, parent, &self.covers, "TV LIBRARY");
                     ui.add_space(38.0);
                 }
-                if show_home_rows {
+                if show_home_rows && (!audiobook_server || !self.on_deck.is_empty()) {
                     if self.on_deck.is_empty() {
-                        ui.label(RichText::new("Continue Watching").size(22.0).strong());
+                        ui.label(RichText::new(continue_heading).size(22.0).strong());
                         ui.label(
                             RichText::new(
                                 "Nothing to continue. Start a film or episode from your library.",
@@ -1428,15 +1600,31 @@ impl App {
                             .color(MUTED),
                         );
                     } else {
+                        let shelf = if audiobook_server {
+                            Shelf::books(self.on_deck.len())
+                        } else {
+                            Shelf::Video(1)
+                        };
                         home_carousel(
                             ui,
                             "continue",
-                            "Continue Watching",
+                            continue_heading,
                             self.carousel_offsets.entry("continue").or_default(),
                             &self.on_deck,
-                            1,
+                            shelf,
                             |ui, item| {
-                                if continue_card(ui, item, &self.covers) && !self.busy {
+                                let clicked = if audiobook_server {
+                                    book_card(
+                                        ui,
+                                        item,
+                                        &self.covers,
+                                        BOOK_CARD_WIDTH,
+                                        book_status(item),
+                                    )
+                                } else {
+                                    continue_card(ui, item, &self.covers)
+                                };
+                                if clicked && !self.busy {
                                     picked = Some(item.clone());
                                 }
                             },
@@ -1450,7 +1638,7 @@ impl App {
                             "Recently Released",
                             self.carousel_offsets.entry("released").or_default(),
                             &self.released,
-                            1,
+                            Shelf::Video(1),
                             |ui, item| {
                                 if released_card(ui, item, &self.covers) && !self.busy {
                                     picked = Some(item.clone());
@@ -1466,6 +1654,66 @@ impl App {
                         .as_ref()
                         .is_some_and(|l| !l.previous_pages.is_empty());
                     let has_next = page.has_next();
+                    let items: Vec<_> = page
+                        .items
+                        .iter()
+                        .filter(|item| {
+                            self.active
+                                .is_none_or(|i| self.servers[i].item_visible(item))
+                        })
+                        .collect();
+                    if audiobook_server && !items.is_empty() {
+                        let mut draw = |ui: &mut egui::Ui, item: &Item, width| {
+                            if book_card(ui, item, &self.covers, width, book_status(item))
+                                && !self.busy
+                            {
+                                picked = Some(item.clone());
+                            }
+                        };
+                        if home {
+                            let range = format!(
+                                "{}–{}{}",
+                                page.offset + 1,
+                                page.offset + page.items.len(),
+                                page.total.map(|n| format!(" of {n}")).unwrap_or_default()
+                            );
+                            page_action = ui
+                                .push_id(page.offset, |ui| {
+                                    home_carousel(
+                                        ui,
+                                        "added_books",
+                                        "Recently Added",
+                                        self.carousel_offsets.entry("added_books").or_default(),
+                                        &items,
+                                        Shelf::Books {
+                                            meta: range,
+                                            previous_page: !self.busy && has_previous,
+                                            next_page: !self.busy && has_next,
+                                        },
+                                        |ui, item| draw(ui, item, BOOK_CARD_WIDTH),
+                                    )
+                                })
+                                .inner;
+                        } else {
+                            let columns = ((ui.available_width() + 16.0) / (BOOK_CARD_WIDTH + 16.0))
+                                .floor()
+                                .max(1.0) as usize;
+                            let width = (ui.available_width() - 16.0 * (columns - 1) as f32)
+                                / columns as f32;
+                            egui::Grid::new("book_covers")
+                                .num_columns(columns)
+                                .spacing([16.0, 24.0])
+                                .show(ui, |ui| {
+                                    for (index, item) in items.into_iter().enumerate() {
+                                        draw(ui, item, width);
+                                        if (index + 1) % columns == 0 {
+                                            ui.end_row();
+                                        }
+                                    }
+                                });
+                        }
+                        return;
+                    }
                     control_row(ui, 32.0, |ui| {
                         ui.label(
                             RichText::new(if home {
@@ -1517,17 +1765,6 @@ impl App {
                         }
                     });
                     ui.add_space(14.0);
-                    let items: Vec<_> = page
-                        .items
-                        .iter()
-                        .filter(|item| {
-                            !self.active.is_some_and(|i| {
-                                item.library_id
-                                    .as_ref()
-                                    .is_some_and(|id| self.servers[i].prefs.hidden.contains(id))
-                            })
-                        })
-                        .collect();
                     if items.is_empty() {
                         ui.add_space(34.0);
                         ui.heading("No titles found");
@@ -1628,9 +1865,14 @@ impl App {
     }
 
     fn details(&mut self, ui: &mut egui::Ui) -> bool {
-        let Some(item) = self.detail.clone() else {
+        let Some(item) = self.detail.take() else {
             return false;
         };
+        if item.kind == Kind::Audiobook {
+            let play = self.book_details(ui, &item);
+            self.detail = Some(item);
+            return play;
+        }
         let mut play = false;
         egui::ScrollArea::vertical()
             .id_salt("detail_page")
@@ -1760,6 +2002,7 @@ impl App {
                         );
                     });
             });
+        self.detail = Some(item);
         play
     }
 
@@ -1771,19 +2014,33 @@ impl App {
         if self.runtime_rx.is_some() {
             return;
         }
-        let (Some(item), Some(source)) = (self.detail.clone(), self.source.clone()) else {
+        let (Some(mut item), Some(source)) = (self.detail.clone(), self.source.clone()) else {
             return;
         };
-        if self.player.is_some() {
+        if self.player.is_some() && !self.book.is_loaded() {
             return;
         }
-        let surface = match video::Surface::new(frame) {
-            Ok(surface) => surface,
-            Err(error) => {
-                self.error = Some(error);
-                return;
+        let audiobook = item.kind == Kind::Audiobook;
+        let surface = if audiobook {
+            if let Some(ms) = self.book.start_at_ms.take() {
+                item.resume_ms = Some(ms);
+                self.resume = true;
+            }
+            None
+        } else {
+            match video::Surface::new(frame) {
+                Ok(surface) => Some(surface),
+                Err(error) => {
+                    self.error = Some(error);
+                    return;
+                }
             }
         };
+        if self.book.is_loaded() {
+            // Join the previous worker so its final progress reaches the original source.
+            self.player = None;
+            self.book_finished();
+        }
         self.playing_title = item.title.clone();
         self.playing_format = item
             .versions
@@ -1804,16 +2061,25 @@ impl App {
         self.error = None;
         self.overlay_focused = true;
         self.overlay_hovered = false;
-        self.player = Some(player::Player::start(
-            Some(surface.id()),
+        if audiobook {
+            self.book_started(&item, &source);
+        }
+        let player = player::Player::start(
+            surface.as_ref().map(video::Surface::id),
             source,
             item,
-            self.version,
-            self.resume,
-        ));
-        self.surface = Some(surface);
+            player::StartOptions {
+                version: self.version,
+                resume: self.resume,
+                volume: self.volume.gain(),
+            },
+        );
+        self.player = Some(player);
+        self.surface = surface;
         self.connection_open = false;
-        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(MIN_PLAYBACK_SIZE));
+        if !audiobook {
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(MIN_PLAYBACK_SIZE));
+        }
     }
 
     fn settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -2390,7 +2656,7 @@ impl App {
                                             ui,
                                             &mut position,
                                             self.playing_duration,
-                                            self.playing_seconds + self.buffered,
+                                            Some(self.playing_seconds + self.buffered),
                                         );
                                         if seek.dragged() {
                                             self.seek_position = Some(position);
@@ -2515,26 +2781,29 @@ impl App {
                                     |ui| {
                                         ui.spacing_mut().slider_width = 110.0;
                                         ui.visuals_mut().selection.bg_fill = ACCENT;
+                                        let mut gain = self.volume.gain();
                                         let slider = ui.add(
-                                            egui::Slider::new(&mut self.volume, 0.0..=100.0)
+                                            egui::Slider::new(&mut gain, 0.0..=100.0)
                                                 .show_value(false)
                                                 .trailing_fill(true),
                                         );
-                                        let icon = if self.volume <= 0.0 {
+                                        let icon = if gain <= 0.0 {
                                             Icon::VolumeMuted
-                                        } else if self.volume < 50.0 {
+                                        } else if gain < 50.0 {
                                             Icon::VolumeLow
                                         } else {
                                             Icon::VolumeHigh
                                         };
                                         let label =
                                             ui.add(icon.image(20.0, TEXT).alt_text("Volume"));
-                                        if slider
+                                        let slider = slider
                                             .labelled_by(label.id)
-                                            .on_hover_text(format!("Volume {:.0}%", self.volume))
-                                            .changed()
-                                        {
-                                            player.volume(self.volume);
+                                            .on_hover_text(format!("Volume {gain:.0}%"));
+                                        if slider.changed() && self.volume.set(gain) {
+                                            player.volume(gain);
+                                        }
+                                        if !slider.dragged() {
+                                            self.volume.save();
                                         }
                                     },
                                 );
@@ -2604,6 +2873,10 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn on_exit(&mut self, _: Option<&eframe::glow::Context>) {
+        self.volume.save();
+    }
+
     fn clear_color(&self, _: &egui::Visuals) -> [f32; 4] {
         // Root window gaps/margins must stay opaque. eframe clears immediate
         // viewports (the playback overlay) separately to transparent RGBA.
@@ -2612,9 +2885,11 @@ impl eframe::App for App {
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.poll(ctx);
+        self.book_tick(ctx);
         self.poll_updates(ctx);
         self.covers.now = ctx.input(|i| i.time);
-        if self.player.is_none() && self.covers.animating() {
+        let video_playing = self.player.is_some() && !self.book.is_loaded();
+        if !video_playing && self.covers.animating() {
             ctx.request_repaint();
         }
         if self.player.is_some() || self.busy || self.login.is_some() || self.runtime_rx.is_some() {
@@ -2624,8 +2899,11 @@ impl eframe::App for App {
         if !self.fullscreen && !mini {
             self.titlebar(ctx);
         }
-        if self.source.is_some() && self.player.is_none() {
+        if self.source.is_some() && !video_playing {
             self.sidebar(ctx);
+        }
+        if self.book.is_loaded() && !self.book.full {
+            self.book_dock(ctx);
         }
         let show_global_error = self.source.is_some() && !self.adding;
         if !mini
@@ -2673,13 +2951,14 @@ impl eframe::App for App {
                     }
                 });
         }
-        if self.player.is_some() {
+        if video_playing {
             if let Some(surface) = &self.surface {
                 surface.place(ctx.available_rect(), ctx.pixels_per_point());
                 surface.reclaim_keyboard();
             }
             self.playback_controls(ctx, mini);
         } else if self.source.is_some()
+            && !self.book.full
             && !self.connection_open
             && !self.overview
             && self.selected_library.is_some()
@@ -2730,8 +3009,24 @@ impl eframe::App for App {
                     } else {
                         Color32::BLACK
                     })
-                    .inner_margin(if self.player.is_some() {
+                    .inner_margin(if video_playing {
                         egui::Margin::ZERO
+                    } else if self.book.full
+                        || self
+                            .detail
+                            .as_ref()
+                            .is_some_and(|item| item.kind == Kind::Audiobook)
+                        || (!self.connection_open && !self.overview && self.audiobook_server())
+                    {
+                        let padding = if ctx.content_rect().width() <= 1000.0 {
+                            32
+                        } else {
+                            48
+                        };
+                        egui::Margin {
+                            bottom: if self.book.full { 0 } else { padding },
+                            ..egui::Margin::same(padding)
+                        }
                     } else if self.source.is_some() {
                         egui::Margin::symmetric(48, 38)
                     } else {
@@ -2739,9 +3034,11 @@ impl eframe::App for App {
                     }),
             )
             .show(ctx, |ui| {
-                if self.player.is_some() {
+                if video_playing {
                     let rect = ui.available_rect_before_wrap();
                     ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
+                } else if self.book.full {
+                    self.book_full_player(ui);
                 } else if self.source.is_none() {
                     self.onboarding(ui, ctx);
                 } else {
@@ -2764,6 +3061,7 @@ impl eframe::App for App {
         if play {
             self.start_playback(ctx, frame);
         }
+        self.show_book_toast(ctx);
         if self.surface.is_none() {
             if !mini {
                 self.update_notification(ctx, 58.0);
@@ -3379,6 +3677,27 @@ fn info_row(ui: &mut egui::Ui, label: &str, value: &str) {
 }
 
 fn cover(ui: &mut egui::Ui, item: &Item, covers: &Artwork, size: Vec2) -> egui::Response {
+    cover_view(ui, item, covers, size, true)
+}
+
+fn cover_view(
+    ui: &mut egui::Ui,
+    item: &Item,
+    covers: &Artwork,
+    size: Vec2,
+    interactive: bool,
+) -> egui::Response {
+    cover_view_rounded(ui, item, covers, size, interactive, 8)
+}
+
+fn cover_view_rounded(
+    ui: &mut egui::Ui,
+    item: &Item,
+    covers: &Artwork,
+    size: Vec2,
+    interactive: bool,
+    radius: u8,
+) -> egui::Response {
     let path = if size.x > size.y && item.kind == Kind::Movie {
         item.art
             .as_ref()
@@ -3387,31 +3706,44 @@ fn cover(ui: &mut egui::Ui, item: &Item, covers: &Artwork, size: Vec2) -> egui::
     } else {
         item.thumb.as_ref()
     };
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let sense = if interactive {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(size, sense);
     response.widget_info(|| {
         egui::WidgetInfo::labeled(
-            egui::WidgetType::Button,
+            if interactive {
+                egui::WidgetType::Button
+            } else {
+                egui::WidgetType::Image
+            },
             ui.is_enabled(),
-            format!("Open {}", item.title),
+            if interactive {
+                format!("Open {}", item.title)
+            } else {
+                format!("Cover of {}", item.title)
+            },
         )
     });
     if let Some((texture, opacity)) = path.and_then(|path| covers.get(path)) {
         if opacity < 1.0 {
             ui.painter()
-                .rect_filled(rect, 8.0, Color32::from_rgb(34, 36, 40));
+                .rect_filled(rect, radius, Color32::from_rgb(34, 36, 40));
         }
         let ratio = size.x / size.y / texture.aspect_ratio();
         let uv_size = Vec2::new(ratio.min(1.0), (1.0 / ratio).min(1.0));
         egui::Image::new(texture)
             .uv(egui::Rect::from_center_size(egui::pos2(0.5, 0.5), uv_size))
-            .corner_radius(8)
+            .corner_radius(radius)
             .tint(Color32::WHITE.gamma_multiply(opacity))
             .paint_at(ui, rect);
     } else if covers.pending(path) {
-        placeholder(ui, rect, 8.0);
+        placeholder(ui, rect, radius as f32);
     } else {
         ui.painter()
-            .rect_filled(rect, 8.0, Color32::from_rgb(34, 36, 40));
+            .rect_filled(rect, radius, Color32::from_rgb(34, 36, 40));
         ui.painter().text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
@@ -3420,15 +3752,34 @@ fn cover(ui: &mut egui::Ui, item: &Item, covers: &Artwork, size: Vec2) -> egui::
             ACCENT,
         );
     }
-    if response.hovered() || response.has_focus() {
+    if interactive && (response.hovered() || response.has_focus()) {
         ui.painter().rect_stroke(
             rect,
-            8.0,
+            radius,
             egui::Stroke::new(2.0_f32, ACCENT),
             egui::StrokeKind::Inside,
         );
     }
     response
+}
+
+enum Shelf {
+    Video(usize),
+    Books {
+        meta: String,
+        previous_page: bool,
+        next_page: bool,
+    },
+}
+
+impl Shelf {
+    fn books(count: usize) -> Self {
+        Self::Books {
+            meta: count.to_string(),
+            previous_page: false,
+            next_page: false,
+        }
+    }
 }
 
 fn home_carousel<T>(
@@ -3437,41 +3788,79 @@ fn home_carousel<T>(
     heading: &str,
     offset_x: &mut f32,
     items: &[T],
-    rows: usize,
+    shelf: Shelf,
     mut card: impl FnMut(&mut egui::Ui, &T),
-) {
+) -> i8 {
     let viewport = ui.available_width();
-    let spacing = ui.spacing().item_spacing.x;
-    let pitch = HOME_CARD_WIDTH + spacing;
+    let book_shelf = matches!(shelf, Shelf::Books { .. });
+    let (rows, card_width, spacing) = match shelf {
+        Shelf::Video(rows) => (rows, HOME_CARD_WIDTH, ui.spacing().item_spacing.x),
+        Shelf::Books { .. } => (1, BOOK_CARD_WIDTH, 16.0),
+    };
+    let pitch = card_width + spacing;
     let visible_columns = ((viewport + spacing) / pitch).floor().max(1.0) as usize;
     let page_size = visible_columns * rows;
     let columns =
         items.len() / page_size * visible_columns + (items.len() % page_size).min(visible_columns);
     let max_offset = (columns as f32 * pitch - spacing - viewport).max(0.0);
     let mut scroll_delta = 0.0_f32;
+    let mut page_action = 0;
     control_row(ui, 32.0, |ui| {
-        ui.label(RichText::new(heading).size(22.0).strong());
-        if max_offset > 1.0 {
+        let (previous_page, next_page) = if let Shelf::Books {
+            meta,
+            previous_page,
+            next_page,
+        } = shelf
+        {
+            ui.spacing_mut().item_spacing.x = 12.0;
+            ui.label(RichText::new(heading).size(22.0));
+            ui.label(RichText::new(meta).size(13.0).color(MUTED));
+            ui.spacing_mut().item_spacing.x = 8.0;
+            (previous_page, next_page)
+        } else {
+            ui.label(RichText::new(heading).size(22.0).strong());
+            (false, false)
+        };
+        if book_shelf || max_offset > 1.0 {
             let step = visible_columns as f32 * pitch;
-            let back_label = format!("Scroll {heading} back");
+            let size = if book_shelf { 28.0 } else { 32.0 };
+            let can_scroll_back = *offset_x > 1.0;
+            let can_scroll_forward = *offset_x < max_offset - 1.0;
+            let back_label = if previous_page && !can_scroll_back {
+                format!("Previous {heading} page")
+            } else {
+                format!("Scroll {heading} back")
+            };
             if ui
                 .add_enabled(
-                    *offset_x > 1.0,
-                    IconButton::new(Icon::PagePrevious, &back_label),
+                    can_scroll_back || previous_page,
+                    IconButton::new(Icon::PagePrevious, &back_label).size(size),
                 )
                 .clicked()
             {
-                scroll_delta = step.min(offset_x.max(0.0));
+                if can_scroll_back {
+                    scroll_delta = step.min(offset_x.max(0.0));
+                } else {
+                    page_action = -1;
+                }
             }
-            let forward_label = format!("Scroll {heading} forward");
+            let forward_label = if next_page && !can_scroll_forward {
+                format!("Next {heading} page")
+            } else {
+                format!("Scroll {heading} forward")
+            };
             if ui
                 .add_enabled(
-                    *offset_x < max_offset - 1.0,
-                    IconButton::new(Icon::PageNext, &forward_label),
+                    can_scroll_forward || next_page,
+                    IconButton::new(Icon::PageNext, &forward_label).size(size),
                 )
                 .clicked()
             {
-                scroll_delta = -step.min((max_offset - *offset_x).max(0.0));
+                if can_scroll_forward {
+                    scroll_delta = -step.min((max_offset - *offset_x).max(0.0));
+                } else {
+                    page_action = 1;
+                }
             }
         }
     });
@@ -3479,6 +3868,7 @@ fn home_carousel<T>(
         .id_salt(id)
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
         .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = spacing;
             if scroll_delta != 0.0 {
                 ui.scroll_with_delta(Vec2::new(scroll_delta, 0.0));
             }
@@ -3497,14 +3887,136 @@ fn home_carousel<T>(
             });
         });
     *offset_x = output.state.offset.x;
+    page_action
+}
+
+#[derive(Clone, Copy)]
+struct BookCardPlayback {
+    paused: bool,
+    elapsed_ms: u64,
+    finished: bool,
+}
+
+fn book_card(
+    ui: &mut egui::Ui,
+    item: &Item,
+    covers: &Artwork,
+    width: f32,
+    playing: Option<BookCardPlayback>,
+) -> bool {
+    let elapsed = playing.map_or(item.resume_ms.unwrap_or(0), |live| live.elapsed_ms);
+    let finished = playing.map_or(item.watched, |live| live.finished);
+    let mut clicked = false;
+    ui.vertical(|ui| {
+        ui.set_width(width);
+        ui.spacing_mut().item_spacing.y = 8.0;
+        let response = cover(ui, item, covers, Vec2::splat(width));
+        let rect = response.rect;
+        clicked |= response.on_hover_text(&item.title).clicked();
+        let corner = rect.min + Vec2::splat(10.0);
+        if let Some(live) = playing {
+            let text = if live.paused { "Paused" } else { "Playing" };
+            let label = ui.painter().layout_no_wrap(
+                text.into(),
+                egui::FontId::proportional(11.0),
+                Color32::WHITE,
+            );
+            let badge = egui::Rect::from_min_size(corner, Vec2::new(label.size().x + 32.0, 24.0));
+            ui.painter()
+                .rect_filled(badge, 12, Color32::from_black_alpha(184));
+            Icon::NowPlaying.paint(ui, corner + Vec2::new(13.0, 12.0), 14.0, Color32::WHITE);
+            ui.painter().galley(
+                corner + Vec2::new(24.0, (24.0 - label.size().y) * 0.5),
+                label,
+                Color32::WHITE,
+            );
+        } else if finished {
+            let center = corner + Vec2::splat(10.0);
+            ui.painter().circle_filled(center, 10.0, Color32::WHITE);
+            Icon::Check.paint(ui, center, 14.0, Color32::BLACK);
+        }
+        if !finished
+            && elapsed > 0
+            && let Some(duration) = item.duration_ms.filter(|&ms| ms > 0)
+        {
+            let track = egui::Rect::from_min_size(
+                rect.left_bottom() + Vec2::new(8.0, -11.0),
+                Vec2::new(width - 16.0, 3.0),
+            );
+            ui.painter()
+                .rect_filled(track, 2, Color32::from_white_alpha(71));
+            ui.painter().rect_filled(
+                egui::Rect::from_min_size(
+                    track.min,
+                    Vec2::new(
+                        track.width() * (elapsed as f32 / duration as f32).clamp(0.0, 1.0),
+                        3.0,
+                    ),
+                ),
+                2,
+                ACCENT,
+            );
+        }
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            clicked |= ui
+                .add(
+                    egui::Label::new(
+                        RichText::new(&item.title)
+                            .size(15.0)
+                            .line_height(Some(22.5)),
+                    )
+                    .truncate()
+                    .sense(egui::Sense::click()),
+                )
+                .clicked();
+            let duration = if finished {
+                Some("Finished".to_owned())
+            } else {
+                item.duration_ms.map(|ms| {
+                    let text =
+                        audiobooks::book_duration(ms.saturating_sub(elapsed) as f64 / 1000.0);
+                    if elapsed > 0 {
+                        format!("{text} left")
+                    } else {
+                        text
+                    }
+                })
+            };
+            let author = item
+                .book
+                .as_ref()
+                .map(|book| book.author.as_str())
+                .filter(|s| !s.is_empty());
+            let subtitle = [author, duration.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" · ");
+            clicked |= ui
+                .add(
+                    egui::Label::new(
+                        RichText::new(subtitle)
+                            .size(12.0)
+                            .color(MUTED)
+                            .line_height(Some(18.0)),
+                    )
+                    .truncate()
+                    .sense(egui::Sense::click()),
+                )
+                .clicked();
+        });
+    });
+    clicked
 }
 
 fn continue_card(ui: &mut egui::Ui, item: &Item, covers: &Artwork) -> bool {
+    let size = Vec2::new(HOME_CARD_WIDTH, 130.0);
     let mut clicked = false;
     ui.vertical(|ui| {
-        ui.set_width(232.0);
+        ui.set_width(size.x);
         ui.spacing_mut().item_spacing.y = 6.0;
-        let response = cover(ui, item, covers, Vec2::new(232.0, 130.0));
+        let response = cover(ui, item, covers, size);
         let rect = response.rect;
         clicked |= response
             .on_hover_text(format!("Resume {}", item.title))
@@ -3741,7 +4253,7 @@ fn seekbar(
     ui: &mut egui::Ui,
     position: &mut f64,
     duration: f64,
-    buffered_end: f64,
+    buffered_end: Option<f64>,
 ) -> egui::Response {
     let duration = duration.max(1.0);
     let (rect, mut response) = ui.allocate_exact_size(
@@ -3759,11 +4271,12 @@ fn seekbar(
         response.mark_changed();
     }
     if focused {
+        let step = if buffered_end.is_some() { 10.0 } else { 1.0 };
         let delta = ui.input(|i| {
             if i.key_pressed(egui::Key::ArrowRight) {
-                10.0
+                step
             } else if i.key_pressed(egui::Key::ArrowLeft) {
-                -10.0
+                -step
             } else {
                 0.0
             }
@@ -3774,13 +4287,21 @@ fn seekbar(
         }
     }
     response.widget_info(|| egui::WidgetInfo::slider(true, *position, "Playback position"));
-    let track = egui::Rect::from_center_size(rect.center(), Vec2::new(rect.width(), 6.0));
+    let height = if buffered_end.is_some() { 6.0 } else { 4.0 };
+    let track = egui::Rect::from_center_size(rect.center(), Vec2::new(rect.width(), height));
     ui.painter().rect_filled(track, 3.0, Color32::from_gray(65));
-    for (end, color) in [(buffered_end, Color32::from_gray(110)), (*position, ACCENT)] {
+    for (end, color) in buffered_end
+        .into_iter()
+        .map(|end| (end, Color32::from_gray(110)))
+        .chain(std::iter::once((*position, ACCENT)))
+    {
         ui.painter().rect_filled(
             egui::Rect::from_min_size(
                 track.min,
-                Vec2::new(track.width() * (end / duration).clamp(0.0, 1.0) as f32, 6.0),
+                Vec2::new(
+                    track.width() * (end / duration).clamp(0.0, 1.0) as f32,
+                    height,
+                ),
             ),
             3.0,
             color,
@@ -3791,14 +4312,20 @@ fn seekbar(
             track.left() + track.width() * (*position / duration).clamp(0.0, 1.0) as f32,
             track.center().y,
         ),
-        if focused || response.hovered() {
+        if buffered_end.is_none() {
+            7.0
+        } else if focused || response.hovered() {
             8.0
         } else {
             6.0
         },
         Color32::WHITE,
     );
-    response.on_hover_text("Seek · use Left / Right to move 10 seconds")
+    response.on_hover_text(if buffered_end.is_some() {
+        "Seek · use Left / Right to move 10 seconds"
+    } else {
+        "Seek in chapter · use Left / Right to move 1 second"
+    })
 }
 
 fn clock(seconds: f64) -> String {

@@ -145,6 +145,13 @@ impl Server {
             .collect()
     }
 
+    pub(super) fn item_visible(&self, item: &Item) -> bool {
+        !item
+            .library_id
+            .as_ref()
+            .is_some_and(|id| self.prefs.hidden.contains(id))
+    }
+
     fn card_libraries(&mut self, ui: &mut egui::Ui) -> Option<Library> {
         const HEIGHT: f32 = 28.0;
         const GAP: f32 = 6.0;
@@ -368,6 +375,7 @@ impl Server {
 
 impl App {
     pub(super) fn activate(&mut self, i: usize) {
+        self.book.full = false;
         let server = &self.servers[i];
         self.active = Some(i);
         self.source = Some(server.source.clone());
@@ -639,6 +647,7 @@ impl App {
                             .clicked()
                         {
                             self.settings_tab = SettingsTab::Servers;
+                            self.book.full = false;
                             self.connection_open = true;
                             ui.close();
                         }
@@ -765,7 +774,7 @@ impl App {
                         }
                     });
                 }
-                let mut watching: Vec<_> = self
+                let (watching, listening): (Vec<_>, Vec<_>) = self
                     .servers
                     .iter()
                     .enumerate()
@@ -773,39 +782,74 @@ impl App {
                     .flat_map(|(i, s)| {
                         s.items
                             .iter()
-                            .filter(|item| {
-                                !item
-                                    .library_id
-                                    .as_ref()
-                                    .is_some_and(|id| s.prefs.hidden.contains(id))
-                            })
+                            .filter(|item| s.item_visible(item))
                             .map(move |entry| (i, s, entry))
                     })
-                    .collect();
-                watching.sort_by_key(|(_, _, entry)| std::cmp::Reverse(entry.last_viewed_at));
-                if !watching.is_empty() {
-                    ui.add_space(20.0);
-                    home_carousel(
-                        ui,
+                    .partition(|(_, _, entry)| entry.kind != Kind::Audiobook);
+                for (id, heading, width, mut entries) in [
+                    (
                         "overview_continue",
                         "Continue Watching",
-                        self.carousel_offsets
-                            .entry("overview_continue")
-                            .or_default(),
-                        &watching,
-                        4,
+                        HOME_CARD_WIDTH,
+                        watching,
+                    ),
+                    (
+                        "overview_listening",
+                        "Continue Listening",
+                        BOOK_CARD_WIDTH,
+                        listening,
+                    ),
+                ] {
+                    if entries.is_empty() {
+                        continue;
+                    }
+                    entries.sort_by_key(|(_, _, entry)| std::cmp::Reverse(entry.last_viewed_at));
+                    ui.add_space(20.0);
+                    let shelf = if entries[0].2.kind == Kind::Audiobook {
+                        Shelf::books(entries.len())
+                    } else {
+                        Shelf::Video(4)
+                    };
+                    home_carousel(
+                        ui,
+                        id,
+                        heading,
+                        self.carousel_offsets.entry(id).or_default(),
+                        &entries,
+                        shelf,
                         |ui, &(i, server, entry)| {
                             ui.push_id((i, &entry.id), |ui| {
                                 ui.vertical(|ui| {
-                                    ui.set_width(HOME_CARD_WIDTH);
-                                    if continue_card(ui, entry, &server.artwork) {
+                                    ui.set_width(width);
+                                    let clicked = if entry.kind == Kind::Audiobook {
+                                        ui.spacing_mut().item_spacing.y = 2.0;
+                                        let playing = self
+                                            .book
+                                            .is_current(&server.source, &entry.id)
+                                            .then_some(BookCardPlayback {
+                                                paused: self.paused,
+                                                elapsed_ms: (self.playing_seconds * 1000.0) as u64,
+                                                finished: self.book.completed,
+                                            });
+                                        book_card(ui, entry, &server.artwork, width, playing)
+                                    } else {
+                                        continue_card(ui, entry, &server.artwork)
+                                    };
+                                    if clicked {
                                         item = Some((i, entry.clone()));
                                     }
                                     ui.horizontal(|ui| {
+                                        if entry.kind == Kind::Audiobook {
+                                            ui.spacing_mut().item_spacing.x = 6.0;
+                                        }
                                         ui.add(server.icon().image(13.0, MUTED));
                                         ui.add(
-                                            egui::Label::new(RichText::new(server.name()).small())
-                                                .truncate(),
+                                            egui::Label::new(if entry.kind == Kind::Audiobook {
+                                                RichText::new(server.name()).size(12.0).color(MUTED)
+                                            } else {
+                                                RichText::new(server.name()).small()
+                                            })
+                                            .truncate(),
                                         );
                                     });
                                 });
@@ -813,19 +857,14 @@ impl App {
                         },
                     );
                 }
-                for s in self
-                    .servers
-                    .iter()
-                    .filter(|s| !s.online && !s.items.is_empty())
-                {
-                    ui.colored_label(
-                        MUTED,
-                        format!(
-                            "{} items from {} hidden while offline",
-                            s.items.len(),
-                            s.name()
-                        ),
-                    );
+                for s in self.servers.iter().filter(|s| !s.online) {
+                    let count = s.items.iter().filter(|item| s.item_visible(item)).count();
+                    if count > 0 {
+                        ui.colored_label(
+                            MUTED,
+                            format!("{count} items from {} hidden while offline", s.name()),
+                        );
+                    }
                 }
                 if self.servers.iter().all(|s| !s.online) {
                     ui.heading("Can't reach any of your servers");
@@ -959,6 +998,7 @@ impl App {
                                     Color32::from_rgb(38, 40, 64),
                                     Color32::from_rgb(161, 170, 255),
                                 ),
+                                ServerKind::Audiobookshelf => (CONTROL, TEXT),
                             };
                             ui.painter().rect_filled(rect, 12, fill);
                             s.icon().paint(ui, rect.center(), 26.0, ink);
@@ -1234,7 +1274,12 @@ impl App {
                 {
                     self.error = Some(error);
                 } else {
-                    self.servers.remove(i);
+                    let removed = self.servers.remove(i);
+                    if self.book.uses_source(&removed.source)
+                        && let Some(player) = &self.player
+                    {
+                        player.stop();
+                    }
                     for (n, s) in self.servers.iter_mut().enumerate() {
                         if s.prefs.position != n {
                             s.prefs.position = n;
@@ -1267,11 +1312,11 @@ impl App {
     }
 }
 
-fn library_icon(lib: &Library) -> Icon {
-    if lib.kind == Kind::Series {
-        Icon::TvShows
-    } else {
-        Icon::Movies
+pub(super) fn library_icon(lib: &Library) -> Icon {
+    match lib.kind {
+        Kind::Series => Icon::TvShows,
+        Kind::Audiobook => Icon::Audiobooks,
+        _ => Icon::Movies,
     }
 }
 

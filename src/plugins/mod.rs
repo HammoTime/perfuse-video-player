@@ -1,5 +1,6 @@
 //! Media source registration. Plugins are compiled into the application.
 
+pub mod audiobookshelf;
 pub mod jellyfin;
 pub mod plex;
 
@@ -13,6 +14,7 @@ pub enum ServerKind {
     #[default]
     Plex,
     Jellyfin,
+    Audiobookshelf,
 }
 
 impl ServerKind {
@@ -20,6 +22,7 @@ impl ServerKind {
         match self {
             Self::Plex => &plex::PLUGIN,
             Self::Jellyfin => &jellyfin::PLUGIN,
+            Self::Audiobookshelf => &audiobookshelf::PLUGIN,
         }
     }
 }
@@ -31,7 +34,7 @@ pub struct Credentials {
     #[serde(default)]
     pub kind: ServerKind,
     pub server: String,
-    pub token: String,
+    pub token: audiobookshelf::auth::SessionToken,
     pub client_id: String,
 }
 
@@ -44,7 +47,7 @@ pub struct Plugin {
     pub open: fn(&Credentials, bool) -> Result<Source, String>,
 }
 
-pub const BUILTIN: &[&Plugin] = &[&plex::PLUGIN, &jellyfin::PLUGIN];
+pub const BUILTIN: &[&Plugin] = &[&plex::PLUGIN, &jellyfin::PLUGIN, &audiobookshelf::PLUGIN];
 
 pub fn by_id(id: &str) -> Option<&'static Plugin> {
     BUILTIN.iter().copied().find(|plugin| plugin.id == id)

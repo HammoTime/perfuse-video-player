@@ -4,7 +4,7 @@ use egui_kittest::{
     Harness,
     kittest::{NodeT, Queryable},
 };
-use perfuse::media::{PAGE_SIZE, Version};
+use perfuse::media::{AudioTrack, Book, Chapter, PAGE_SIZE, Version};
 
 fn login(size: [f32; 2]) -> Harness<'static, App> {
     app_harness(size, 0.25)
@@ -319,6 +319,29 @@ fn home_cards_reserve_the_library_row_and_overflow_opens_all_visible_libraries()
 }
 
 #[test]
+fn mixed_home_routes_audiobooks_to_continue_listening_and_respects_hidden_libraries() {
+    let mut harness = library([1440.0, 900.0], "home");
+    let app = harness.state_mut();
+    app.overview = true;
+    app.servers[0].items = app.on_deck.clone();
+    let mut shelf = book_server();
+    shelf.items = vec![book_item()];
+    app.servers.push(shelf);
+    harness.run_steps(4);
+    harness.get_by_label("Continue Watching");
+    harness.get_by_label("Continue Listening");
+    let cover = harness.get_by_label("Open Listening to the Coast").rect();
+    assert!((cover.width() - cover.height()).abs() <= 1.0);
+    harness.state_mut().servers[1]
+        .prefs
+        .hidden
+        .push("books".into());
+    harness.run_steps(3);
+    assert!(harness.query_by_label("Continue Listening").is_none());
+    harness.get_by_label("Continue Watching");
+}
+
+#[test]
 fn settings_action_pairs_match_and_remove_requires_confirmation() {
     let mut harness = library([860.0, 620.0], "movies");
     harness.state_mut().connection_open = true;
@@ -578,6 +601,327 @@ fn attach_server(app: &mut App) {
         false,
     ));
     app.active = Some(app.servers.len() - 1);
+}
+
+fn book_server() -> Server {
+    let session = session::Session {
+        kind: ServerKind::Audiobookshelf,
+        server: "http://127.0.0.1:0".into(),
+        token: "synthetic".into(),
+        client_id: "ui-test".into(),
+    };
+    let source = session::open(&session).unwrap();
+    let library = Library {
+        id: "books".into(),
+        title: "Audiobooks".into(),
+        kind: Kind::Audiobook,
+    };
+    let mut server = Server::new(session, source, vec![library], false);
+    server.prefs.name = "Reading Room".into();
+    server
+}
+
+fn book_item() -> Item {
+    Item {
+        id: "coast".into(),
+        library_id: Some("books".into()),
+        title: "Listening to the Coast".into(),
+        kind: Kind::Audiobook,
+        year: Some(2023),
+        summary: "A field guide to the birds and sounds of the coastal wetlands.".into(),
+        duration_ms: Some(700_000),
+        resume_ms: Some(250_000),
+        thumb: Some("/fixture/shore".into()),
+        versions: vec![Version {
+            stream: Stream::Audiobook(vec![AudioTrack {
+                file: "one".into(),
+                start_ms: 0,
+            }]),
+            ..Default::default()
+        }],
+        book: Some(Box::new(Book {
+            author: "Alex Morgan".into(),
+            narrator: "Robin Gray".into(),
+            series: String::new(),
+            chapters: vec![
+                Chapter {
+                    title: "Tidal flats".into(),
+                    start_ms: 0,
+                    end_ms: 400_000,
+                },
+                Chapter {
+                    title: "Salt marsh".into(),
+                    start_ms: 400_000,
+                    end_ms: 700_000,
+                },
+            ],
+            bookmarks: vec![],
+        })),
+        ..Default::default()
+    }
+}
+
+fn book_detail(size: [f32; 2]) -> Harness<'static, App> {
+    let mut harness = app_harness(size, 0.25);
+    let texture = harness
+        .ctx
+        .load_texture("shore", library_art(3, [256, 256]), Default::default());
+    let app = harness.state_mut();
+    let server = book_server();
+    app.covers.insert("/fixture/shore".into(), texture);
+    app.source = Some(server.source.clone());
+    app.sections = server.sections.clone();
+    app.servers.push(server);
+    app.active = Some(0);
+    app.selected_library = Some("books".into());
+    app.detail = Some(book_item());
+    harness
+}
+
+fn show_book_collection(app: &mut App, ctx: &egui::Context, home: bool) {
+    let current = app.detail.take().unwrap();
+    let mut items = vec![current.clone()];
+    for (index, title) in [
+        "Tide Tables",
+        "Wayfinding",
+        "The River Mouth",
+        "Passage Birds",
+        "The Winter Marsh",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut item = current.clone();
+        let id = format!("fixture-book-{index}");
+        app.covers.insert(
+            id.clone(),
+            ctx.load_texture(&id, library_art(index, [256, 256]), Default::default()),
+        );
+        item.thumb = Some(id.clone());
+        item.id = id;
+        item.title = title.into();
+        item.resume_ms = None;
+        items.push(item);
+    }
+    let (title, browse) = if home {
+        app.selected_library = None;
+        app.home_loaded = true;
+        app.on_deck = items[..3].to_vec();
+        (app.servers[0].name(), Browse::RecentlyAdded)
+    } else {
+        (
+            "Audiobooks".into(),
+            Browse::Library(app.sections[0].clone()),
+        )
+    };
+    app.location = Some(Location {
+        title,
+        browse,
+        search: String::new(),
+        offset: 0,
+        previous_pages: vec![],
+        library: !home,
+        parent: None,
+    });
+    app.page = Some(Page {
+        total: Some(items.len() + usize::from(home)),
+        items,
+        offset: 0,
+    });
+}
+
+fn start_book_fixture(app: &mut App) {
+    let item = app.detail.clone().unwrap();
+    let source = app.source.clone().unwrap();
+    app.player = Some(player::Player::test_stub());
+    app.playing_seconds = item.resume_ms.unwrap() as f64 / 1000.0;
+    app.playing_duration = item.duration_ms.unwrap() as f64 / 1000.0;
+    app.book_started(&item, &source);
+}
+
+#[test]
+fn audiobook_detail_and_docked_player_open_and_collapse_without_a_video_surface() {
+    let mut harness = book_detail([1480.0, 1080.0]);
+    harness.run_steps(4);
+    harness.get_by_label("AUDIOBOOK");
+    harness.get_by_label("Resume");
+    harness.get_by_label("Play from beginning");
+    harness.get_by_label("Chapters");
+    start_book_fixture(harness.state_mut());
+    harness.run_steps(4);
+    harness
+        .get_all_by_label("Open player")
+        .max_by(|a, b| a.rect().bottom().total_cmp(&b.rect().bottom()))
+        .unwrap()
+        .click();
+    harness.run_steps(4);
+    harness.get_by_label("Add bookmark");
+    harness.get_by_label("Servers & settings");
+    harness.get_by_label("Back 30 seconds");
+    harness.get_by_label("Forward 30 seconds");
+    let chapters = harness.get_by_label("Chapters (2)").rect();
+    let speed = harness.get_by_label("Speed 1×").rect();
+    harness.get_by_label("Speed 1×").click();
+    harness.run_steps(3);
+    let option = harness.get_by_label("1× (normal)");
+    assert!(option.is_focused());
+    assert!(option.rect().top() > speed.bottom());
+    assert!(option.rect().right() < chapters.left());
+    assert_eq!(harness.get_by_label("Chapters (2)").rect(), chapters);
+    harness.key_press(egui::Key::ArrowDown);
+    harness.run_steps(3);
+    assert!(harness.get_by_label("1.25×").is_focused());
+    harness.key_press(egui::Key::Enter);
+    harness.run_steps(3);
+    assert!(harness.get_by_label("Speed 1.25×").is_focused());
+    harness.get_by_label("Sleep").click();
+    harness.run_steps(3);
+    harness.get_by_label("End of chapter").click();
+    harness.run_steps(3);
+    harness.get_by_label("Sleep · End of chapter");
+    harness.get_by_label("Sleep · End of chapter").click();
+    harness.run_steps(3);
+    assert!(harness.get_by_label("End of chapter").is_focused());
+    harness.key_press(egui::Key::Escape);
+    harness.run_steps(3);
+    assert!(harness.query_by_label("Off").is_none());
+    assert!(harness.get_by_label("Sleep · End of chapter").is_focused());
+    harness.get_by_label("Bookmarks (0)").click();
+    harness.run_steps(3);
+    harness.get_by_label("Speed 1.25×").click();
+    harness.run_steps(3);
+    harness.get_by_label("Chapters (2)").click();
+    harness.run_steps(3);
+    assert!(harness.query_by_label("1× (normal)").is_none());
+    harness.get_by_label("Salt marsh");
+    harness.get_by_label("Collapse player").click();
+    harness.run_steps(4);
+    harness.get_by_label("AUDIOBOOK");
+    assert!(!harness.state().book.full);
+    assert!(harness.state().surface.is_none());
+    // The same book ID on another source is a separate playback target.
+    harness.state_mut().source = Some(book_server().source);
+    harness.run_steps(3);
+    harness.get_by_label("Resume");
+    harness
+        .get_by_label("Open player: Listening to the Coast")
+        .click();
+    harness.run_steps(3);
+    assert!(harness.state().book.full);
+    harness.get_by_label("Servers & settings").click();
+    harness.run_steps(3);
+    assert!(harness.state().connection_open);
+    assert!(!harness.state().book.full);
+    harness.get_by_label("Open player: Listening to the Coast");
+}
+
+#[test]
+fn audiobook_dock_respects_the_sidebar_and_viewport_breakpoints() {
+    for width in [860.0, 1000.0, 1180.0, 2560.0] {
+        let mut harness = book_detail([width, 900.0]);
+        start_book_fixture(harness.state_mut());
+        harness.run_steps(4);
+        let now = harness
+            .get_by_label("Open player: Listening to the Coast")
+            .rect();
+        let pause = harness
+            .get_all_by_label("Pause")
+            .map(|node| node.rect())
+            .max_by(|a, b| a.bottom().total_cmp(&b.bottom()))
+            .unwrap();
+        assert!((now.left() - 268.0).abs() <= 1.0, "{width}: {now:?}");
+        assert!((pause.width() - 40.0).abs() <= 1.0);
+        assert!(now.bottom() < 900.0 && now.top() > 812.0);
+        let center = if width <= 1000.0 {
+            width - 24.0 - 120.0
+        } else {
+            (244.0 + width) * 0.5
+        };
+        assert!(
+            (pause.center().x - center).abs() <= 1.0,
+            "{width}: {pause:?}"
+        );
+        let volume = harness.get_by_label("Volume").rect();
+        assert!(harness.ctx.content_rect().contains_rect(volume));
+        assert!(!volume.intersects(pause));
+        if width <= 1000.0 {
+            assert!(harness.query_by_label("Playback speed 1×").is_none());
+        } else {
+            let stop = harness.get_by_label("Stop").rect();
+            assert!((width - stop.right() - 24.0).abs() <= 1.0);
+            let speed = harness.get_by_label("Playback speed 1×");
+            let trigger = speed.rect();
+            speed.click();
+            harness.run_steps(3);
+            let last_option = harness.get_by_label("3×").rect();
+            assert!(last_option.bottom() < trigger.top());
+            harness.key_press(egui::Key::Escape);
+            harness.run_steps(3);
+            assert!(harness.get_by_label("Playback speed 1×").is_focused());
+        }
+    }
+}
+
+#[test]
+fn expanded_audiobook_controls_fill_and_center_in_the_wide_player_column() {
+    let mut harness = book_detail([2560.0, 1440.0]);
+    start_book_fixture(harness.state_mut());
+    harness.state_mut().book.full = true;
+    harness.run_steps(4);
+
+    let chapter_tab = harness.get_by_label("Chapters (2)").rect();
+    let chapter_seek = harness.get_by_label("Playback position").rect();
+    let pause = harness.get_by_label("Pause").rect();
+    let speed = harness.get_by_label("Speed 1×").rect();
+    let volume = harness.get_by_label("Volume").rect();
+    let left = 244.0 + 48.0; // Sidebar and page padding.
+    let right = 2560.0 - 48.0 - 360.0 - 40.0; // Padding, chapter panel and column gap.
+    let center = (left + right) / 2.0;
+    assert!(chapter_tab.left() > right + 40.0);
+    assert!((chapter_seek.left() - left).abs() <= 1.0);
+    assert!((chapter_seek.right() - right).abs() <= 1.0);
+    assert!((pause.center().x - center).abs() <= 1.0);
+    assert!((speed.union(volume).center().x - center).abs() <= 1.0);
+    assert!(
+        harness.output().shapes.iter().any(|clipped| {
+            matches!(&clipped.shape, egui::Shape::LineSegment { points: [a, b], .. }
+                if a.y == b.y && a.y > chapter_seek.bottom() && a.y < pause.top()
+                    && (a.x - left).abs() <= 1.0 && (b.x - right).abs() <= 1.0)
+        }),
+        "The whole-book timeline should span the same column as the chapter scrubber"
+    );
+}
+
+#[test]
+fn audiobook_volume_is_adjustable_from_the_dock_and_full_player() {
+    let mut harness = book_detail([860.0, 620.0]);
+    start_book_fixture(harness.state_mut());
+    for full in [false, true] {
+        harness.state_mut().book.full = full;
+        harness.run_steps(4);
+        let volume = harness.get_by_label("Volume");
+        assert!(harness.ctx.content_rect().contains_rect(volume.rect()));
+        volume.click();
+        harness.run_steps(3);
+        let slider = harness.get_by_label("Audiobook volume");
+        assert!(harness.ctx.content_rect().contains_rect(slider.rect()));
+        let previous = harness.state().volume.gain();
+        slider.focus();
+        harness.run_steps(2);
+        harness.key_press(egui::Key::ArrowLeft);
+        harness.run_steps(3);
+        let adjusted = harness.state().volume.gain();
+        assert!(adjusted > 0.0 && adjusted < previous);
+        harness.get_by_label("Mute").click();
+        harness.run_steps(3);
+        assert_eq!(harness.state().volume.gain(), 0.0);
+        harness.get_by_label("Unmute").click();
+        harness.run_steps(3);
+        assert_eq!(harness.state().volume.gain(), adjusted);
+        harness.key_press(egui::Key::Escape);
+        harness.run_steps(3);
+        assert!(harness.query_by_label("Audiobook volume").is_none());
+    }
 }
 
 // Review the real library without network requests, credentials or desktop windows.
@@ -843,12 +1187,67 @@ fn library_snapshots() {
         ("episodes-minimum", "episodes", [860.0, 620.0], 1.0),
         ("details-desktop", "details", [1440.0, 900.0], 1.0),
         ("details-minimum", "details", [860.0, 620.0], 1.0),
+        ("audiobook-home", "book-home", [1440.0, 960.0], 1.0),
+        ("audiobook-details", "book-details", [1280.0, 900.0], 1.0),
+        ("audiobook-library", "book-dock", [1440.0, 900.0], 1.0),
+        ("audiobook-dock-volume", "book-dock", [1440.0, 900.0], 1.0),
+        ("audiobook-dock-wide", "book-dock", [2560.0, 900.0], 1.0),
+        (
+            "audiobook-player-wide",
+            "book-player",
+            [2560.0, 1440.0],
+            1.0,
+        ),
+        (
+            "audiobook-player-menu",
+            "book-player-menu",
+            [1480.0, 1080.0],
+            1.0,
+        ),
+        (
+            "audiobook-player-minimum",
+            "book-player",
+            [860.0, 620.0],
+            1.0,
+        ),
         ("library-empty", "empty", [860.0, 620.0], 1.0),
         ("library-loading", "loading", [860.0, 620.0], 1.0),
         ("library-search", "search", [860.0, 620.0], 1.0),
         ("library-missing-art", "missing-art", [860.0, 620.0], 1.0),
     ] {
-        let mut harness = library(size, screen);
+        let mut harness = if screen.starts_with("book-") {
+            book_detail(size)
+        } else {
+            library(size, screen)
+        };
+        if screen == "book-home" {
+            let ctx = harness.ctx.clone();
+            show_book_collection(harness.state_mut(), &ctx, true);
+        }
+        if matches!(screen, "book-dock" | "book-player" | "book-player-menu") {
+            let ctx = harness.ctx.clone();
+            let app = harness.state_mut();
+            if screen == "book-player-menu" {
+                // Keep the chapter list longer than the viewport so this comparison
+                // catches a menu pushing, clipping or displacing the scrolling pane.
+                let item = app.detail.as_mut().unwrap();
+                let chapters = &mut item.book.as_mut().unwrap().chapters;
+                for index in 3..=20 {
+                    let start = chapters.last().unwrap().end_ms;
+                    chapters.push(Chapter {
+                        title: format!("Coastal walk {index}"),
+                        start_ms: start,
+                        end_ms: start + 300_000,
+                    });
+                }
+                item.duration_ms = Some(chapters.last().unwrap().end_ms);
+            }
+            start_book_fixture(app);
+            app.book.full = screen != "book-dock";
+            if screen == "book-dock" {
+                show_book_collection(app, &ctx, false);
+            }
+        }
         if screen == "home" {
             let app = harness.state_mut();
             app.servers[0].prefs.name = "Glass".into();
@@ -892,6 +1291,37 @@ fn library_snapshots() {
         }
         harness.remove_cursor();
         harness.run_steps(4);
+        if name == "audiobook-dock-volume" {
+            harness.get_by_label("Volume").click();
+            harness.run_steps(3);
+            harness.get_by_label("Audiobook volume");
+        }
+        if screen == "book-dock" {
+            let first = harness.get_by_label("Open Listening to the Coast").rect();
+            let second = harness.get_by_label("Open Tide Tables").rect();
+            assert!((first.width() - first.height()).abs() <= 1.0);
+            assert_eq!(first.top(), second.top());
+            assert!((second.left() - first.right() - 16.0).abs() <= 1.0);
+            harness.get_by_label("Search audiobooks");
+        }
+        if screen == "book-player-menu" {
+            harness.get_by_label("Speed 1×").click();
+            harness.run_steps(3);
+            let row_y = harness.get_by_label("Pause").rect().center().y;
+            for label in [
+                "Previous chapter",
+                "Back 30 seconds",
+                "Forward 30 seconds",
+                "Next chapter",
+            ] {
+                let rect = harness.get_by_label(label).rect();
+                assert!(harness.ctx.content_rect().contains_rect(rect));
+                assert!(
+                    (rect.center().y - row_y).abs() <= 1.0,
+                    "{label} is off-center"
+                );
+            }
+        }
         if name == "server-status" {
             harness.get_by_label("2 servers connected").hover();
             harness.run_steps(5);
@@ -1115,11 +1545,17 @@ fn login_controls_fit_the_window() {
         assert!(harness.query_by_label("Server address").is_none());
         let plex = harness.get_by_label("Plex");
         let jellyfin = harness.get_by_label("Jellyfin").rect();
+        let audiobookshelf = harness.get_by_label("Audiobookshelf").rect();
         assert!(screen.contains_rect(plex.rect()) && screen.contains_rect(jellyfin));
         if size[0] > 1000.0 {
             assert_eq!(plex.rect().top(), jellyfin.top());
+            assert_eq!(jellyfin.top(), audiobookshelf.top());
+            assert!(
+                audiobookshelf.left() > jellyfin.right() && screen.contains_rect(audiobookshelf)
+            );
         } else {
             assert!(jellyfin.top() > plex.rect().bottom());
+            assert!(audiobookshelf.top() > jellyfin.bottom());
         }
         plex.click();
         harness.run();
@@ -1198,6 +1634,7 @@ fn add_server_dialog_grows_to_fit_each_form_and_keeps_headings_left_aligned() {
     );
     for (kind, title, last) in [
         ("Jellyfin", "Connect to Jellyfin", "Use Quick Connect"),
+        ("Audiobookshelf", "Connect to Audiobookshelf", "Connect"),
         ("Plex", "Connect to Plex", "Connect"),
     ] {
         harness.get_by_label(kind).click();
@@ -1274,6 +1711,39 @@ fn jellyfin_sign_in_isolated_from_plex_and_quick_connect_can_be_cancelled() {
         .unwrap();
     harness.run_steps(2);
     assert!(!harness.state().busy && harness.state().quick_code.is_none());
+}
+
+#[test]
+fn audiobookshelf_requires_password_and_clears_it_on_back() {
+    let password = egui::accesskit::Role::PasswordInput;
+    let mut harness = login([1200.0, 900.0]);
+    harness.get_by_label("Audiobookshelf").click();
+    harness.run();
+    harness.get_by_label("Connect to Audiobookshelf");
+    assert!(harness.get_by_label("Server address").is_focused());
+    assert!(harness.query_by_label("Use Quick Connect").is_none());
+    harness.get_by_role_and_label(password, "Password");
+    harness.get_by_label("Connect").click();
+    harness.run();
+    for error in [
+        "Enter your server address.",
+        "Enter your username.",
+        "Enter your password.",
+    ] {
+        harness.get_by_label(error);
+    }
+    assert!(!harness.state().busy);
+    harness.get_by_role_and_label(password, "Password").focus();
+    harness.run();
+    harness
+        .get_by_role_and_label(password, "Password")
+        .type_text("synthetic");
+    harness.run();
+    assert_eq!(harness.state().password, "synthetic");
+    harness.get_by_label("Back to server types").click();
+    harness.run();
+    assert!(harness.state().password.is_empty());
+    assert!(harness.get_by_label("Audiobookshelf").is_focused());
 }
 
 #[test]
@@ -1501,10 +1971,12 @@ fn login_snapshots() {
         ("login-plex", [1200.0, 900.0], 1.0),
         ("login-manual", [860.0, 620.0], 1.0),
         ("login-jellyfin", [1200.0, 900.0], 1.0),
+        ("login-audiobookshelf", [1200.0, 900.0], 1.0),
         ("add-server-types", [1280.0, 800.0], 1.0),
         ("remove-server", [1100.0, 800.0], 1.0),
         ("add-server-plex-manual", [1280.0, 800.0], 1.0),
         ("add-server-jellyfin", [1280.0, 800.0], 1.0),
+        ("add-server-audiobookshelf", [1280.0, 800.0], 1.0),
         ("login-waiting", [860.0, 620.0], 1.0),
         ("login-expired", [860.0, 620.0], 1.0),
         ("login-servers", [860.0, 620.0], 1.0),
@@ -1525,6 +1997,9 @@ fn login_snapshots() {
             }
             "login-jellyfin" => {
                 harness.get_by_label("Jellyfin").click();
+            }
+            "login-audiobookshelf" => {
+                harness.get_by_label("Audiobookshelf").click();
             }
             "login-manual" => {
                 harness.get_by_label("Plex").click();
@@ -1561,6 +2036,7 @@ fn login_snapshots() {
             | "remove-server"
             | "add-server-types"
             | "add-server-plex-manual"
+            | "add-server-audiobookshelf"
             | "add-server-jellyfin" => {
                 let app = harness.state_mut();
                 app.source = Some(fixture_source("http://127.0.0.1:32499"));
@@ -1610,6 +2086,8 @@ fn login_snapshots() {
             harness.run_steps(4);
             if name == "add-server-jellyfin" {
                 harness.get_by_label("Jellyfin").click();
+            } else if name == "add-server-audiobookshelf" {
+                harness.get_by_label("Audiobookshelf").click();
             } else if name == "add-server-plex-manual" {
                 harness.get_by_label("Plex").click();
                 harness.run_steps(4);
@@ -1922,6 +2400,62 @@ fn sidebar_libraries_can_be_sorted_and_reordered() {
         harness.state().servers[0].prefs.sort,
         prefs::LibrarySort::Custom
     );
+}
+
+#[test]
+fn audiobook_home_scrolls_and_pages_from_the_same_heading_arrows() {
+    let mut harness = book_detail([1440.0, 960.0]);
+    let ctx = harness.ctx.clone();
+    show_book_collection(harness.state_mut(), &ctx, true);
+    harness.run_steps(4);
+    let heading = harness.get_by_label("Recently Added").rect();
+    let back = harness.get_by_label("Scroll Recently Added back").rect();
+    let next = harness.get_by_label("Scroll Recently Added forward");
+    let forward = next.rect();
+    assert!((heading.center().y - forward.center().y).abs() < 4.0);
+    assert!(
+        harness
+            .query_by_label("Previous Recently Added page")
+            .is_none()
+    );
+    assert!(harness.query_by_label("Next Recently Added page").is_none());
+    next.click();
+    harness.run_steps(20);
+    assert!(harness.state().carousel_offsets["added_books"] > 1.0);
+    assert_eq!(harness.state().page.as_ref().unwrap().offset, 0);
+    let page = harness.get_by_label("Next Recently Added page");
+    assert_eq!(page.rect(), forward);
+    assert!(
+        harness
+            .query_by_label("Scroll Recently Added forward")
+            .is_none()
+    );
+    page.click();
+    harness.run_steps(3);
+    assert_eq!(harness.state().location.as_ref().unwrap().offset, 6);
+
+    // Render the last page using the same fixture, with a single remaining title.
+    let app = harness.state_mut();
+    app.begin();
+    app.busy = false;
+    app.page = Some(Page {
+        items: vec![book_item()],
+        offset: 6,
+        total: Some(7),
+    });
+    harness.run_steps(4);
+    let previous = harness.get_by_label("Previous Recently Added page");
+    assert_eq!(previous.rect().center().y, back.center().y);
+    assert!((previous.rect().left() - back.left()).abs() < 12.0);
+    assert!(
+        harness
+            .get_by_label("Scroll Recently Added forward")
+            .accesskit_node()
+            .is_disabled()
+    );
+    previous.click();
+    harness.run_steps(2);
+    assert_eq!(harness.state().location.as_ref().unwrap().offset, 0);
 }
 
 #[test]

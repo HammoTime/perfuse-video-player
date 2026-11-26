@@ -196,7 +196,7 @@ It shows on every browse screen while a book is loaded, and is hidden on the ful
 ```
 
 - The left block (cover and text) opens the full player.
-- Transport, in order: previous chapter, back 30 s, play/pause (40 px white circle), forward 30 s, next chapter.
+- The transport shows previous chapter, back 30 s, play/pause, forward 30 s and next chapter. Chapter and skip icons are 20 px in 32 px buttons. Play/pause uses a 25 px icon in a 40 px white circle.
 - The time row is **chapter-relative**: elapsed in the chapter, the bar, and the time remaining in the chapter.
 - Right side, in order:
   - sleep countdown badge (only while a timer is set),
@@ -209,12 +209,12 @@ It shows on every browse screen while a book is loaded, and is hidden on the ful
 
 ### Full player
 
-- Left column (max 720 px):
+- The left column fills the available width. Both timelines span that column, with the transport and tools centered beneath them.
   - collapse button and breadcrumb,
   - 240 px cover, with `CHAPTER 9 OF 16` (eyebrow), the chapter title (18 px ACCENT), the book title (30 px) and the byline,
   - **chapter scrubber:** a slider over the current chapter only, labelled `elapsed` and `−remaining`,
   - **book track:** a thin 4 px whole-book bar with a 2 px **tick at each chapter boundary** (the current chapter's tick is ACCENT), labelled `Book 5:52:10 of 7:21:00` and `1 h 29 min left`. At speeds other than 1×, the right label reads `1 h 11 min left at 1.25×`,
-  - transport: 44 px buttons and a 64 px white play button,
+  - transport: 27.5 px icons in 44 px buttons and a 35 px play/pause icon in a 64 px white button,
   - tools row (40 h pills): `Speed 1.25×`, `Sleep · 28:41`, `Add bookmark`.
 - Right column (360 px, sticky, panel): a segmented tab control, `Chapters (16)` / `Bookmarks (1)`, with the lists described above.
 - **Previous chapter** jumps to the start of the current chapter if more than 3 s have played; otherwise it goes to the previous chapter.

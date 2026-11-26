@@ -44,6 +44,69 @@ pub struct LibraryOrder {
 struct Store {
     #[serde(default)]
     libraries: HashMap<String, LibraryOrder>,
+    #[serde(default)]
+    volume: Volume,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Volume {
+    level: f64,
+    muted: bool,
+    #[serde(skip)]
+    changed: bool,
+}
+
+impl Default for Volume {
+    fn default() -> Self {
+        Self {
+            level: 100.0,
+            muted: false,
+            changed: false,
+        }
+    }
+}
+
+impl Volume {
+    pub fn load() -> Self {
+        file()
+            .map(|path| read_store(&path).volume)
+            .unwrap_or_default()
+    }
+
+    pub fn level(self) -> f64 {
+        self.level.clamp(0.0, 100.0)
+    }
+
+    pub fn gain(self) -> f64 {
+        if self.muted { 0.0 } else { self.level() }
+    }
+
+    pub fn set(&mut self, value: f64) -> bool {
+        let value = value.clamp(0.0, 100.0);
+        if value == self.gain() {
+            return false;
+        }
+        self.muted = value == 0.0;
+        if !self.muted {
+            self.level = value;
+        }
+        self.changed = true;
+        true
+    }
+
+    pub fn save(&mut self) {
+        if self.changed {
+            if let Some(path) = file() {
+                self.save_to(&path);
+            }
+            self.changed = false;
+        }
+    }
+
+    fn save_to(self, path: &Path) {
+        update_store(path, |store| store.volume = self);
+    }
 }
 
 /// `%LOCALAPPDATA%\Perfuse\preferences.json` on Windows, XDG config elsewhere.
@@ -73,14 +136,15 @@ fn server_key(server: &str) -> String {
     format!("{hash:016x}")
 }
 
+fn read_store(path: &Path) -> Store {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
 fn load_from(path: &Path, server: &str) -> LibraryOrder {
-    let Ok(bytes) = fs::read(path) else {
-        return LibraryOrder::default();
-    };
-    let Ok(store) = serde_json::from_slice::<Store>(&bytes) else {
-        return LibraryOrder::default();
-    };
-    store
+    read_store(path)
         .libraries
         .get(&server_key(server))
         .cloned()
@@ -88,11 +152,14 @@ fn load_from(path: &Path, server: &str) -> LibraryOrder {
 }
 
 fn save_to(path: &Path, server: &str, order: &LibraryOrder) {
-    let mut store = fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Store>(&bytes).ok())
-        .unwrap_or_default();
-    store.libraries.insert(server_key(server), order.clone());
+    update_store(path, |store| {
+        store.libraries.insert(server_key(server), order.clone());
+    });
+}
+
+fn update_store(path: &Path, update: impl FnOnce(&mut Store)) {
+    let mut store = read_store(path);
+    update(&mut store);
     let Ok(bytes) = serde_json::to_vec_pretty(&store) else {
         return;
     };
@@ -113,7 +180,7 @@ fn preference_scope(session: &Credentials) -> String {
     match session.kind {
         // Keep the existing hash for Plex libraries, names and ordering.
         ServerKind::Plex => session.server.clone(),
-        ServerKind::Jellyfin => format!("jellyfin/{}", session.server.trim()),
+        kind => format!("{}/{}", kind.plugin().id, session.server.trim()),
     }
 }
 
@@ -159,7 +226,8 @@ pub fn apply_library_order(server_sections: &[Library], order: &LibraryOrder) ->
                 let rank = |kind: Kind| match kind {
                     Kind::Movie => 0,
                     Kind::Series => 1,
-                    _ => 2,
+                    Kind::Audiobook => 2,
+                    _ => 3,
                 };
                 rank(a.kind)
                     .cmp(&rank(b.kind))
@@ -275,6 +343,54 @@ mod tests {
             )),
             ["Documentaries", "anime", "TV Shows", "Movies"]
         );
+    }
+
+    #[test]
+    fn library_preferences_are_scoped_to_the_source_at_each_origin() {
+        let mut session = Credentials {
+            kind: ServerKind::Plex,
+            server: "http://library.local".into(),
+            token: "test".into(),
+            client_id: "test".into(),
+        };
+        let key = |session: &Credentials| server_key(&preference_scope(session));
+        assert_eq!(key(&session), server_key("http://library.local"));
+        session.kind = ServerKind::Jellyfin;
+        assert_eq!(key(&session), server_key("jellyfin/http://library.local"));
+        session.kind = ServerKind::Audiobookshelf;
+        assert_eq!(
+            key(&session),
+            server_key("audiobookshelf/http://library.local")
+        );
+    }
+
+    #[test]
+    fn volume_and_mute_survive_relaunch_and_library_preference_updates() {
+        let dir = std::env::temp_dir().join(format!("perfuse-volume-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("preferences.json");
+        fs::write(&path, r#"{"libraries":{}}"#).unwrap();
+        let mut volume = read_store(&path).volume;
+        assert_eq!(volume.gain(), 100.0);
+        assert!(volume.set(37.0));
+        volume.save_to(&path);
+        let mut restored = read_store(&path).volume;
+        assert_eq!(restored.gain(), 37.0);
+        assert!(restored.set(0.0));
+        restored.save_to(&path);
+        let order = LibraryOrder {
+            collapsed: true,
+            ..Default::default()
+        };
+        save_to(&path, "test", &order);
+        let mut restored = read_store(&path).volume;
+        assert_eq!(restored.gain(), 0.0);
+        assert!(!restored.set(0.0));
+        assert!(restored.set(restored.level()));
+        assert_eq!(restored.gain(), 37.0);
+        restored.save_to(&path);
+        assert_eq!(load_from(&path, "test"), order);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

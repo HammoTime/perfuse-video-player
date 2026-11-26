@@ -5,6 +5,9 @@ pub mod plugins;
 
 mod cache;
 mod http;
+#[cfg(test)]
+#[path = "plugins/http_fixture.rs"]
+mod http_fixture;
 
 pub fn trim_artwork_cache() {
     if let Some(dir) = cache::dir() {

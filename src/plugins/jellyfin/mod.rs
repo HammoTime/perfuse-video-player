@@ -20,7 +20,11 @@ pub static PLUGIN: Plugin = Plugin {
     default_address: "http://localhost:8096",
     open: |session, cache| {
         Ok(Arc::new(Jellyfin {
-            api: Api::new(&session.server, &session.client_id, Some(&session.token))?,
+            api: Api::new(
+                &session.server,
+                &session.client_id,
+                Some(session.token.fixed()?),
+            )?,
             artwork: Artwork::new(cache),
         }))
     },
@@ -207,6 +211,7 @@ impl Entry {
         });
         let user = self.user_data.unwrap_or_default();
         Ok(Item {
+            book: None,
             id: self.id,
             title: self.name,
             kind: match self.kind.as_str() {

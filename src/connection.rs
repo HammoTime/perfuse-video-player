@@ -1,10 +1,11 @@
 //! First-run and Settings share the add-server flow in docs/design/multi-server/js/app.js.
 use super::*;
-use perfuse::plugins::{BUILTIN, jellyfin};
+use perfuse::plugins::{BUILTIN, audiobookshelf, jellyfin};
 use std::collections::{BTreeMap, VecDeque};
 
 const ADDRESS: &str = "Server address";
 const USERNAME: &str = "Username";
+const PASSWORD: &str = "Password";
 const TOKEN: &str = "Access token";
 const MANUAL: &str = "Connect manually with an address and token";
 const QUICK: &str = "Use Quick Connect";
@@ -15,6 +16,7 @@ const NAME: &str = "Name in Perfuse";
 enum SignIn {
     PlexToken,
     JellyfinPassword,
+    AudiobookshelfPassword,
     QuickConnect,
 }
 
@@ -29,6 +31,7 @@ enum Step {
     Types,
     Plex,
     Jellyfin,
+    Audiobookshelf,
     Browser,
     QuickConnect,
     PlexChoices,
@@ -61,6 +64,7 @@ pub(super) fn source_icon(kind: ServerKind) -> Icon {
     match kind {
         ServerKind::Plex => Icon::ServerPlex,
         ServerKind::Jellyfin => Icon::ServerJellyfin,
+        ServerKind::Audiobookshelf => Icon::ServerAudiobookshelf,
     }
 }
 
@@ -108,7 +112,7 @@ fn text_field(
                     egui::TextEdit::singleline(value)
                         .id(id)
                         .desired_width(f32::INFINITY)
-                        .password(matches!(label, TOKEN | "Password"))
+                        .password(matches!(label, TOKEN | PASSWORD))
                         .char_limit(if label == NAME { 40 } else { usize::MAX })
                         .min_size(Vec2::new(0.0, 44.0))
                         .margin(egui::Margin::symmetric(16, 0))
@@ -198,8 +202,18 @@ impl App {
                     })
                     .map(|s| format!("This server is already added as \"{}\".", s.name())),
             },
-            USERNAME if self.username.trim().is_empty() => {
+            USERNAME
+                if self.username.trim().is_empty()
+                    && self.form.kind == Some(ServerKind::Jellyfin) =>
+            {
                 Some("Enter your Jellyfin username.".into())
+            }
+            USERNAME if self.username.trim().is_empty() => Some("Enter your username.".into()),
+            PASSWORD
+                if self.form.kind == Some(ServerKind::Audiobookshelf)
+                    && self.password.is_empty() =>
+            {
+                Some("Enter your password.".into())
             }
             TOKEN if self.token.trim().is_empty() => Some("Enter your Plex access token.".into()),
             _ => None,
@@ -217,6 +231,7 @@ impl App {
         let kind = match method {
             SignIn::PlexToken => ServerKind::Plex,
             SignIn::JellyfinPassword | SignIn::QuickConnect => ServerKind::Jellyfin,
+            SignIn::AudiobookshelfPassword => ServerKind::Audiobookshelf,
         };
         if !self.validate_connection(method) {
             return;
@@ -225,14 +240,11 @@ impl App {
         let mut session = session::Session {
             kind,
             server: self.server.clone(),
-            token: String::new(),
+            token: self.token.clone().into(),
             client_id: self.client_id.clone(),
         };
         let username = self.username.clone();
         let password = std::mem::take(&mut self.password);
-        if kind == ServerKind::Plex {
-            session.token = self.token.clone();
-        }
         if matches!(method, SignIn::QuickConnect) {
             self.quick_code = Some(String::new());
             self.form.next_focus = Some("Cancel");
@@ -242,13 +254,17 @@ impl App {
             let result = (|| {
                 match method {
                     SignIn::PlexToken => {}
+                    SignIn::AudiobookshelfPassword => {
+                        audiobookshelf::auth::password(&mut session, &username, &password)?;
+                    }
                     SignIn::JellyfinPassword => {
                         session.token = jellyfin::auth::password(
                             &session.server,
                             &session.client_id,
                             &username,
                             &password,
-                        )?;
+                        )?
+                        .into();
                     }
                     SignIn::QuickConnect => {
                         session.token = jellyfin::auth::quick_connect(
@@ -259,7 +275,8 @@ impl App {
                                 ctx.request_repaint();
                             },
                             || current.load(Ordering::Relaxed) != generation,
-                        )?;
+                        )?
+                        .into();
                     }
                 }
                 let source = session::open(&session)?;
@@ -278,6 +295,7 @@ impl App {
         let required: &[&str] = match method {
             SignIn::PlexToken => &[ADDRESS, TOKEN],
             SignIn::JellyfinPassword => &[ADDRESS, USERNAME],
+            SignIn::AudiobookshelfPassword => &[ADDRESS, USERNAME, PASSWORD],
             SignIn::QuickConnect => &[ADDRESS],
         };
         for &field in required {
@@ -306,7 +324,7 @@ impl App {
             ui,
             label,
             value,
-            label != "Password",
+            label != PASSWORD || self.form.kind == Some(ServerKind::Audiobookshelf),
             help,
             self.form.issues.get(label).map(String::as_str),
         );
@@ -392,25 +410,42 @@ impl App {
         });
     }
 
-    fn jellyfin_form(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn password_form(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let jellyfin = self.form.kind == Some(ServerKind::Jellyfin);
         ui.add_enabled_ui(!self.busy, |ui| {
-            self.credential_field(ui, ADDRESS, "For example http://192.168.1.30:8096");
+            let example = if jellyfin {
+                "For example http://192.168.1.30:8096"
+            } else {
+                "For example https://abs.example.com"
+            };
+            self.credential_field(ui, ADDRESS, example);
             ui.spacing_mut().item_spacing.x = 16.0;
             let password = ui.columns(2, |cols| {
                 self.credential_field(&mut cols[0], USERNAME, "");
                 self.credential_field(
                     &mut cols[1],
-                    "Password",
-                    "Leave empty if your account has no password.",
+                    PASSWORD,
+                    if jellyfin {
+                        "Leave empty if your account has no password."
+                    } else {
+                        ""
+                    },
                 )
             });
             remember_field(ui, &mut self.remember);
             self.submit_button(
                 ui,
                 ctx,
-                SignIn::JellyfinPassword,
+                if jellyfin {
+                    SignIn::JellyfinPassword
+                } else {
+                    SignIn::AudiobookshelfPassword
+                },
                 password.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)),
             );
+            if !jellyfin {
+                return;
+            }
             ui.horizontal(|ui| {
                 let mid = ui.available_rect_before_wrap().center().x;
                 let (rect, _) = ui.allocate_exact_size(
@@ -752,7 +787,9 @@ impl App {
                         .map(|lib| lib.title.as_str())
                         .collect::<Vec<_>>()
                         .join(", ");
-                    let text = if n == 0 {
+                    let text = if n == 0 && server.session.kind == ServerKind::Audiobookshelf {
+                        "Found no audiobook libraries".into()
+                    } else if n == 0 {
                         "Found no movie or TV libraries".into()
                     } else {
                         format!(
@@ -793,6 +830,7 @@ fn source_tile(ui: &mut egui::Ui, kind: ServerKind, compact: bool) -> egui::Resp
     let description = match kind {
         ServerKind::Plex => "Movies and TV. Sign in with your Plex account.",
         ServerKind::Jellyfin => "Movies and TV. Use your server address and Jellyfin account.",
+        ServerKind::Audiobookshelf => "Audiobooks with chapters and bookmarks.",
     };
     let width = ui.available_width();
     let left = if compact { 76.0 } else { 20.0 };
@@ -864,7 +902,7 @@ impl App {
             kind,
             next_focus: Some(match kind {
                 None => previous.plugin().name,
-                Some(ServerKind::Jellyfin) => ADDRESS,
+                Some(ServerKind::Jellyfin | ServerKind::Audiobookshelf) => ADDRESS,
                 Some(ServerKind::Plex) => PLEX_SIGN_IN,
             }),
             ..Form::default()
@@ -921,6 +959,7 @@ impl App {
             match self.form.kind {
                 Some(ServerKind::Plex) => Step::Plex,
                 Some(ServerKind::Jellyfin) => Step::Jellyfin,
+                Some(ServerKind::Audiobookshelf) => Step::Audiobookshelf,
                 None => Step::Types,
             }
         }
@@ -967,6 +1006,7 @@ impl App {
             Step::Types => "Add another server".into(),
             Step::Plex | Step::Browser => "Connect to Plex".into(),
             Step::Jellyfin => "Connect to Jellyfin".into(),
+            Step::Audiobookshelf => "Connect to Audiobookshelf".into(),
             Step::QuickConnect => "Jellyfin Quick Connect".into(),
             Step::PlexChoices => "Choose Plex servers".into(),
             Step::Connected if self.form.added.len() == 1 => {
@@ -1064,7 +1104,7 @@ impl App {
         match step {
             Step::Types => self.source_chooser(ui),
             Step::Plex => self.plex_form(ui, ctx),
-            Step::Jellyfin => self.jellyfin_form(ui, ctx),
+            Step::Jellyfin | Step::Audiobookshelf => self.password_form(ui, ctx),
             Step::Browser | Step::QuickConnect => self.wait_for_sign_in(ui),
             Step::PlexChoices => self.plex_choices(ui, ctx),
             Step::Connected => self.connection_success(ui),
@@ -1084,7 +1124,7 @@ impl App {
                 ("What kind of server are you connecting to?", 15.0)
             } else {
                 (
-                    "Your films and shows, in original quality. Connect a server to get started. You can add more later.",
+                    "Your films, shows and audiobooks, in original quality. Connect a server to get started. You can add more later.",
                     16.0,
                 )
             };

@@ -40,6 +40,15 @@ impl Artwork {
         let response = request
             .send()
             .map_err(|_| "Artwork unavailable.".to_owned())?;
+        self.store_response(server, path, response)
+    }
+
+    pub fn store_response(
+        &self,
+        server: &str,
+        path: &str,
+        response: reqwest::blocking::Response,
+    ) -> Result<image::RgbaImage, String> {
         if !response.status().is_success() {
             return Err("Artwork unavailable.".into());
         }

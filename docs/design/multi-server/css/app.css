@@ -368,8 +368,8 @@ a { color: var(--c-accent); }
 .dock .now .s { font-size: var(--fs-caption); color: var(--c-muted); }
 .dock .center { display: grid; gap: 6px; justify-items: center; }
 .dock .transport { display: flex; align-items: center; gap: var(--s-2); }
-.dock .transport .icon-btn { background: transparent; }
-.dock .transport .play { background: var(--c-text); color: var(--c-on-light); width: 40px; height: 40px; --od-icon-size: 20px; }
+.dock .transport .icon-btn { background: transparent; --od-icon-size: 20px; }
+.dock .transport .play { background: var(--c-text); color: var(--c-on-light); width: 40px; height: 40px; --od-icon-size: 25px; }
 @media (hover: hover) { .dock .transport .play:hover { background: #fff; color: var(--c-on-light); } }
 .dock .time-row { display: flex; align-items: center; gap: var(--s-3); font-size: 11px; color: var(--c-muted); font-variant-numeric: tabular-nums; width: 420px; }
 .dock .time-row .track { flex: 1; height: 3px; border-radius: 2px; background: var(--c-track); }
@@ -395,7 +395,7 @@ a { color: var(--c-accent); }
 
 /* ── Full player ── */
 .player { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: var(--s-10); min-height: 100%; }
-.player-main { display: grid; align-content: start; gap: var(--s-6); max-width: 720px; }
+.player-main { display: grid; align-content: start; gap: var(--s-6); }
 .player-top { display: flex; align-items: center; gap: var(--s-3); }
 .player-top .od-fill { flex: 1; }
 .player-cover { display: grid; grid-template-columns: 240px minmax(0, 1fr); gap: var(--s-7); align-items: end; }
@@ -417,7 +417,8 @@ input[type="range"].seek::-moz-range-thumb { width: 14px; height: 14px; border-r
 .book-track .tick { position: absolute; top: 2px; width: 2px; height: 10px; background: var(--c-main); border-radius: 1px; }
 .book-track .tick.cur { background: var(--c-accent); }
 .big-transport { display: flex; align-items: center; justify-content: center; gap: var(--s-5); }
-.big-transport .icon-btn.lg { background: transparent; }
+.big-transport .icon-btn.lg { background: transparent; --od-icon-size: 27.5px; }
+.big-transport .icon-btn.xl { --od-icon-size: 35px; }
 .player-tools { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: var(--s-3); position: relative; }
 .tool { display: inline-flex; align-items: center; gap: var(--s-2); height: 40px; padding: 0 var(--s-4); border: 0; border-radius: 20px; background: var(--c-control); color: var(--c-text); font-size: var(--fs-small); --od-icon-size: 18px; white-space: nowrap; }
 @media (hover: hover) { .tool:hover { background: var(--c-control-hover); } }

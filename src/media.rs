@@ -5,6 +5,7 @@ pub const PAGE_SIZE: usize = 36;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Kind {
     Movie,
+    Audiobook,
     Series,
     Season,
     Episode,
@@ -14,6 +15,7 @@ pub enum Kind {
 
 #[derive(Clone, Default)]
 pub struct Item {
+    pub book: Option<Box<Book>>,
     pub library_id: Option<String>,
     pub last_viewed_at: Option<u64>,
     pub id: String,
@@ -36,10 +38,15 @@ pub struct Item {
 
 impl Item {
     pub fn playable(&self) -> bool {
-        matches!(self.kind, Kind::Movie | Kind::Episode)
+        matches!(self.kind, Kind::Movie | Kind::Episode | Kind::Audiobook)
     }
 
     pub fn subtitle(&self) -> String {
+        if let Some(book) = &self.book
+            && !book.author.is_empty()
+        {
+            return book.author.clone();
+        }
         if self.kind == Kind::Episode {
             return format!(
                 "{} · S{:02} E{:02}",
@@ -52,6 +59,7 @@ impl Item {
             || {
                 match self.kind {
                     Kind::Movie => "movie",
+                    Kind::Audiobook => "audiobook",
                     Kind::Series => "show",
                     Kind::Season => "season",
                     Kind::Episode => "episode",
@@ -62,6 +70,35 @@ impl Item {
             |year| year.to_string(),
         )
     }
+}
+
+#[derive(Clone, Default)]
+pub struct Book {
+    pub author: String,
+    pub narrator: String,
+    pub series: String,
+    pub chapters: Vec<Chapter>,
+    pub bookmarks: Vec<Bookmark>,
+}
+
+#[derive(Clone, Default)]
+pub struct Chapter {
+    pub title: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
+}
+
+#[derive(Clone, Default)]
+pub struct Bookmark {
+    pub title: String,
+    /// Server-side bookmark identity in seconds, including fractional positions.
+    pub time: f64,
+}
+
+#[derive(Clone)]
+pub struct AudioTrack {
+    pub file: String,
+    pub start_ms: u64,
 }
 
 #[derive(Clone, Default)]
@@ -93,6 +130,7 @@ impl Version {
 pub enum Stream {
     /// File reference scoped to the plugin and the connected server.
     Direct(String),
+    Audiobook(Vec<AudioTrack>),
     Multipart,
     #[default]
     Unavailable,
@@ -102,6 +140,7 @@ impl Stream {
     pub fn direct_file(&self) -> Result<&str, &'static str> {
         match self {
             Self::Direct(file) => Ok(file),
+            Self::Audiobook(_) => Err("Select an audiobook track to play."),
             Self::Multipart => {
                 Err("Multipart titles are not supported yet. Choose a single-file version.")
             }
@@ -170,6 +209,15 @@ pub trait MediaSource: Send + Sync {
     fn browse(&self, scope: &Browse, search: &str, offset: usize) -> Result<Page, String>;
     fn recently_released(&self, libraries: &[Library]) -> Result<Vec<Item>, String>;
     fn item(&self, id: &str) -> Result<Item, String>;
+    fn bookmarks(&self, _id: &str) -> Result<Vec<Bookmark>, String> {
+        Err("This source does not support bookmarks.".into())
+    }
+    fn add_bookmark(&self, _id: &str, _bookmark: &Bookmark) -> Result<Bookmark, String> {
+        Err("This source does not support bookmarks.".into())
+    }
+    fn remove_bookmark(&self, _id: &str, _time: f64) -> Result<(), String> {
+        Err("This source does not support bookmarks.".into())
+    }
     fn cached_artwork(&self, path: &str) -> Option<image::RgbaImage>;
     fn artwork(&self, path: &str) -> Result<image::RgbaImage, String>;
     fn playback(&self, item: &Item, version: &Version) -> Result<Playback, String>;
