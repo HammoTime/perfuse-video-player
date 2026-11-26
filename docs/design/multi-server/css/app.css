@@ -201,7 +201,7 @@ a { color: var(--c-accent); }
 .nav-item[aria-current="page"] { background: color-mix(in srgb, var(--tone) 18%, var(--c-sidebar)); box-shadow: inset 3px 0 0 var(--tone); }
 .nav-item[aria-current="page"] .od-icon { color: var(--tone); }
 .nav-item:focus-visible { outline: 1px solid var(--tone); outline-offset: -1px; }
-@media (hover: hover) { .nav-item:not([aria-current="page"]):hover { background: color-mix(in srgb, var(--tone) 7%, var(--c-sidebar)); } }
+@media (hover: hover) { .nav-item:not([aria-current="page"]):hover { background: color-mix(in srgb, var(--tone) 7%, var(--c-sidebar)); box-shadow: inset 3px 0 0 color-mix(in srgb, var(--tone) 60%, transparent); } }
 .nav-item.dim { color: var(--c-faint); }
 .nav-item.dim .od-icon { color: var(--c-faint); }
 .nav-item .count { margin-left: auto; font-size: var(--fs-caption); color: var(--c-muted); }

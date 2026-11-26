@@ -1015,7 +1015,7 @@ impl App {
                     {
                         player.stop();
                     }
-                    ui.add(Icon::Mark.image(24.0, Color32::WHITE));
+                    ui.add(Icon::Mark.image(28.0, Color32::WHITE));
                     ui.label(
                         RichText::new("PERFUSE")
                             .size(26.0)
@@ -3247,10 +3247,14 @@ fn nav_item(
             ),
         );
     }
-    if selected || dragging {
-        // Selection is marked by shape as well as colour.
+    let hovered = response.hovered() || response.has_focus();
+    if selected || dragging || hovered {
+        // Selection is marked by shape as well as colour. Hover keeps a softer
+        // edge so the blue line on the left never disappears under the fill.
         let marker = egui::Rect::from_min_size(rect.min, Vec2::new(3.0, rect.height()));
-        ui.painter().rect_filled(marker, 0, color);
+        let strength = if selected || dragging { 1.0 } else { 0.6 };
+        ui.painter()
+            .rect_filled(marker, 0, color.gamma_multiply(strength));
     }
     if response.has_focus() || dragging {
         ui.painter().rect_stroke(
