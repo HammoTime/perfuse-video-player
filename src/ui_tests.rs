@@ -1300,6 +1300,7 @@ fn library_snapshots() {
     for (name, screen, size, scale) in [
         ("home-desktop", "home", [1440.0, 900.0], 1.0),
         ("home-minimum", "home", [860.0, 620.0], 1.0),
+        ("server-home-minimum", "server-home", [860.0, 620.0], 1.0),
         ("server-status", "home", [860.0, 620.0], 1.0),
         ("home-library-menu", "home", [1280.0, 800.0], 1.0),
         ("movies-desktop", "movies", [1440.0, 900.0], 1.0),
@@ -1310,6 +1311,7 @@ fn library_snapshots() {
         ("details-desktop", "details", [1440.0, 900.0], 1.0),
         ("details-minimum", "details", [860.0, 620.0], 1.0),
         ("audiobook-home", "book-home", [1440.0, 960.0], 1.0),
+        ("audiobook-home-minimum", "book-home", [860.0, 620.0], 1.0),
         ("audiobook-details", "book-details", [1280.0, 900.0], 1.0),
         ("audiobook-library", "book-dock", [1440.0, 900.0], 1.0),
         (
@@ -1347,12 +1349,21 @@ fn library_snapshots() {
             book_library_search(size)
         } else if screen.starts_with("book-") {
             book_detail(size)
+        } else if screen == "server-home" {
+            library(size, "home")
         } else {
             library(size, screen)
         };
         if screen == "book-home" {
             let ctx = harness.ctx.clone();
             show_book_collection(harness.state_mut(), &ctx, true);
+        }
+        if screen == "server-home" {
+            let app = harness.state_mut();
+            app.servers[0].prefs.name = "Basement".into();
+            app.location.as_mut().unwrap().title = app.servers[0].name();
+            let page = app.page.as_mut().unwrap();
+            page.total = Some(page.items.len() + 1);
         }
         if matches!(screen, "book-dock" | "book-player" | "book-player-menu") {
             let ctx = harness.ctx.clone();
@@ -2543,36 +2554,79 @@ fn sidebar_libraries_can_be_sorted_and_reordered() {
 }
 
 #[test]
-fn audiobook_home_scrolls_and_pages_from_the_same_heading_arrows() {
-    let mut harness = book_detail([1440.0, 960.0]);
+fn audiobook_home_matches_video_layout_and_pages_recently_added() {
+    let size = [860.0, 620.0];
+    let mut video = library(size, "home");
+    video.run_steps(4);
+    let mut harness = book_detail(size);
     let ctx = harness.ctx.clone();
     show_book_collection(harness.state_mut(), &ctx, true);
     harness.run_steps(4);
-    let heading = harness.get_by_label("Recently Added").rect();
-    let back = harness.get_by_label("Scroll Recently Added back").rect();
-    let next = harness.get_by_label("Scroll Recently Added forward");
-    let forward = next.rect();
-    assert!((heading.center().y - forward.center().y).abs() < 4.0);
-    assert!(
-        harness
-            .query_by_label("Previous Recently Added page")
-            .is_none()
+
+    let screen = harness.ctx.content_rect();
+    let refresh = harness.get_by_label("Refresh").rect();
+    assert_eq!(refresh, video.get_by_label("Refresh").rect());
+    assert!(screen.contains_rect(refresh));
+    let heading = harness.get_by_label("Continue Listening").rect();
+    assert_eq!(
+        heading.min,
+        video.get_by_label("Continue Watching").rect().min
     );
-    assert!(harness.query_by_label("Next Recently Added page").is_none());
-    next.click();
+    let forward = harness.get_by_label("Scroll Continue Listening forward");
+    assert_eq!(
+        forward.rect().size(),
+        video
+            .get_by_label("Scroll Continue Watching forward")
+            .rect()
+            .size()
+    );
+    assert!(screen.contains_rect(forward.rect()));
+    assert!((heading.center().y - forward.rect().center().y).abs() < 4.0);
+    forward.click();
     harness.run_steps(20);
-    assert!(harness.state().carousel_offsets["added_books"] > 1.0);
+    let listening_offset = harness.state().carousel_offsets["continue"];
+    assert!(listening_offset > 1.0);
     assert_eq!(harness.state().page.as_ref().unwrap().offset, 0);
-    let page = harness.get_by_label("Next Recently Added page");
-    assert_eq!(page.rect(), forward);
+
+    let grid_cover = harness.get_by_label("Open The River Mouth").rect();
+    let last_cover = harness.get_by_label("Open The Winter Marsh").rect();
+    assert_eq!(grid_cover.size(), Vec2::splat(grid_cover.width()));
+    assert_eq!(grid_cover.left(), last_cover.left());
+    assert!(last_cover.top() > grid_cover.bottom());
+    assert!(grid_cover.right() <= screen.right());
     assert!(
         harness
             .query_by_label("Scroll Recently Added forward")
             .is_none()
     );
-    page.click();
+
+    let listening_ids: Vec<_> = harness
+        .state()
+        .on_deck
+        .iter()
+        .map(|item| item.id.clone())
+        .collect();
+    harness
+        .get_by_label("Next Recently Added page")
+        .scroll_to_me();
+    harness.run_steps(4);
+    let next = harness.get_by_label("Next Recently Added page");
+    assert!(screen.contains_rect(next.rect()));
+    next.click();
     harness.run_steps(3);
     assert_eq!(harness.state().location.as_ref().unwrap().offset, 6);
+    assert_eq!(
+        harness.state().carousel_offsets["continue"],
+        listening_offset
+    );
+    assert!(
+        harness
+            .state()
+            .on_deck
+            .iter()
+            .map(|item| &item.id)
+            .eq(&listening_ids)
+    );
 
     // Render the last page using the same fixture, with a single remaining title.
     let app = harness.state_mut();
@@ -2584,18 +2638,27 @@ fn audiobook_home_scrolls_and_pages_from_the_same_heading_arrows() {
         total: Some(7),
     });
     harness.run_steps(4);
-    let previous = harness.get_by_label("Previous Recently Added page");
-    assert_eq!(previous.rect().center().y, back.center().y);
-    assert!((previous.rect().left() - back.left()).abs() < 12.0);
     assert!(
         harness
-            .get_by_label("Scroll Recently Added forward")
+            .get_by_label("Next Recently Added page")
             .accesskit_node()
             .is_disabled()
     );
-    previous.click();
+    harness
+        .get_by_label("Previous Recently Added page")
+        .scroll_to_me();
+    harness.run_steps(4);
+    harness.get_by_label("Previous Recently Added page").click();
     harness.run_steps(2);
     assert_eq!(harness.state().location.as_ref().unwrap().offset, 0);
+    assert!(
+        harness
+            .state()
+            .on_deck
+            .iter()
+            .map(|item| &item.id)
+            .eq(&listening_ids)
+    );
 }
 
 #[test]

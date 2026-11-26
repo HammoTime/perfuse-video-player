@@ -834,7 +834,9 @@ impl App {
                     entries.sort_by_key(|(_, _, entry)| std::cmp::Reverse(entry.last_viewed_at));
                     ui.add_space(20.0);
                     let shelf = if entries[0].2.kind == Kind::Audiobook {
-                        Shelf::books(entries.len())
+                        Shelf::Books {
+                            count: Some(entries.len()),
+                        }
                     } else {
                         Shelf::Video(4)
                     };

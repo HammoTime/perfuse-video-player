@@ -1457,48 +1457,6 @@ impl App {
         );
     }
 
-    fn audiobook_home_header(
-        &mut self,
-        ui: &mut egui::Ui,
-        ctx: &egui::Context,
-        server: usize,
-        title: &str,
-    ) {
-        let name = self.servers[server].name();
-        let count = self.sections.len();
-        let noun = if count == 1 { "library" } else { "libraries" };
-        ui.horizontal_top(|ui| {
-            ui.spacing_mut().item_spacing.x = 16.0;
-            let width = (ui.available_width() - 44.0 - 16.0).max(0.0);
-            ui.vertical(|ui| {
-                ui.set_width(width);
-                ui.spacing_mut().item_spacing.y = 8.0;
-                ui.horizontal(|ui| audiobooks::book_crumb(ui, &name, None));
-                ui.add(
-                    egui::Label::new(RichText::new(title).size(30.0).line_height(Some(36.0)))
-                        .truncate(),
-                )
-                .on_hover_text(title);
-                ui.label(
-                    RichText::new(format!("Audiobookshelf server · {count} {noun}"))
-                        .size(15.0)
-                        .line_height(Some(22.5))
-                        .color(MUTED),
-                );
-            });
-            if ui
-                .add_enabled(
-                    !self.busy,
-                    IconButton::new(Icon::Refresh, "Refresh").size(44.0),
-                )
-                .clicked()
-            {
-                self.load_page(ctx, false);
-            }
-        });
-        ui.add_space(28.0);
-    }
-
     fn collection(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.spacing_mut().item_spacing.y = 12.0;
         let home = self.selected_library.is_none();
@@ -1508,51 +1466,47 @@ impl App {
             .map(|l| l.title.as_str())
             .unwrap_or("Your library")
             .to_owned();
-        if let Some(i) = self.active.filter(|_| home && self.audiobook_server()) {
-            self.audiobook_home_header(ui, ctx, i, &title);
-        } else {
-            let searchable = self.location.as_ref().is_some_and(|l| l.library);
-            ui.allocate_ui_with_layout(
-                Vec2::new(ui.available_width(), 40.0),
-                egui::Layout::right_to_left(egui::Align::Center),
-                |ui| {
-                    if ui
-                        .add_enabled(!self.busy, IconButton::new(Icon::Refresh, "Refresh"))
-                        .clicked()
-                    {
-                        self.load_page(ctx, false);
-                    }
-                    if self.busy {
-                        ui.spinner();
-                    }
-                    if searchable {
-                        self.library_search_fields(ui, ctx);
-                    }
-                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        ui.add(
-                            egui::Label::new(RichText::new(&title).size(30.0).strong()).truncate(),
-                        )
+        let searchable = self.location.as_ref().is_some_and(|l| l.library);
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), 40.0),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                if ui
+                    .add_enabled(!self.busy, IconButton::new(Icon::Refresh, "Refresh"))
+                    .clicked()
+                {
+                    self.load_page(ctx, false);
+                }
+                if self.busy {
+                    ui.spinner();
+                }
+                if searchable {
+                    self.library_search_fields(ui, ctx);
+                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add(egui::Label::new(RichText::new(&title).size(30.0).strong()).truncate())
                         .on_hover_text(&title);
-                    });
-                },
-            );
-            if let Some(i) = self.active {
-                let server = &self.servers[i];
-                let kind = server.session.kind.plugin().name;
-                ui.horizontal(|ui| {
-                    ui.add(server.icon().image(15.0, MUTED));
-                    ui.colored_label(
-                        MUTED,
-                        if home {
-                            format!("{kind} server · {} libraries", self.sections.len())
-                        } else {
-                            format!("{kind} / {}", server.name())
-                        },
-                    );
                 });
-            }
-            ui.add_space(34.0);
+            },
+        );
+        if let Some(i) = self.active {
+            let server = &self.servers[i];
+            let kind = server.session.kind.plugin().name;
+            ui.horizontal(|ui| {
+                ui.add(server.icon().image(15.0, MUTED));
+                ui.colored_label(
+                    MUTED,
+                    if home {
+                        let count = self.sections.len();
+                        let noun = if count == 1 { "library" } else { "libraries" };
+                        format!("{kind} server · {count} {noun}")
+                    } else {
+                        format!("{kind} / {}", server.name())
+                    },
+                );
+            });
         }
+        ui.add_space(34.0);
         if self.sections.is_empty() {
             ui.heading(if self.audiobook_server() {
                 "No audiobook libraries available"
@@ -1569,6 +1523,8 @@ impl App {
                 || self.page.is_some()
                 || !self.on_deck.is_empty()
                 || !self.released.is_empty());
+        let home_spacing =
+            (ctx.content_rect().height() - MIN_BROWSE_SIZE.y + 32.0).clamp(32.0, 48.0);
         let audiobook_server = self.audiobook_server();
         let continue_heading = self.continue_heading();
         let book_status = |item: &Item| {
@@ -1600,7 +1556,7 @@ impl App {
                         );
                     } else {
                         let shelf = if audiobook_server {
-                            Shelf::books(self.on_deck.len())
+                            Shelf::Books { count: None }
                         } else {
                             Shelf::Video(1)
                         };
@@ -1629,7 +1585,7 @@ impl App {
                             },
                         );
                     }
-                    ui.add_space(48.0);
+                    ui.add_space(home_spacing);
                     if !self.released.is_empty() {
                         home_carousel(
                             ui,
@@ -1644,7 +1600,7 @@ impl App {
                                 }
                             },
                         );
-                        ui.add_space(48.0);
+                        ui.add_space(home_spacing);
                     }
                 }
                 if let Some(page) = &self.page {
@@ -1661,43 +1617,6 @@ impl App {
                                 .is_none_or(|i| self.servers[i].item_visible(item))
                         })
                         .collect();
-                    if home && audiobook_server && !items.is_empty() {
-                        let range = format!(
-                            "{}–{}{}",
-                            page.offset + 1,
-                            page.offset + page.items.len(),
-                            page.total.map(|n| format!(" of {n}")).unwrap_or_default()
-                        );
-                        page_action = ui
-                            .push_id(page.offset, |ui| {
-                                home_carousel(
-                                    ui,
-                                    "added_books",
-                                    "Recently Added",
-                                    self.carousel_offsets.entry("added_books").or_default(),
-                                    &items,
-                                    Shelf::Books {
-                                        meta: range,
-                                        previous_page: !self.busy && has_previous,
-                                        next_page: !self.busy && has_next,
-                                    },
-                                    |ui, &item| {
-                                        if book_card(
-                                            ui,
-                                            item,
-                                            &self.covers,
-                                            BOOK_CARD_WIDTH,
-                                            book_status(item),
-                                        ) && !self.busy
-                                        {
-                                            picked = Some(item.clone());
-                                        }
-                                    },
-                                )
-                            })
-                            .inner;
-                        return;
-                    }
                     control_row(ui, 32.0, |ui| {
                         ui.label(
                             RichText::new(if home {
@@ -2993,10 +2912,6 @@ impl eframe::App for App {
                             .detail
                             .as_ref()
                             .is_some_and(|item| item.kind == Kind::Audiobook)
-                        || (!self.connection_open
-                            && !self.overview
-                            && self.selected_library.is_none()
-                            && self.audiobook_server())
                     {
                         let padding = if ctx.content_rect().width() <= 1000.0 {
                             32
@@ -3876,21 +3791,7 @@ fn cover_view_rounded(
 
 enum Shelf {
     Video(usize),
-    Books {
-        meta: String,
-        previous_page: bool,
-        next_page: bool,
-    },
-}
-
-impl Shelf {
-    fn books(count: usize) -> Self {
-        Self::Books {
-            meta: count.to_string(),
-            previous_page: false,
-            next_page: false,
-        }
-    }
+    Books { count: Option<usize> },
 }
 
 fn home_carousel<T>(
@@ -3901,9 +3802,13 @@ fn home_carousel<T>(
     items: &[T],
     shelf: Shelf,
     mut card: impl FnMut(&mut egui::Ui, &T),
-) -> i8 {
+) {
     let viewport = ui.available_width();
-    let book_shelf = matches!(shelf, Shelf::Books { .. });
+    let show_count = if let Shelf::Books { count } = shelf {
+        count
+    } else {
+        None
+    };
     let (rows, card_width, spacing) = match shelf {
         Shelf::Video(rows) => (rows, HOME_CARD_WIDTH, ART_GAP),
         Shelf::Books { .. } => (1, BOOK_CARD_WIDTH, ART_GAP),
@@ -3915,63 +3820,37 @@ fn home_carousel<T>(
         items.len() / page_size * visible_columns + (items.len() % page_size).min(visible_columns);
     let max_offset = (columns as f32 * pitch - spacing - viewport).max(0.0);
     let mut scroll_delta = 0.0_f32;
-    let mut page_action = 0;
     control_row(ui, 32.0, |ui| {
-        let (previous_page, next_page) = if let Shelf::Books {
-            meta,
-            previous_page,
-            next_page,
-        } = shelf
-        {
+        if let Some(count) = show_count {
             ui.spacing_mut().item_spacing.x = 12.0;
             ui.label(RichText::new(heading).size(22.0));
-            ui.label(RichText::new(meta).size(13.0).color(MUTED));
+            ui.label(RichText::new(count.to_string()).size(13.0).color(MUTED));
             ui.spacing_mut().item_spacing.x = 8.0;
-            (previous_page, next_page)
         } else {
             ui.label(RichText::new(heading).size(22.0).strong());
-            (false, false)
-        };
-        if book_shelf || max_offset > 1.0 {
+        }
+        if show_count.is_some() || max_offset > 1.0 {
             let step = visible_columns as f32 * pitch;
-            let size = if book_shelf { 28.0 } else { 32.0 };
-            let can_scroll_back = *offset_x > 1.0;
-            let can_scroll_forward = *offset_x < max_offset - 1.0;
-            let back_label = if previous_page && !can_scroll_back {
-                format!("Previous {heading} page")
-            } else {
-                format!("Scroll {heading} back")
-            };
+            let size = if show_count.is_some() { 28.0 } else { 32.0 };
             if ui
                 .add_enabled(
-                    can_scroll_back || previous_page,
-                    IconButton::new(Icon::PagePrevious, &back_label).size(size),
+                    *offset_x > 1.0,
+                    IconButton::new(Icon::PagePrevious, &format!("Scroll {heading} back"))
+                        .size(size),
                 )
                 .clicked()
             {
-                if can_scroll_back {
-                    scroll_delta = step.min(offset_x.max(0.0));
-                } else {
-                    page_action = -1;
-                }
+                scroll_delta = step.min(offset_x.max(0.0));
             }
-            let forward_label = if next_page && !can_scroll_forward {
-                format!("Next {heading} page")
-            } else {
-                format!("Scroll {heading} forward")
-            };
             if ui
                 .add_enabled(
-                    can_scroll_forward || next_page,
-                    IconButton::new(Icon::PageNext, &forward_label).size(size),
+                    *offset_x < max_offset - 1.0,
+                    IconButton::new(Icon::PageNext, &format!("Scroll {heading} forward"))
+                        .size(size),
                 )
                 .clicked()
             {
-                if can_scroll_forward {
-                    scroll_delta = -step.min((max_offset - *offset_x).max(0.0));
-                } else {
-                    page_action = 1;
-                }
+                scroll_delta = -step.min((max_offset - *offset_x).max(0.0));
             }
         }
     });
@@ -3998,7 +3877,6 @@ fn home_carousel<T>(
             });
         });
     *offset_x = output.state.offset.x;
-    page_action
 }
 
 #[derive(Clone, Copy)]
