@@ -5,7 +5,9 @@ mod mpv;
 mod player;
 mod prefs;
 mod runtime;
+mod servers;
 mod session;
+use servers::Server;
 mod updates;
 mod video;
 
@@ -134,15 +136,27 @@ enum RuntimePrompt {
     },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum SettingsTab {
+    Servers,
+    Playback,
+    Updates,
+}
+
 struct App {
+    settings_tab: SettingsTab,
+    servers: Vec<Server>,
+    active: Option<usize>,
+    overview: bool,
+    adding: bool,
+    removing: Option<usize>,
+    next_health_check: Instant,
+    status_popover: servers::StatusPopover,
     server: String,
     token: String,
     client_id: String,
     source: Option<Source>,
-    server_sections: Vec<Library>,
     sections: Vec<Library>,
-    library_order: prefs::LibraryOrder,
-    dragging_section: Option<usize>,
     selected_library: Option<String>,
     location: Option<Location>,
     history: Vec<Location>,
@@ -186,7 +200,6 @@ struct App {
     login_url: Option<String>,
     available_servers: Vec<auth::Server>,
     remember: bool,
-    saved: bool,
     runtime_rx: Option<Receiver<runtime::Update>>,
     runtime_prompt: Option<RuntimePrompt>,
     runtime_status: Option<String>,
@@ -235,6 +248,14 @@ impl App {
         });
         let (tx, rx) = mpsc::channel();
         Self {
+            settings_tab: SettingsTab::Servers,
+            servers: vec![],
+            active: None,
+            overview: false,
+            adding: false,
+            removing: None,
+            next_health_check: Instant::now() + Duration::from_secs(60),
+            status_popover: servers::StatusPopover::default(),
             server: std::env::var("PLEX_URL")
                 .unwrap_or_else(|_| plex::PLUGIN.default_address.into()),
             token: std::env::var("PLEX_TOKEN").unwrap_or_default(),
@@ -247,10 +268,7 @@ impl App {
                     .as_nanos()
             ),
             source: None,
-            server_sections: vec![],
             sections: vec![],
-            library_order: prefs::LibraryOrder::default(),
-            dragging_section: None,
             selected_library: None,
             location: None,
             history: vec![],
@@ -294,7 +312,6 @@ impl App {
             login_url: None,
             available_servers: vec![],
             remember: cfg!(windows),
-            saved: false,
             runtime_rx: None,
             runtime_prompt: None,
             runtime_status: None,
@@ -326,26 +343,36 @@ impl App {
     }
 
     fn restore(&mut self, ctx: &egui::Context) {
-        match session::load() {
-            Ok(Some(saved)) => {
-                self.saved = true;
-                self.client_id = saved.client_id;
-                if std::env::var_os("PLEX_URL").is_none() {
-                    self.server = saved.server;
-                } else if std::env::var_os("PLEX_TOKEN").is_none()
-                    && reqwest::Url::parse(self.server.trim()).ok()
-                        != reqwest::Url::parse(saved.server.trim()).ok()
-                {
-                    // Keep the saved token scoped to its original server.
-                    return;
-                }
-                if std::env::var_os("PLEX_TOKEN").is_none() {
-                    self.token = saved.token;
-                }
-                self.connect(ctx);
+        let sessions = match session::load() {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                self.error = Some(error);
+                return;
             }
-            Ok(None) => {}
-            Err(error) => self.error = Some(error),
+        };
+        let single = sessions.len() == 1;
+        for mut saved in sessions {
+            let matches = session::origin(&saved.server) == session::origin(&self.server);
+            if std::env::var_os("PLEX_URL").is_some() && !matches {
+                continue;
+            }
+            if let Ok(token) = std::env::var("PLEX_TOKEN") {
+                if !matches && !single {
+                    continue;
+                }
+                saved.token = token;
+            }
+            if let Ok(source) = session::open(&saved) {
+                self.client_id = saved.client_id.clone();
+                let mut server = Server::new(saved, source, vec![], true);
+                server.check(ctx);
+                self.servers.push(server);
+            }
+        }
+        self.servers.sort_by_key(|s| s.prefs.position);
+        if !self.servers.is_empty() {
+            self.activate(0);
+            self.overview = true;
         }
     }
 
@@ -448,19 +475,6 @@ impl App {
         self.runtime_rx = Some(runtime::start(ctx.clone()));
     }
 
-    fn forget_saved(&mut self) -> bool {
-        match session::clear() {
-            Ok(()) => {
-                self.saved = false;
-                true
-            }
-            Err(error) => {
-                self.error = Some(error);
-                false
-            }
-        }
-    }
-
     fn begin(&mut self) -> u64 {
         self.busy = true;
         self.error = None;
@@ -470,6 +484,14 @@ impl App {
     }
 
     fn connect(&mut self, ctx: &egui::Context) {
+        if self
+            .servers
+            .iter()
+            .any(|s| session::origin(&self.server) == session::origin(&s.session.server))
+        {
+            self.error = Some("This server has already been added.".into());
+            return;
+        }
         let generation = self.begin();
         let session = session::Session {
             server: self.server.clone(),
@@ -664,6 +686,7 @@ impl App {
     }
 
     fn poll(&mut self, ctx: &egui::Context) {
+        self.poll_servers(ctx);
         let mut runtime_finished = None;
         if let Some(rx) = &self.runtime_rx {
             while let Ok(update) = rx.try_recv() {
@@ -705,38 +728,35 @@ impl App {
                 Reply::Connected(source, sections, session) => {
                     self.busy = false;
                     let save_error = if self.remember {
-                        match session::save(&session) {
-                            Ok(()) => {
-                                self.saved = true;
-                                None
-                            }
-                            Err(error) => Some(error),
-                        }
+                        session::save(&session).err()
                     } else {
                         None
                     };
-                    self.server = session.server;
-                    self.token = session.token;
-                    self.client_id = session.client_id;
-                    self.source = Some(source);
-                    self.server_sections = sections;
-                    self.library_order = prefs::load_library_order(&self.server);
-                    self.sections =
-                        prefs::apply_library_order(&self.server_sections, &self.library_order);
-                    self.dragging_section = None;
-                    self.location = None;
-                    self.page = None;
-                    self.home_loaded = false;
-                    self.carousel_offsets.clear();
-                    self.covers.clear();
-                    self.detail = None;
-                    self.selected_library = None;
-                    self.history.clear();
-                    self.search.clear();
-                    self.notice = None;
+                    let mut entry = Server::new(
+                        session,
+                        source,
+                        sections,
+                        self.remember && save_error.is_none(),
+                    );
+                    if entry.prefs.name.is_empty()
+                        && let Some(discovered) = self.available_servers.iter().find(|s| {
+                            s.connections.iter().any(|c| {
+                                session::origin(&c.uri) == session::origin(&entry.session.server)
+                            })
+                        })
+                    {
+                        entry.prefs.name = discovered.name.clone();
+                    }
+                    entry.prefs.position = self.servers.len();
+                    entry.persist();
+                    entry.check(ctx);
+                    self.servers.push(entry);
+                    self.activate(self.servers.len() - 1);
+                    self.overview = true;
+                    self.adding = false;
                     self.connection_open = false;
-                    self.home(ctx);
-                    // Loading Home starts a new request and clears old errors.
+                    self.token.clear();
+                    self.available_servers.clear();
                     if let Some(error) = save_error {
                         self.error = Some(error);
                     }
@@ -750,11 +770,18 @@ impl App {
                     if let Some(location) = &mut self.location {
                         location.offset = page.offset;
                     }
+                    let visible = |item: &Item| {
+                        !self.active.is_some_and(|i| {
+                            item.library_id
+                                .as_ref()
+                                .is_some_and(|id| self.servers[i].prefs.hidden.contains(id))
+                        })
+                    };
                     self.page = Some(page);
                     if let Some((on_deck, released)) = home_rows {
                         self.home_loaded = true;
-                        self.on_deck = on_deck;
-                        self.released = released;
+                        self.on_deck = on_deck.into_iter().filter(visible).collect();
+                        self.released = released.into_iter().filter(visible).collect();
                         self.notice = notice;
                     } else if self.selected_library.is_some() {
                         self.notice = notice;
@@ -901,7 +928,7 @@ impl App {
         } else if ui
             .add_enabled(
                 !self.busy && self.player.is_none(),
-                Pill::primary(Icon::SignInBrowser, "Sign in with Plex").min_width(210.0),
+                Pill::primary(Icon::ServerPlex, "Sign in with Plex").min_width(210.0),
             )
             .clicked()
         {
@@ -914,29 +941,27 @@ impl App {
                 .small()
                 .color(MUTED),
         );
-        if ui
-            .add_enabled(
-                cfg!(windows),
-                egui::Checkbox::new(&mut self.remember, "Remember me on this computer"),
-            )
-            .changed()
-            && !self.remember
-            && !self.forget_saved()
-        {
-            self.remember = true;
-        }
+        ui.add_enabled(
+            cfg!(windows) && !self.busy,
+            egui::Checkbox::new(&mut self.remember, "Remember me on this computer"),
+        );
         ui.label(
-            RichText::new(if self.saved {
-                "Sign-in saved in Windows Credential Manager."
-            } else {
-                "Remembered sign-ins are saved securely after connecting."
-            })
-            .small()
-            .color(MUTED),
+            RichText::new("Remembered sign-ins are stored in Windows Credential Manager.")
+                .small()
+                .color(MUTED),
         );
         let mut selected = None;
         for (index, server) in self.available_servers.iter().enumerate() {
             ui.add_space(10.0);
+            if self.servers.iter().any(|s| {
+                server
+                    .connections
+                    .iter()
+                    .any(|c| session::origin(&c.uri) == session::origin(&s.session.server))
+            }) {
+                ui.label(format!("{} · Already added", server.name));
+                continue;
+            }
             if ui
                 .add_enabled(
                     !self.busy,
@@ -980,7 +1005,6 @@ impl App {
                 if ui.add(Pill::secondary(Icon::Connect, "Connect to server")).clicked() { self.connect(ctx); }
             });
             ui.hyperlink_to("How to find a Plex token", "https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/");
-            if ui.add(Pill::secondary(Icon::Forget, "Forget saved sign-in")).clicked() { self.forget_saved(); }
         });
         if self.busy {
             ui.horizontal(|ui| {
@@ -991,12 +1015,16 @@ impl App {
     }
 
     fn home(&mut self, ctx: &egui::Context) {
+        self.overview = false;
         self.selected_library = None;
         self.history.clear();
         self.search.clear();
         self.connection_open = false;
         self.location = Some(Location {
-            title: "Home".into(),
+            title: self
+                .active
+                .map(|i| self.servers[i].name())
+                .unwrap_or_else(|| "Home".into()),
             browse: Browse::RecentlyAdded,
             search: String::new(),
             offset: 0,
@@ -1012,10 +1040,17 @@ impl App {
             self.connection_open = false;
         } else if self.detail.is_some() {
             self.detail = None;
+            if self.location.is_none() {
+                self.overview = true;
+            }
         } else if let Some(location) = self.history.pop() {
             self.search = location.search.clone();
             self.location = Some(location);
             self.load_page(ctx, false);
+        } else if self.selected_library.is_some() {
+            self.home(ctx);
+        } else {
+            self.overview = true;
         }
     }
 
@@ -1037,29 +1072,6 @@ impl App {
         }
         let size = ctx.content_rect().size();
         size.x < MINI_PLAYER_WIDTH || size.y < MINI_PLAYER_HEIGHT
-    }
-
-    fn set_library_sort(&mut self, sort: prefs::LibrarySort) {
-        if self.server_sections.is_empty() && !self.sections.is_empty() {
-            self.server_sections = self.sections.clone();
-        }
-        self.library_order.sort = sort;
-        self.sections = prefs::apply_library_order(&self.server_sections, &self.library_order);
-        prefs::save_library_order(&self.server, &self.library_order);
-    }
-
-    fn move_section(&mut self, from: usize, to: usize) {
-        if from >= self.sections.len() || to >= self.sections.len() || from == to {
-            return;
-        }
-        if self.server_sections.is_empty() {
-            self.server_sections = self.sections.clone();
-        }
-        let section = self.sections.remove(from);
-        self.sections.insert(to, section);
-        self.library_order.sort = prefs::LibrarySort::Custom;
-        self.library_order.custom_keys = self.sections.iter().map(|s| s.id.clone()).collect();
-        prefs::save_library_order(&self.server, &self.library_order);
     }
 
     fn page_previous(&mut self, ctx: &egui::Context) {
@@ -1112,7 +1124,8 @@ impl App {
                                 !self.busy
                                     && (self.detail.is_some()
                                         || self.connection_open
-                                        || !self.history.is_empty()),
+                                        || !self.history.is_empty()
+                                        || (!self.servers.is_empty() && !self.overview)),
                                 IconButton::new(Icon::Back, "Back"),
                             )
                             .clicked()
@@ -1188,189 +1201,27 @@ impl App {
                         ui,
                         Icon::Home,
                         "Home",
-                        self.selected_library.is_none() && !self.connection_open,
+                        self.overview && !self.connection_open,
                     )
                     .clicked()
                         && !self.busy
                     {
-                        self.home(ctx);
+                        self.overview = true;
+                        self.connection_open = false;
+                        self.detail = None;
                     }
-                    ui.add_space(34.0);
-                    let mut requested_sort = None;
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 0.0;
-                        ui.add_space(SIDEBAR_ICON_INSET);
-                        ui.label(RichText::new("LIBRARIES").size(12.0).strong().color(MUTED));
-                        if self.sections.len() > 1 {
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    let sort_btn = ui.add(
-                                        IconButton::new(Icon::Sort, "Sort libraries")
-                                            .size(24.0)
-                                            .active(
-                                                self.library_order.sort
-                                                    != prefs::LibrarySort::Server,
-                                            ),
-                                    );
-                                    egui::Popup::menu(&sort_btn).show(|ui| {
-                                        for (mode, label) in [
-                                            (prefs::LibrarySort::Server, "Server order"),
-                                            (prefs::LibrarySort::NameAsc, "Name (A–Z)"),
-                                            (prefs::LibrarySort::NameDesc, "Name (Z–A)"),
-                                            (prefs::LibrarySort::TypeThenName, "Movies, then TV"),
-                                        ] {
-                                            if ui
-                                                .selectable_label(
-                                                    self.library_order.sort == mode,
-                                                    label,
-                                                )
-                                                .clicked()
-                                            {
-                                                requested_sort = Some(mode);
-                                            }
-                                        }
-                                        if self.library_order.sort == prefs::LibrarySort::Custom {
-                                            let _ = ui.selectable_label(true, "Custom order");
-                                        }
-                                        ui.separator();
-                                        ui.label(
-                                            RichText::new("Drag libraries to reorder")
-                                                .small()
-                                                .color(MUTED),
-                                        );
-                                    });
-                                },
-                            );
-                        }
-                    });
-                    let mut pending_move: Option<(usize, usize)> = None;
-                    let mut open_section: Option<Library> = None;
-                    let can_reorder = self.sections.len() > 1;
-                    let section_count = self.sections.len();
+                    ui.add_space(24.0);
                     egui::ScrollArea::vertical()
-                        .id_salt("sidebar_libraries")
-                        .max_height((ui.available_height() - 180.0).max(80.0))
+                        .id_salt("server_groups")
+                        .max_height((ui.available_height() - 130.0).max(60.0))
                         .show(ui, |ui| {
-                            let mut row_rects = Vec::with_capacity(section_count);
-                            for (index, section) in self.sections.iter().enumerate() {
-                                let selected = !self.connection_open
-                                    && self.selected_library.as_ref() == Some(&section.id);
-                                let icon = if section.kind == Kind::Series {
-                                    Icon::TvShows
-                                } else {
-                                    Icon::Movies
-                                };
-                                let dragging_this = self.dragging_section == Some(index);
-                                let response = nav_item(
-                                    ui,
-                                    icon,
-                                    &section.title,
-                                    selected,
-                                    can_reorder,
-                                    dragging_this,
-                                );
-                                row_rects.push(response.rect);
-                                if can_reorder
-                                    && response.drag_started_by(egui::PointerButton::Primary)
-                                {
-                                    self.dragging_section = Some(index);
-                                }
-                                if response.clicked()
-                                    && self.dragging_section.is_none()
-                                    && !self.busy
-                                {
-                                    open_section = Some(section.clone());
-                                }
-                                if can_reorder {
-                                    response.context_menu(|ui| {
-                                        if ui
-                                            .add_enabled(index > 0, egui::Button::new("Move up"))
-                                            .clicked()
-                                        {
-                                            pending_move = Some((index, index - 1));
-                                            ui.close();
-                                        }
-                                        if ui
-                                            .add_enabled(
-                                                index + 1 < section_count,
-                                                egui::Button::new("Move down"),
-                                            )
-                                            .clicked()
-                                        {
-                                            pending_move = Some((index, index + 1));
-                                            ui.close();
-                                        }
-                                        ui.separator();
-                                        if ui.button("Sort A–Z").clicked() {
-                                            requested_sort = Some(prefs::LibrarySort::NameAsc);
-                                            ui.close();
-                                        }
-                                        if ui.button("Sort Z–A").clicked() {
-                                            requested_sort = Some(prefs::LibrarySort::NameDesc);
-                                            ui.close();
-                                        }
-                                        if ui.button("Server order").clicked() {
-                                            requested_sort = Some(prefs::LibrarySort::Server);
-                                            ui.close();
-                                        }
-                                    });
-                                }
-                            }
-                            if let Some(from) = self.dragging_section {
-                                if from >= row_rects.len() {
-                                    self.dragging_section = None;
-                                } else {
-                                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-                                    let pointer_y = ui
-                                        .ctx()
-                                        .input(|i| i.pointer.latest_pos())
-                                        .map(|p| p.y)
-                                        .unwrap_or_else(|| row_rects[from].center().y);
-                                    let drop_slot = row_rects
-                                        .iter()
-                                        .position(|rect| pointer_y < rect.center().y)
-                                        .unwrap_or(row_rects.len());
-                                    if drop_slot != from && drop_slot != from + 1 {
-                                        let y = if drop_slot == 0 {
-                                            row_rects[0].top()
-                                        } else if drop_slot == row_rects.len() {
-                                            row_rects[drop_slot - 1].bottom()
-                                        } else {
-                                            (row_rects[drop_slot - 1].bottom()
-                                                + row_rects[drop_slot].top())
-                                                * 0.5
-                                        };
-                                        ui.painter().hline(
-                                            row_rects[0].x_range(),
-                                            y,
-                                            egui::Stroke::new(2.0_f32, ACCENT),
-                                        );
-                                    }
-                                    if !ui.ctx().input(|i| i.pointer.primary_down()) {
-                                        let to = if drop_slot > from {
-                                            drop_slot - 1
-                                        } else {
-                                            drop_slot
-                                        };
-                                        if to != from {
-                                            pending_move = Some((from, to));
-                                        }
-                                        self.dragging_section = None;
-                                    }
-                                }
+                            for i in 0..self.servers.len() {
+                                ui.push_id(i, |ui| {
+                                    self.server_group(ui, ctx, i);
+                                });
+                                ui.add_space(12.0);
                             }
                         });
-                    if let Some(sort) = requested_sort {
-                        self.set_library_sort(sort);
-                    }
-                    if let Some((from, to)) = pending_move {
-                        self.move_section(from, to);
-                    }
-                    if let Some(section) = open_section {
-                        self.connection_open = false;
-                        self.library(&section, ctx);
-                    }
                     ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                         if nav(
                             ui,
@@ -1382,17 +1233,218 @@ impl App {
                         {
                             self.connection_open = true;
                         }
-                        ui.add_space(20.0);
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 0.0;
-                            ui.add_space(12.0);
-                            ui.add(Icon::StatusConnected.image(16.0, GREEN));
-                            ui.add_space(12.0);
-                            ui.label(RichText::new("Plex connected").color(MUTED).size(12.0));
-                        });
+                        self.status_button(ui, ctx);
                     });
                 });
             });
+    }
+
+    fn server_group(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, i: usize) {
+        let mut sections = self.servers[i].libraries();
+        let mut requested_sort = None;
+        control_row(ui, 28.0, |ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            self.group_heading(ui, i, ctx);
+            if sections.len() > 1 && self.servers[i].online {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let sort_btn = ui.add(
+                        IconButton::new(Icon::Sort, "Sort libraries")
+                            .size(24.0)
+                            .active(self.servers[i].prefs.sort != prefs::LibrarySort::Server),
+                    );
+                    egui::Popup::menu(&sort_btn).show(|ui| {
+                        for (mode, label) in [
+                            (prefs::LibrarySort::Server, "Server order"),
+                            (prefs::LibrarySort::NameAsc, "Name (A–Z)"),
+                            (prefs::LibrarySort::NameDesc, "Name (Z–A)"),
+                            (prefs::LibrarySort::TypeThenName, "Movies, then TV"),
+                        ] {
+                            if ui
+                                .selectable_label(self.servers[i].prefs.sort == mode, label)
+                                .clicked()
+                            {
+                                requested_sort = Some(mode);
+                            }
+                        }
+                        if self.servers[i].prefs.sort == prefs::LibrarySort::Custom {
+                            let _ = ui.selectable_label(true, "Custom order");
+                        }
+                        ui.separator();
+                        ui.label(
+                            RichText::new("Drag libraries to reorder")
+                                .small()
+                                .color(MUTED),
+                        );
+                    });
+                });
+            }
+        });
+        let mut pending_move: Option<(usize, usize)> = None;
+        let mut open_section: Option<Library> = None;
+        let can_reorder = sections.len() > 1;
+        let section_count = sections.len();
+        if self.servers[i].prefs.collapsed {
+            return;
+        }
+        let server_home = self.active == Some(i)
+            && !self.overview
+            && !self.connection_open
+            && self.selected_library.is_none()
+            && self.detail.is_none()
+            && self
+                .location
+                .as_ref()
+                .is_some_and(|location| matches!(location.browse, Browse::RecentlyAdded));
+        egui::Frame::new()
+            .inner_margin(egui::Margin {
+                left: 16,
+                ..Default::default()
+            })
+            .show(ui, |ui| {
+                let home = nav(ui, Icon::Home, "Home", server_home);
+                let label = format!("{} Home", self.servers[i].name());
+                home.widget_info(|| {
+                    egui::WidgetInfo::selected(
+                        egui::WidgetType::SelectableLabel,
+                        true,
+                        server_home,
+                        &label,
+                    )
+                });
+                if home.on_hover_text(label).clicked() {
+                    self.open_server(i, ctx);
+                }
+                let mut row_rects = Vec::with_capacity(section_count);
+                for (index, section) in sections.iter().enumerate() {
+                    let selected = !self.overview
+                        && self.active == Some(i)
+                        && !self.connection_open
+                        && self.selected_library.as_ref() == Some(&section.id);
+                    let icon = if section.kind == Kind::Series {
+                        Icon::TvShows
+                    } else {
+                        Icon::Movies
+                    };
+                    let dragging_this = self.servers[i].dragging_section == Some(index);
+                    let response = nav_item(
+                        ui,
+                        icon,
+                        &section.title,
+                        selected,
+                        can_reorder,
+                        dragging_this,
+                    );
+                    row_rects.push(response.rect);
+                    if can_reorder && response.drag_started_by(egui::PointerButton::Primary) {
+                        self.servers[i].dragging_section = Some(index);
+                    }
+                    if response.clicked()
+                        && self.servers[i].dragging_section.is_none()
+                        && !self.busy
+                    {
+                        open_section = Some(section.clone());
+                    }
+                    if can_reorder {
+                        response.context_menu(|ui| {
+                            if ui
+                                .add_enabled(index > 0, egui::Button::new("Move up"))
+                                .clicked()
+                            {
+                                pending_move = Some((index, index - 1));
+                                ui.close();
+                            }
+                            if ui
+                                .add_enabled(
+                                    index + 1 < section_count,
+                                    egui::Button::new("Move down"),
+                                )
+                                .clicked()
+                            {
+                                pending_move = Some((index, index + 1));
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui.button("Sort A–Z").clicked() {
+                                requested_sort = Some(prefs::LibrarySort::NameAsc);
+                                ui.close();
+                            }
+                            if ui.button("Sort Z–A").clicked() {
+                                requested_sort = Some(prefs::LibrarySort::NameDesc);
+                                ui.close();
+                            }
+                            if ui.button("Server order").clicked() {
+                                requested_sort = Some(prefs::LibrarySort::Server);
+                                ui.close();
+                            }
+                        });
+                    }
+                }
+                if let Some(from) = self.servers[i].dragging_section {
+                    if from >= row_rects.len() {
+                        self.servers[i].dragging_section = None;
+                    } else {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                        let pointer_y = ui
+                            .ctx()
+                            .input(|i| i.pointer.latest_pos())
+                            .map(|p| p.y)
+                            .unwrap_or_else(|| row_rects[from].center().y);
+                        let drop_slot = row_rects
+                            .iter()
+                            .position(|rect| pointer_y < rect.center().y)
+                            .unwrap_or(row_rects.len());
+                        if drop_slot != from && drop_slot != from + 1 {
+                            let y = if drop_slot == 0 {
+                                row_rects[0].top()
+                            } else if drop_slot == row_rects.len() {
+                                row_rects[drop_slot - 1].bottom()
+                            } else {
+                                (row_rects[drop_slot - 1].bottom() + row_rects[drop_slot].top())
+                                    * 0.5
+                            };
+                            ui.painter().hline(
+                                row_rects[0].x_range(),
+                                y,
+                                egui::Stroke::new(2.0_f32, ACCENT),
+                            );
+                        }
+                        if !ui.ctx().input(|i| i.pointer.primary_down()) {
+                            let to = if drop_slot > from {
+                                drop_slot - 1
+                            } else {
+                                drop_slot
+                            };
+                            if to != from {
+                                pending_move = Some((from, to));
+                            }
+                            self.servers[i].dragging_section = None;
+                        }
+                    }
+                }
+            });
+        if let Some(sort) = requested_sort {
+            self.servers[i].prefs.sort = sort;
+        }
+        if let Some((from, to)) = pending_move {
+            let moved = sections.remove(from);
+            sections.insert(to, moved);
+            self.servers[i].prefs.sort = prefs::LibrarySort::Custom;
+            self.servers[i].prefs.custom_keys = sections.iter().map(|lib| lib.id.clone()).collect();
+        }
+        if requested_sort.is_some() || pending_move.is_some() {
+            self.servers[i].persist();
+            if self.active == Some(i) {
+                self.sections = self.servers[i].libraries();
+            }
+        }
+        if let Some(section) = open_section {
+            if self.active != Some(i) {
+                self.activate(i);
+            }
+            self.connection_open = false;
+            self.overview = false;
+            self.library(&section, ctx);
+        }
     }
 
     fn search_library(&mut self, ctx: &egui::Context) {
@@ -1503,14 +1555,19 @@ impl App {
                 }
             });
         });
-        ui.label(
-            RichText::new(if home {
-                "Pick up where you left off, or find something new."
-            } else {
-                "Your collection, in original quality."
-            })
-            .color(MUTED),
-        );
+        if let Some(i) = self.active {
+            ui.horizontal(|ui| {
+                ui.add(Icon::ServerPlex.image(15.0, MUTED));
+                ui.colored_label(
+                    MUTED,
+                    if home {
+                        format!("Plex server · {} libraries", self.sections.len())
+                    } else {
+                        format!("Plex / {}", self.servers[i].name())
+                    },
+                );
+            });
+        }
         ui.add_space(34.0);
         if self.location.as_ref().is_some_and(|l| l.library) {
             ui.horizontal(|ui| {
@@ -1674,7 +1731,18 @@ impl App {
                         }
                     });
                     ui.add_space(14.0);
-                    if page.items.is_empty() {
+                    let items: Vec<_> = page
+                        .items
+                        .iter()
+                        .filter(|item| {
+                            !self.active.is_some_and(|i| {
+                                item.library_id
+                                    .as_ref()
+                                    .is_some_and(|id| self.servers[i].prefs.hidden.contains(id))
+                            })
+                        })
+                        .collect();
+                    if items.is_empty() {
                         ui.add_space(34.0);
                         ui.heading("No titles found");
                         ui.label(
@@ -1682,10 +1750,10 @@ impl App {
                                 .color(MUTED),
                         );
                     }
-                    let episodes = !page.items.is_empty()
-                        && page.items.iter().all(|i| i.kind == Kind::Episode);
+                    let episodes =
+                        !items.is_empty() && items.iter().all(|i| i.kind == Kind::Episode);
                     if episodes {
-                        for item in &page.items {
+                        for &item in &items {
                             egui::Frame::new()
                                 .fill(PANEL)
                                 .corner_radius(18)
@@ -1740,7 +1808,7 @@ impl App {
                             .num_columns(columns)
                             .spacing([18.0, 22.0])
                             .show(ui, |ui| {
-                                for (index, item) in page.items.iter().enumerate() {
+                                for (index, item) in items.into_iter().enumerate() {
                                     if poster(ui, item, &self.covers, width) && !self.busy {
                                         picked = Some(item.clone());
                                     }
@@ -1963,90 +2031,147 @@ impl App {
     }
 
     fn settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.label(RichText::new("Settings").size(32.0).strong());
-            ui.label(RichText::new("Your server and playback preferences").color(MUTED));
-            ui.add_space(38.0);
-            ui.heading("Servers");
-            egui::Frame::new().fill(PANEL).corner_radius(18).inner_margin(28).show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    ui.add(Icon::StatusConnected.image(16.0, GREEN));
-                    ui.colored_label(GREEN, "Plex connected");
+        ui.set_max_width(ui.available_width().min(980.0));
+        ui.label(RichText::new("Settings").size(34.0).strong());
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            for (tab, icon, text) in [
+                (SettingsTab::Servers, Icon::Server, "Servers"),
+                (SettingsTab::Playback, Icon::Play, "Playback"),
+                (SettingsTab::Updates, Icon::Refresh, "Updates & about"),
+            ] {
+                let active = self.settings_tab == tab;
+                let color = if active { TEXT } else { MUTED };
+                let button = egui::Button::image_and_text(
+                    icon.image(16.0, if active { ACCENT } else { MUTED }),
+                    RichText::new(text).size(15.0).color(color),
+                )
+                .min_size(Vec2::new(
+                    if tab == SettingsTab::Updates {
+                        154.0
+                    } else {
+                        104.0
+                    },
+                    38.0,
+                ))
+                .frame(false);
+                let response = ui.add(button);
+                response.widget_info(|| {
+                    egui::WidgetInfo::selected(
+                        egui::WidgetType::SelectableLabel,
+                        true,
+                        active,
+                        text,
+                    )
                 });
-                ui.label(RichText::new(format!("{} movie and TV libraries available", self.sections.len())).color(MUTED));
-                ui.separator();
-                self.connection_fields(ui, ctx);
-            });
-            ui.add_space(44.0);
-            ui.heading("Playback");
-            egui::Frame::new().fill(PANEL).corner_radius(18).inner_margin(28).show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                info_row(ui, "Streaming quality", "Original · Direct Play");
-                info_row(ui, "Hardware decoding", "Automatic · safe modes");
-                info_row(ui, "Video output", "DirectX 11 · embedded in Perfuse");
-                info_row(ui, "Read ahead", "300 seconds · temporary disk cache");
-                ui.separator();
-                ui.label(RichText::new("Audio, subtitles, volume and speed are available in the player. Remembered sign-ins are protected by Windows Credential Manager.").color(MUTED));
-            });
-            ui.add_space(44.0);
-            self.third_party_libraries(ui, ctx);
-            ui.add_space(44.0);
-            ui.heading("About");
-            ui.horizontal_wrapped(|ui| {
-                ui.label(format!("Perfuse {}", updates::VERSION));
-                ui.hyperlink_to("GitHub", "https://github.com/HammoTime/perfuse-video-player");
-                match &self.client_updates.status {
-                    Some(Ok(message)) => {
-                        let color = if self.client_updates.busy() { MUTED } else { GREEN };
-                        ui.colored_label(color, message);
-                    }
-                    Some(Err(error)) => { ui.colored_label(ERROR_TEXT, error); }
-                    None => {}
+                if active {
+                    ui.painter().hline(
+                        response.rect.x_range(),
+                        response.rect.bottom() + 3.0,
+                        egui::Stroke::new(2.0_f32, ACCENT),
+                    );
                 }
-            });
-            ui.horizontal_wrapped(|ui| {
-                if ui.add_enabled(cfg!(all(windows, target_arch = "x86_64"))
-                    && !self.client_updates.busy() && self.client_after_runtime.is_none(),
-                    egui::Button::new("Check for Perfuse updates")).clicked()
-                {
-                    self.dismissed_updates = None;
-                    self.client_updates.check(ctx);
+                if response.clicked() {
+                    self.settings_tab = tab;
                 }
-                if self.client_updates.available.is_some()
-                    && ui.add_enabled(self.runtime_rx.is_none() && !self.client_updates.busy(),
-                        egui::Button::new("Update Perfuse")).clicked()
-                {
-                    self.update_available(ctx, true);
-                }
-            });
-            ui.add_space(24.0);
-            if ui.add_enabled(!self.busy, Pill::secondary(Icon::SignOut, "Sign out & forget this device")).clicked() && self.forget_saved() {
-                self.generation.fetch_add(1, Ordering::Relaxed);
-                self.source = None;
-                self.token.clear();
-                self.server_sections.clear();
-                self.sections.clear();
-                self.dragging_section = None;
-                self.page = None;
-                self.home_loaded = false;
-                self.on_deck.clear();
-                self.released.clear();
-                self.carousel_offsets.clear();
-                self.location = None;
-                self.history.clear();
-                self.selected_library = None;
-                self.covers.clear();
-                self.detail = None;
-                self.error = None;
-                self.notice = None;
-                self.connection_open = false;
-                self.login = None;
-                self.login_url = None;
-                self.available_servers.clear();
             }
         });
+        ui.separator();
+        ui.add_space(6.0);
+        egui::ScrollArea::vertical()
+            .id_salt(("settings", self.settings_tab))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                if self.settings_tab == SettingsTab::Servers {
+                    self.server_settings(ui, ctx);
+                    return;
+                }
+                if self.settings_tab == SettingsTab::Playback {
+                    ui.label(RichText::new("Playback configuration").size(23.0).strong());
+                    egui::Frame::new()
+                        .fill(PANEL)
+                        .corner_radius(14)
+                        .inner_margin(20)
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            for (n, (label, value)) in [
+                                ("Streaming quality", "Original · Direct Play"),
+                                ("Hardware decoding", "Automatic · safe modes"),
+                                ("Video output", "DirectX 11 · embedded in Perfuse"),
+                                ("Read ahead", "300 seconds · temporary disk cache"),
+                            ]
+                            .into_iter()
+                            .enumerate()
+                            {
+                                if n > 0 {
+                                    ui.separator();
+                                }
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(label).size(15.0));
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.colored_label(MUTED, value);
+                                        },
+                                    );
+                                });
+                            }
+                        });
+                    ui.colored_label(
+                        MUTED,
+                        "Change audio, subtitles, volume and speed in the player.",
+                    );
+                    return;
+                }
+                self.third_party_libraries(ui, ctx);
+                ui.add_space(22.0);
+                ui.heading("About");
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!("Perfuse {}", updates::VERSION));
+                    ui.hyperlink_to(
+                        "GitHub",
+                        "https://github.com/HammoTime/perfuse-video-player",
+                    );
+                    match &self.client_updates.status {
+                        Some(Ok(message)) => {
+                            let color = if self.client_updates.busy() {
+                                MUTED
+                            } else {
+                                GREEN
+                            };
+                            ui.colored_label(color, message);
+                        }
+                        Some(Err(error)) => {
+                            ui.colored_label(ERROR_TEXT, error);
+                        }
+                        None => {}
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(
+                            cfg!(all(windows, target_arch = "x86_64"))
+                                && !self.client_updates.busy()
+                                && self.client_after_runtime.is_none(),
+                            egui::Button::new("Check for Perfuse updates"),
+                        )
+                        .clicked()
+                    {
+                        self.dismissed_updates = None;
+                        self.client_updates.check(ctx);
+                    }
+                    if self.client_updates.available.is_some()
+                        && ui
+                            .add_enabled(
+                                self.runtime_rx.is_none() && !self.client_updates.busy(),
+                                egui::Button::new("Update Perfuse"),
+                            )
+                            .clicked()
+                    {
+                        self.update_available(ctx, true);
+                    }
+                });
+            });
     }
 
     fn third_party_libraries(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -2767,6 +2892,7 @@ impl eframe::App for App {
             self.playback_controls(ctx, mini);
         } else if self.source.is_some()
             && !self.connection_open
+            && !self.overview
             && self.detail.is_none()
             && (self.page.as_ref().is_some_and(Page::has_next)
                 || self
@@ -2857,7 +2983,7 @@ impl eframe::App for App {
                                         ui.heading("Make yourself at home.");
                                         ui.label(
                                             RichText::new(
-                                                "Your films and shows. Original quality.",
+                                                "Connect a Plex server to watch your films and shows. You can add more servers later.",
                                             )
                                             .color(MUTED),
                                         );
@@ -2872,6 +2998,10 @@ impl eframe::App for App {
                         ui.set_min_size(ui.available_size());
                         if self.connection_open {
                             self.settings(ui, ctx);
+                        } else if self.overview {
+                            self.servers_home(ui, ctx);
+                        } else if self.active.is_some_and(|i| !self.servers[i].online) {
+                            self.offline_view(ui, ctx);
                         } else if self.detail.is_some() {
                             play = self.details(ui);
                         } else {
@@ -2887,6 +3017,7 @@ impl eframe::App for App {
             if !mini {
                 self.update_notification(ctx, 58.0);
             }
+            self.server_dialogs(ctx);
             self.runtime_dialog(ctx);
         }
         self.handle_window_resize(ctx, egui::ViewportId::ROOT, true);
@@ -2941,7 +3072,7 @@ const ART_FADE_SECONDS: f64 = 1.0;
 
 /// Artwork textures for the current view, with when each arrived so new art
 /// fades in, and whether more is still loading so its slot shows a placeholder.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Artwork {
     textures: HashMap<String, (egui::TextureHandle, f64)>,
     loading: bool,
@@ -2950,7 +3081,6 @@ struct Artwork {
 
 impl Artwork {
     /// Adds art that is shown immediately, without fading in.
-    #[cfg(test)]
     fn insert(&mut self, path: String, texture: egui::TextureHandle) {
         self.textures.insert(path, (texture, f64::NEG_INFINITY));
     }

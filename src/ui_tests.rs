@@ -122,6 +122,8 @@ fn installed_libraries_and_update_availability() {
     app.connection_open = true;
     app.runtime_installed.libraries = runtime_versions_fixture();
     harness.run_steps(3);
+    harness.get_by_label("Updates & about").click();
+    harness.run_steps(2);
     harness.get_by_label("Update").scroll_to_me();
     harness.run_steps(3);
     assert!(harness.query_by_label("3rd party libraries").is_some());
@@ -198,14 +200,138 @@ fn installed_libraries_and_update_availability() {
 }
 
 #[test]
-fn sidebar_library_heading_aligns_with_navigation_icons() {
+fn sidebar_shows_server_groups_and_connection_count() {
     let mut harness = library([1440.0, 900.0], "home");
     harness.run_steps(3);
-    let row_left = harness.get_by_label("Servers & settings").rect().left();
-    let heading_left = harness.get_by_label("LIBRARIES").rect().left();
-    assert!((heading_left - row_left - SIDEBAR_ICON_INSET).abs() < 1.0);
-    let status_left = harness.get_by_label("Plex connected").rect().left();
-    assert!((status_left - row_left - SIDEBAR_TEXT_INSET).abs() < 1.0);
+    harness.get_by_label("Collapse libraries").click();
+    harness.run_steps(3);
+    assert!(harness.state().servers[0].prefs.collapsed);
+    harness.get_by_label("1 server connected");
+}
+
+#[test]
+fn server_switch_discards_stale_items_and_cancel_keeps_both_servers() {
+    let mut harness = library([1000.0, 720.0], "movies");
+    let app = harness.state_mut();
+    let second = "http://127.0.0.1:32500";
+    let source = fixture_source(second);
+    let session = session::Session {
+        server: second.into(),
+        token: "synthetic".into(),
+        client_id: "ui-test".into(),
+    };
+    app.servers.push(Server::new(
+        session,
+        source.clone(),
+        app.sections.clone(),
+        false,
+    ));
+    let stale = app.generation.load(Ordering::Relaxed);
+    app.activate(1);
+    assert!(Arc::ptr_eq(app.source.as_ref().unwrap(), &source));
+    assert!(app.page.is_none() && app.location.is_none());
+    app.tx
+        .send((stale, Reply::Details(Item::default())))
+        .unwrap();
+    app.connection_open = true;
+    harness.run_steps(3);
+    assert!(harness.state().detail.is_none());
+    assert!(
+        harness
+            .ctx
+            .content_rect()
+            .contains_rect(harness.get_by_label("Add server").rect())
+    );
+    harness.get_by_label("Add server").click();
+    harness.run_steps(3);
+    assert!(harness.state().adding && harness.state().token.is_empty());
+    harness.key_press(egui::Key::Escape);
+    harness.run_steps(3);
+    assert!(!harness.state().adding);
+    assert_eq!(harness.state().servers.len(), 2);
+    assert!(Arc::ptr_eq(
+        harness.state().source.as_ref().unwrap(),
+        &source
+    ));
+}
+
+#[test]
+fn each_server_home_opens_its_own_recently_added_view() {
+    let mut harness = library([1440.0, 900.0], "movies");
+    let app = harness.state_mut();
+    app.servers[0].prefs.name = "Basement".into();
+    use std::{
+        io::{BufRead, BufReader, Write},
+        net::TcpListener,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = format!("http://{}", listener.local_addr().unwrap());
+    let worker = thread::spawn(move || {
+        for path in [
+            "/library/recentlyAdded",
+            "/library/onDeck",
+            "/library/sections/1/all",
+            "/library/sections/2/all",
+        ] {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(&socket);
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            assert!(request.starts_with(&format!("GET {path}")));
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+            }
+            let body = r#"{"MediaContainer":{"Metadata":[{"ratingKey":"1","type":"movie","title":"Living Room film"}]}}"#;
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        }
+    });
+    let session = session::Session {
+        server: address.clone(),
+        token: "synthetic".into(),
+        client_id: "ui-test".into(),
+    };
+    let mut second = Server::new(
+        session,
+        fixture_source(&address),
+        app.sections.clone(),
+        false,
+    );
+    second.prefs.name = "Living Room".into();
+    app.servers.push(second);
+    app.overview = true;
+    harness.run_steps(3);
+    harness.get_by_label("Basement Home");
+    harness.get_by_label("Living Room Home").click();
+    harness.run_steps(2);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while harness.state().busy && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+        harness.step();
+    }
+    assert_eq!(
+        harness.state().page.as_ref().unwrap().items[0].title,
+        "Living Room film"
+    );
+    worker.join().unwrap();
+    let app = harness.state();
+    assert_eq!(app.active, Some(1));
+    assert!(!app.overview);
+    let location = app.location.as_ref().unwrap();
+    assert!(matches!(location.browse, Browse::RecentlyAdded));
+    assert_eq!(location.title, "Living Room");
+    assert!(Arc::ptr_eq(
+        app.source.as_ref().unwrap(),
+        &app.servers[1].source
+    ));
 }
 
 fn app_harness(size: [f32; 2], frame_seconds: f32) -> Harness<'static, App> {
@@ -270,6 +396,21 @@ fn fixture_source(server: &str) -> Source {
     .unwrap()
 }
 
+fn attach_server(app: &mut App) {
+    let source = app.source.clone().unwrap();
+    app.servers.push(Server::new(
+        session::Session {
+            server: app.server.clone(),
+            token: "synthetic".into(),
+            client_id: "ui-test".into(),
+        },
+        source,
+        app.sections.clone(),
+        false,
+    ));
+    app.active = Some(app.servers.len() - 1);
+}
+
 // Review the real library without network requests, credentials or desktop windows.
 fn library(size: [f32; 2], screen: &str) -> Harness<'static, App> {
     let mut harness = app_harness(size, 0.25);
@@ -288,6 +429,7 @@ fn library(size: [f32; 2], screen: &str) -> Harness<'static, App> {
             kind: Kind::Series,
         },
     ];
+    attach_server(app);
     let titles = [
         "The Quiet Earth",
         "Beyond the Blue",
@@ -479,6 +621,43 @@ fn library_search_entry_and_keyboard_navigation() {
 }
 
 #[test]
+fn server_status_popover_hover_pin_and_keyboard() {
+    let mut harness = library([860.0, 620.0], "home");
+    let trigger = "1 server connected";
+    harness.run_steps(3);
+    harness.get_by_label(trigger).hover();
+    harness.run_steps(5);
+    let manage = harness.get_by_label("Manage servers").rect();
+    assert!(manage.bottom() < harness.get_by_label(trigger).rect().top());
+    harness.hover_at(manage.center());
+    harness.run_steps(3);
+    assert!(harness.query_by_label("Everything is reachable.").is_some());
+    harness.remove_cursor();
+    harness.run_steps(3);
+    assert!(harness.query_by_label("Manage servers").is_none());
+
+    harness.get_by_label(trigger).click();
+    harness.run_steps(3);
+    harness.remove_cursor();
+    harness.run_steps(3);
+    assert!(harness.query_by_label("Manage servers").is_some());
+    harness.key_press(egui::Key::Escape);
+    harness.run_steps(3);
+    assert!(harness.query_by_label("Manage servers").is_none());
+
+    harness.state_mut().servers[0].online = false;
+    harness.get_by_label("Servers & settings").focus();
+    harness.run_steps(3);
+    harness.get_by_label("Cannot connect to servers").focus();
+    harness.run_steps(3);
+    assert!(harness.query_by_label("No servers reachable").is_some());
+    assert!(harness.query_by_label("Retry").is_some());
+    harness.get_by_label("Manage servers").click();
+    harness.run_steps(3);
+    assert!(harness.state().connection_open);
+}
+
+#[test]
 #[ignore = "offscreen library design review; run explicitly to export PNGs"]
 fn library_snapshots() {
     std::fs::create_dir_all(".artifacts/ui").unwrap();
@@ -486,6 +665,7 @@ fn library_snapshots() {
     for (name, screen, size, scale) in [
         ("home-desktop", "home", [1440.0, 900.0], 1.0),
         ("home-minimum", "home", [860.0, 620.0], 1.0),
+        ("server-status", "home", [860.0, 620.0], 1.0),
         ("movies-desktop", "movies", [1440.0, 900.0], 1.0),
         ("movies-minimum", "movies", [860.0, 620.0], 1.0),
         ("movies-high-dpi", "movies", [860.0, 620.0], 1.5),
@@ -499,6 +679,31 @@ fn library_snapshots() {
         ("library-missing-art", "missing-art", [860.0, 620.0], 1.0),
     ] {
         let mut harness = library(size, screen);
+        if screen == "home" {
+            let app = harness.state_mut();
+            app.servers[0].prefs.name = "Glass".into();
+            app.servers[0].sections.push(Library {
+                id: "3".into(),
+                title: "Lectures".into(),
+                kind: Kind::Series,
+            });
+            app.servers[0].items = app.on_deck.clone();
+            app.servers[0].artwork = app.covers.clone();
+            let session = session::Session {
+                server: "http://second.example.test".into(),
+                token: "synthetic".into(),
+                client_id: "ui-test".into(),
+            };
+            let mut second = Server::new(
+                session.clone(),
+                fixture_source(&session.server),
+                app.sections.clone(),
+                false,
+            );
+            second.prefs.name = "Living Room".into();
+            app.servers.push(second);
+            app.overview = true;
+        }
         harness.set_pixels_per_point(scale);
         // A zoom change rescales the first frame's input rectangle. Restore
         // logical window bounds afterwards so 150% DPI exports 1290x930 pixels.
@@ -508,6 +713,34 @@ fn library_snapshots() {
         }
         harness.remove_cursor();
         harness.run_steps(4);
+        if name == "server-status" {
+            harness.get_by_label("2 servers connected").hover();
+            harness.run_steps(5);
+            assert!(harness.query_by_label("All servers connected").is_some());
+        }
+        if screen == "home" {
+            let card_header = |name| {
+                harness
+                    .get_by_role_and_label(egui::accesskit::Role::Button, name)
+                    .rect()
+            };
+            let glass = card_header("Glass");
+            let other = card_header("Living Room");
+            assert!((glass.width() - 280.0).abs() < 1.0);
+            assert!((glass.width() - other.width()).abs() < 1.0);
+            assert!(other.right() <= harness.ctx.content_rect().right());
+            let chip = |name| {
+                harness
+                    .get_all_by_label(name)
+                    .map(|node| node.rect())
+                    .find(|r| glass.x_range().contains(r.center().x) && r.top() >= glass.bottom())
+                    .unwrap()
+            };
+            let movies = chip("Movies");
+            for name in ["TV Shows", "Lectures"] {
+                assert!((chip(name).top() - movies.top()).abs() < 1.0);
+            }
+        }
         let image = harness
             .render()
             .expect("offscreen rendering must be available");
@@ -839,6 +1072,7 @@ fn login_snapshots() {
         ("login-servers", [860.0, 620.0], 1.0),
         ("login-download-permission", [860.0, 620.0], 1.0),
         ("login-settings", [860.0, 620.0], 1.0),
+        ("settings-desktop", [1280.0, 800.0], 1.0),
         ("login-libraries", [1100.0, 900.0], 1.0),
     ] {
         let mut harness = login(size);
@@ -870,7 +1104,7 @@ fn login_snapshots() {
                     error: None,
                 });
             }
-            "login-settings" | "login-libraries" => {
+            "login-settings" | "settings-desktop" | "login-libraries" => {
                 let app = harness.state_mut();
                 app.source = Some(fixture_source("http://127.0.0.1:32499"));
                 app.sections.push(Library {
@@ -878,6 +1112,35 @@ fn login_snapshots() {
                     title: "Movies".into(),
                     kind: Kind::Movie,
                 });
+                attach_server(app);
+                app.servers[0].prefs.name = "Living Room".into();
+                app.servers[0].sections.push(Library {
+                    id: "2".into(),
+                    title: "TV Shows".into(),
+                    kind: Kind::Series,
+                });
+                if name == "settings-desktop" {
+                    let address = "http://archive.example.test:32400";
+                    let session = session::Session {
+                        server: address.into(),
+                        token: "synthetic".into(),
+                        client_id: "ui-test".into(),
+                    };
+                    let mut archive = Server::new(
+                        session,
+                        fixture_source(address),
+                        app.sections.clone(),
+                        false,
+                    );
+                    archive.prefs.name = "Archive".into();
+                    archive.online = false;
+                    app.servers.push(archive);
+                }
+                app.settings_tab = if name == "login-libraries" {
+                    SettingsTab::Updates
+                } else {
+                    SettingsTab::Servers
+                };
                 app.connection_open = true;
                 app.runtime_installed.libraries = runtime_versions_fixture();
             }
@@ -1111,7 +1374,7 @@ fn sidebar_libraries_can_be_sorted_and_reordered() {
             kind: Kind::Series,
         },
     ];
-    harness.state_mut().server_sections = sections.clone();
+    harness.state_mut().servers[0].sections = sections.clone();
     harness.state_mut().sections = sections;
     harness.run_steps(3);
 
@@ -1180,7 +1443,7 @@ fn sidebar_libraries_can_be_sorted_and_reordered() {
     harness.run_steps(2);
     assert_eq!(order(&harness), ["Anime", "TV Shows", "Movies"]);
     assert_eq!(
-        harness.state().library_order.sort,
+        harness.state().servers[0].prefs.sort,
         prefs::LibrarySort::Custom
     );
 }

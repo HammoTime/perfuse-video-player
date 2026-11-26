@@ -9,8 +9,8 @@ macro_rules! icons {
             $($name,)*
         }
 
-        const SOURCES: &[(&str, &str)] = &[
-            $((concat!("bytes://perfuse/", $file), include_str!(concat!("../assets/", $file))),)*
+        const SOURCES: &[(Icon, &str)] = &[
+            $((Icon::$name, include_str!(concat!("../assets/", $file))),)*
         ];
 
         impl Icon {
@@ -66,16 +66,43 @@ icons! {
     VolumeLow => "icons/volume-low.svg",
     VolumeMuted => "icons/volume-muted.svg",
     Watched => "icons/watched.svg",
+    Add => "icons/add.svg",
+    Audiobooks => "icons/audiobooks.svg",
+    Back30 => "icons/back-30.svg",
+    BookmarkAdd => "icons/bookmark-add.svg",
+    Bookmark => "icons/bookmark.svg",
+    Chapters => "icons/chapters.svg",
+    Check => "icons/check.svg",
+    ChevronDown => "icons/chevron-down.svg",
+    DragHandle => "icons/drag-handle.svg",
+    Forward30 => "icons/forward-30.svg",
+    Headphones => "icons/headphones.svg",
+    More => "icons/more.svg",
+    NowPlaying => "icons/now-playing.svg",
+    PlayerCollapse => "icons/player-collapse.svg",
+    PlayerExpand => "icons/player-expand.svg",
+    Podcasts => "icons/podcasts.svg",
+    QuickConnect => "icons/quick-connect.svg",
+    Rename => "icons/rename.svg",
+    ServerAudiobookshelf => "icons/server-audiobookshelf.svg",
+    ServerJellyfin => "icons/server-jellyfin.svg",
+    ServerPlex => "icons/server-plex.svg",
+    SleepTimer => "icons/sleep-timer.svg",
+    StatusOffline => "icons/status-offline.svg",
+    StatusPartial => "icons/status-partial.svg",
     Mark => "brand/perfuse-mark.svg",
 }
 
 /// Registers the SVG loader and every bundled icon with this context.
 pub fn install(ctx: &egui::Context) {
     egui_extras::install_image_loaders(ctx);
-    for (uri, svg) in SOURCES {
+    for (icon, svg) in SOURCES {
         // Icons draw in `currentColor`, which resvg resolves to black. Render
         // them white so the egui tint becomes the visible colour.
-        ctx.include_bytes(*uri, svg.replace("currentColor", "#FFFFFF").into_bytes());
+        ctx.include_bytes(
+            icon.uri(),
+            svg.replace("currentColor", "#FFFFFF").into_bytes(),
+        );
     }
 }
 
@@ -166,7 +193,8 @@ mod tests {
     fn bundled_icons_render_visible_pixels() {
         let ctx = egui::Context::default();
         install(&ctx);
-        for (uri, _) in SOURCES {
+        for (icon, _) in SOURCES {
+            let uri = icon.uri();
             let Ok(ImagePoll::Ready { image }) = ctx.try_load_image(uri, Default::default()) else {
                 panic!("{uri} did not render");
             };

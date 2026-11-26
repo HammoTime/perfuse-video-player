@@ -42,6 +42,9 @@ struct Plex {
 struct PlexItem {
     #[serde(default)]
     rating_key: String,
+    #[serde(rename = "librarySectionID")]
+    library_section_id: Option<serde_json::Value>,
+    last_viewed_at: Option<u64>,
     #[serde(default)]
     title: String,
     #[serde(default, rename = "type")]
@@ -78,6 +81,12 @@ impl From<PlexItem> for Item {
     fn from(item: PlexItem) -> Self {
         Self {
             id: item.rating_key,
+            library_id: item.library_section_id.and_then(|v| match v {
+                serde_json::Value::String(s) => Some(s),
+                serde_json::Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            }),
+            last_viewed_at: item.last_viewed_at,
             title: item.title,
             kind: kind(&item.kind),
             year: item.year,

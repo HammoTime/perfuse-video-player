@@ -12,6 +12,12 @@ pub fn open(session: &Session) -> Result<Source, String> {
 #[cfg(windows)]
 pub use windows::{clear, load, save};
 
+pub fn origin(server: &str) -> Option<String> {
+    reqwest::Url::parse(server.trim())
+        .ok()
+        .map(|u| u.origin().ascii_serialization())
+}
+
 #[cfg(windows)]
 mod windows {
     use super::Session;
@@ -26,14 +32,65 @@ mod windows {
         value.encode_utf16().chain(Some(0)).collect()
     }
 
-    pub fn load() -> Result<Option<Session>, String> {
-        read(TARGET)
+    const PREFIX: &str = "Perfuse/Plex/";
+    fn target(server: &str) -> Result<String, String> {
+        super::origin(server)
+            .map(|id| format!("{PREFIX}{id}"))
+            .ok_or_else(|| "Invalid server address.".into())
+    }
+    pub fn load() -> Result<Vec<Session>, String> {
+        let mut sessions = Vec::new();
+        let mut count = 0;
+        let mut list = std::ptr::null_mut();
+        // SAFETY: the filter is terminated and both output pointers are valid.
+        if unsafe {
+            CredEnumerateW(
+                wide(&format!("{PREFIX}*")).as_ptr(),
+                0,
+                &mut count,
+                &mut list,
+            )
+        } != 0
+        {
+            // SAFETY: Windows owns the array and each terminated target name until CredFree.
+            let names: Vec<_> = unsafe { std::slice::from_raw_parts(list, count as usize) }
+                .iter()
+                .map(|entry| unsafe {
+                    let name = (**entry).TargetName;
+                    let mut len = 0;
+                    while *name.add(len) != 0 {
+                        len += 1;
+                    }
+                    String::from_utf16_lossy(std::slice::from_raw_parts(name, len))
+                })
+                .collect();
+            // SAFETY: releases the entire result returned by CredEnumerateW.
+            unsafe { CredFree(list.cast()) };
+            for name in names {
+                if let Some(session) = read(&name)? {
+                    sessions.push(session);
+                }
+            }
+        } else if unsafe { GetLastError() } != ERROR_NOT_FOUND {
+            return Err("Could not list saved Plex sign-ins.".into());
+        }
+        if let Some(legacy) = read(TARGET)?
+            && !sessions
+                .iter()
+                .any(|s| super::origin(&s.server) == super::origin(&legacy.server))
+        {
+            sessions.push(legacy);
+        }
+        Ok(sessions)
     }
     pub fn save(session: &Session) -> Result<(), String> {
-        write(TARGET, session)
+        write(&target(&session.server)?, session)
     }
-    pub fn clear() -> Result<(), String> {
-        delete(TARGET)
+    pub fn clear(server: &str) -> Result<(), String> {
+        if read(TARGET)?.is_some_and(|s| super::origin(&s.server) == super::origin(server)) {
+            delete(TARGET)?;
+        }
+        delete(&target(server)?)
     }
 
     fn read(target: &str) -> Result<Option<Session>, String> {
@@ -153,8 +210,8 @@ mod windows {
 }
 
 #[cfg(not(windows))]
-pub fn load() -> Result<Option<Session>, String> {
-    Ok(None)
+pub fn load() -> Result<Vec<Session>, String> {
+    Ok(vec![])
 }
 #[cfg(not(windows))]
 pub fn save(session: &Session) -> Result<(), String> {
@@ -162,7 +219,7 @@ pub fn save(session: &Session) -> Result<(), String> {
     Err("Saved sign-in currently requires Windows Credential Manager.".into())
 }
 #[cfg(not(windows))]
-pub fn clear() -> Result<(), String> {
+pub fn clear(_server: &str) -> Result<(), String> {
     Ok(())
 }
 

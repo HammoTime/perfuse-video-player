@@ -8,6 +8,7 @@ Perfuse is an open-source Plex player for Windows. Browse your library and play 
 
 ## Features
 
+- Connect multiple Plex servers, see their connection status and continue watching across them from Home.
 - Browse and search Plex movie and TV libraries with poster art, synopses, seasons and episodes.
 - Play the original file inside Perfuse with libmpv and FFmpeg. Choose a media version, audio track or embedded subtitle.
 - Pick up where you left off with playback progress synced to Plex.

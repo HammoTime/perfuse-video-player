@@ -14,6 +14,8 @@ pub enum Kind {
 
 #[derive(Clone, Default)]
 pub struct Item {
+    pub library_id: Option<String>,
+    pub last_viewed_at: Option<u64>,
     pub id: String,
     pub title: String,
     pub kind: Kind,

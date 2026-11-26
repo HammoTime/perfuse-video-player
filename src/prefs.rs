@@ -26,6 +26,14 @@ pub struct LibraryOrder {
     #[serde(default)]
     pub sort: LibrarySort,
     #[serde(default)]
+    pub collapsed: bool,
+    #[serde(default)]
+    pub hidden: Vec<String>,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub position: usize,
+    #[serde(default)]
     pub custom_keys: Vec<String>,
 }
 
@@ -217,6 +225,7 @@ mod tests {
                 &LibraryOrder {
                     sort: LibrarySort::NameAsc,
                     custom_keys: vec![],
+                    ..Default::default()
                 }
             )),
             ["anime", "Documentaries", "Movies", "TV Shows"]
@@ -227,6 +236,7 @@ mod tests {
                 &LibraryOrder {
                     sort: LibrarySort::NameDesc,
                     custom_keys: vec![],
+                    ..Default::default()
                 }
             )),
             ["TV Shows", "Movies", "Documentaries", "anime"]
@@ -237,6 +247,7 @@ mod tests {
                 &LibraryOrder {
                     sort: LibrarySort::TypeThenName,
                     custom_keys: vec![],
+                    ..Default::default()
                 }
             )),
             ["Documentaries", "Movies", "anime", "TV Shows"]
@@ -248,6 +259,7 @@ mod tests {
                     sort: LibrarySort::Custom,
                     // Includes a stale removed key ("99") and omits key "1" (newly added).
                     custom_keys: vec!["4".into(), "99".into(), "2".into()],
+                    ..Default::default()
                 }
             )),
             ["Documentaries", "anime", "TV Shows", "Movies"]
@@ -261,6 +273,7 @@ mod tests {
         let order = LibraryOrder {
             sort: LibrarySort::Custom,
             custom_keys: vec!["2".into(), "1".into()],
+            ..Default::default()
         };
         save_to(&path, "http://server-a:32400/", &order);
         assert_eq!(load_from(&path, "http://SERVER-A:32400"), order);
