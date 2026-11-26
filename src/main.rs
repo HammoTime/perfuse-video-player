@@ -56,16 +56,6 @@ const SIDEBAR_NAV_MARGIN: egui::Margin = egui::Margin {
     bottom: 0,
 };
 const SIDEBAR_ICON_INSET: f32 = 10.0;
-/// Identity colours for each server's library menu, assigned by server order so
-/// two servers of the same kind still differ. Each keeps at least 4.5:1 contrast
-/// on the sidebar and stays clear of ACCENT, which marks top-level navigation.
-const SERVER_TINTS: [Color32; 5] = [
-    Color32::from_rgb(45, 212, 191),  // teal
-    Color32::from_rgb(245, 177, 66),  // amber
-    Color32::from_rgb(167, 139, 250), // violet
-    Color32::from_rgb(251, 113, 133), // coral
-    Color32::from_rgb(163, 230, 53),  // lime
-];
 /// Corner radius for buttons, inputs, menu rows and popovers: square with a
 /// softened edge.
 const EDGE: u8 = 2;
@@ -86,6 +76,8 @@ const RESIZE_BORDER: f32 = 6.0;
 const RESIZE_CORNER: f32 = 12.0;
 const HOME_CARD_WIDTH: f32 = 232.0;
 const BOOK_CARD_WIDTH: f32 = 184.0;
+/// Gap between square artwork in grids and shelves.
+const ART_GAP: f32 = 24.0;
 
 fn main() -> eframe::Result {
     thread::spawn(perfuse::trim_artwork_cache);
@@ -451,7 +443,7 @@ impl App {
             RuntimePrompt::Upgrade { .. } => ("Update playback libraries?", "Download and install"),
         };
         let dialog = egui::Modal::new(egui::Id::new("runtime_licences"))
-            .frame(egui::Frame::popup(&ctx.style()).fill(PANEL).corner_radius(18).inner_margin(24))
+            .frame(egui::Frame::popup(&ctx.style()).fill(PANEL).corner_radius(0).inner_margin(24))
             .show(ctx, |ui| {
                 ui.set_width(460.0);
                 ui.heading(title);
@@ -1023,42 +1015,44 @@ impl App {
                     {
                         player.stop();
                     }
-                    ui.add(Icon::Mark.image(18.0, Color32::WHITE));
-                    ui.label(RichText::new("PERFUSE").strong().color(ACCENT));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Leave the corner to the Windows caption buttons.
-                        ui.add_space(3.0 * CaptionButton::WIDTH - 20.0 + 12.0);
-                        let pin_label = if self.always_on_top {
-                            "Disable always on top"
-                        } else {
-                            "Always on top"
-                        };
-                        if ui
-                            .add(IconButton::new(Icon::Pin, pin_label).active(self.always_on_top))
-                            .clicked()
-                        {
-                            self.set_always_on_top(ctx, !self.always_on_top);
-                        }
-                    });
+                    ui.add(Icon::Mark.image(24.0, Color32::WHITE));
+                    ui.label(
+                        RichText::new("PERFUSE")
+                            .size(26.0)
+                            .strong()
+                            .extra_letter_spacing(1.5)
+                            .color(ACCENT),
+                    );
                 });
             });
         self.caption_buttons(ctx);
     }
 
-    /// Minimize, maximize and close, flush with the window's top-right corner
-    /// in the Windows 11 caption button style.
+    /// Always on top, minimize, maximize and close, flush with the window's
+    /// top-right corner in the Windows 11 caption button style.
     fn caption_buttons(&mut self, ctx: &egui::Context) {
         let screen = ctx.content_rect();
         let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
         egui::Area::new(egui::Id::new("caption_buttons"))
             .order(egui::Order::Middle)
             .fixed_pos(egui::pos2(
-                screen.right() - 3.0 * CaptionButton::WIDTH,
+                screen.right() - 4.0 * CaptionButton::WIDTH,
                 screen.top(),
             ))
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
                 ui.horizontal(|ui| {
+                    let pin_label = if self.always_on_top {
+                        "Disable always on top"
+                    } else {
+                        "Always on top"
+                    };
+                    if ui
+                        .add(CaptionButton::new(Caption::Pin, pin_label).active(self.always_on_top))
+                        .clicked()
+                    {
+                        self.set_always_on_top(ctx, !self.always_on_top);
+                    }
                     if ui
                         .add(CaptionButton::new(Caption::Minimize, "Minimize"))
                         .clicked()
@@ -1212,17 +1206,8 @@ impl App {
         egui::Frame::new()
             .inner_margin(SIDEBAR_NAV_MARGIN)
             .show(ui, |ui| {
-                let tint = server_tint(i);
                 let rail = ui.painter().add(egui::Shape::Noop);
-                let home = nav_item(
-                    ui,
-                    Icon::Home,
-                    "Home",
-                    server_home,
-                    false,
-                    false,
-                    Some(tint),
-                );
+                let home = nav_item(ui, Icon::Home, "Home", server_home, false, false);
                 let home_rect = home.rect;
                 let label = format!("{} Home", self.servers[i].name());
                 home.widget_info(|| {
@@ -1252,7 +1237,6 @@ impl App {
                         selected,
                         can_reorder,
                         dragging_this,
-                        Some(tint),
                     );
                     row_rects.push(response.rect);
                     if can_reorder && response.drag_started_by(egui::PointerButton::Primary) {
@@ -1299,7 +1283,7 @@ impl App {
                         });
                     }
                 }
-                // A thin rail in the server's colour ties its library menu together.
+                // A thin rail ties each server's library menu together.
                 let last = row_rects
                     .last()
                     .map_or(home_rect.bottom(), |rect| rect.bottom());
@@ -1311,7 +1295,7 @@ impl App {
                             home_rect.top()..=last,
                         ),
                         0,
-                        tint.gamma_multiply(0.35),
+                        ACCENT.gamma_multiply(0.35),
                     ),
                 );
                 if let Some(from) = self.servers[i].dragging_section {
@@ -1340,7 +1324,7 @@ impl App {
                             ui.painter().hline(
                                 row_rects[0].x_range(),
                                 y,
-                                egui::Stroke::new(2.0_f32, tint),
+                                egui::Stroke::new(2.0_f32, ACCENT),
                             );
                         }
                         if !ui.ctx().input(|i| i.pointer.primary_down()) {
@@ -1502,7 +1486,9 @@ impl App {
         };
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 16.0;
-            let width = (ui.available_width() - 60.0).max(0.0);
+            // Reserve the trailing button: the larger Refresh on Home, otherwise the library one.
+            let button = if home { 44.0 } else { 32.0 };
+            let width = (ui.available_width() - button - 16.0).max(0.0);
             ui.vertical(|ui| {
                 ui.set_width(width);
                 ui.spacing_mut().item_spacing.y = 8.0;
@@ -1531,34 +1517,18 @@ impl App {
                 {
                     self.load_page(ctx, false);
                 }
-            } else {
-                let trigger = ui.add(
-                    IconButton::new(Icon::Search, "Search audiobooks")
-                        .active(filtered)
-                        .size(44.0),
-                );
-                egui::Popup::from_toggle_button_response(&trigger)
-                    .align(egui::RectAlign::BOTTOM_END)
-                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                    .frame(popover_frame())
-                    .show(|ui| {
-                        ui.set_width(400.0);
-                        if self.library_search_fields(ui, ctx, trigger.clicked()) {
-                            ui.close();
-                        }
-                        if ui
-                            .add_enabled(
-                                !self.busy,
-                                Pill::secondary(Icon::Refresh, "Refresh library"),
-                            )
-                            .clicked()
-                        {
-                            self.load_page(ctx, false);
-                            ui.close();
-                        }
-                    });
+            } else if ui
+                .add_enabled(!self.busy, IconButton::new(Icon::Refresh, "Refresh"))
+                .clicked()
+            {
+                self.load_page(ctx, false);
             }
         });
+        // Search sits inline under the heading, as in movie and TV libraries.
+        if !home {
+            ui.add_space(26.0);
+            self.library_search_fields(ui, ctx, false);
+        }
         ui.add_space(28.0);
     }
 
@@ -1760,14 +1730,15 @@ impl App {
                                 })
                                 .inner;
                         } else {
-                            let columns = ((ui.available_width() + 16.0) / (BOOK_CARD_WIDTH + 16.0))
+                            let columns = ((ui.available_width() + ART_GAP)
+                                / (BOOK_CARD_WIDTH + ART_GAP))
                                 .floor()
                                 .max(1.0) as usize;
-                            let width = (ui.available_width() - 16.0 * (columns - 1) as f32)
+                            let width = (ui.available_width() - ART_GAP * (columns - 1) as f32)
                                 / columns as f32;
                             egui::Grid::new("book_covers")
                                 .num_columns(columns)
-                                .spacing([16.0, 24.0])
+                                .spacing([ART_GAP, 28.0])
                                 .show(ui, |ui| {
                                     for (index, item) in items.into_iter().enumerate() {
                                         draw(ui, item, width);
@@ -1828,6 +1799,32 @@ impl App {
                                 page_action = 1;
                             }
                         }
+                        if !home && (has_previous || has_next) {
+                            // Library pages turn from the right of the heading row.
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .add_enabled(
+                                            !self.busy && has_next,
+                                            IconButton::new(Icon::PageNext, "Next page"),
+                                        )
+                                        .clicked()
+                                    {
+                                        page_action = 1;
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            !self.busy && has_previous,
+                                            IconButton::new(Icon::PagePrevious, "Previous page"),
+                                        )
+                                        .clicked()
+                                    {
+                                        page_action = -1;
+                                    }
+                                },
+                            );
+                        }
                     });
                     ui.add_space(14.0);
                     if items.is_empty() {
@@ -1844,7 +1841,7 @@ impl App {
                         for &item in &items {
                             egui::Frame::new()
                                 .fill(PANEL)
-                                .corner_radius(18)
+                                .corner_radius(0)
                                 .inner_margin(24)
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
@@ -1887,14 +1884,15 @@ impl App {
                                 });
                         }
                     } else {
-                        let columns =
-                            ((ui.available_width() + 18.0) / 176.0).floor().max(1.0) as usize;
-                        let width = ((ui.available_width() - 18.0 * (columns - 1) as f32)
+                        let columns = ((ui.available_width() + ART_GAP) / (158.0 + ART_GAP))
+                            .floor()
+                            .max(1.0) as usize;
+                        let width = ((ui.available_width() - ART_GAP * (columns - 1) as f32)
                             / columns as f32)
                             .min(210.0);
                         egui::Grid::new("posters")
                             .num_columns(columns)
-                            .spacing([18.0, 22.0])
+                            .spacing([ART_GAP, 28.0])
                             .show(ui, |ui| {
                                 for (index, item) in items.into_iter().enumerate() {
                                     if poster(ui, item, &self.covers, width) && !self.busy {
@@ -2010,7 +2008,7 @@ impl App {
                 ui.label(RichText::new("Playback").size(22.0).strong());
                 egui::Frame::new()
                     .fill(PANEL)
-                    .corner_radius(18)
+                    .corner_radius(0)
                     .inner_margin(28)
                     .show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
@@ -2200,7 +2198,7 @@ impl App {
                     ui.label(RichText::new("Playback configuration").size(23.0).strong());
                     egui::Frame::new()
                         .fill(PANEL)
-                        .corner_radius(14)
+                        .corner_radius(0)
                         .inner_margin(20)
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
@@ -2291,7 +2289,7 @@ impl App {
 
     fn third_party_libraries(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.heading("3rd party libraries");
-        egui::Frame::new().fill(PANEL).corner_radius(18).inner_margin(28).show(ui, |ui| {
+        egui::Frame::new().fill(PANEL).corner_radius(0).inner_margin(28).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             if self.runtime_installed.libraries.is_empty() {
                 ui.label(if self.runtime_rx.is_some() { "Reading installed libraries…" } else { "No playback libraries found." });
@@ -3022,48 +3020,6 @@ impl eframe::App for App {
                 surface.reclaim_keyboard();
             }
             self.playback_controls(ctx, mini);
-        } else if self.source.is_some()
-            && !self.book.full
-            && !self.connection_open
-            && !self.overview
-            && self.selected_library.is_some()
-            && self.detail.is_none()
-            && (self.page.as_ref().is_some_and(Page::has_next)
-                || self
-                    .location
-                    .as_ref()
-                    .is_some_and(|l| !l.previous_pages.is_empty()))
-        {
-            egui::TopBottomPanel::bottom("pagination")
-                .frame(egui::Frame::new().inner_margin(egui::Margin::same(28)))
-                .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        let previous = self
-                            .location
-                            .as_ref()
-                            .is_some_and(|l| !l.previous_pages.is_empty());
-                        let next = self.page.as_ref().is_some_and(Page::has_next);
-                        let (previous_button, next_button) = Pill::pair(
-                            ui,
-                            Pill::secondary(Icon::PagePrevious, "Previous page"),
-                            Pill::secondary(Icon::PageNext, "Next page").trailing(),
-                        );
-                        let compact = !Pill::labels_fit(ui, &[&previous_button, &next_button], 0.0);
-                        let (previous_button, next_button) = (
-                            previous_button.icon_only(compact),
-                            next_button.icon_only(compact),
-                        );
-                        if ui
-                            .add_enabled(!self.busy && previous, previous_button)
-                            .clicked()
-                        {
-                            self.page_previous(ctx);
-                        }
-                        if ui.add_enabled(!self.busy && next, next_button).clicked() {
-                            self.page_next(ctx);
-                        }
-                    });
-                });
         }
         let mut play = false;
         egui::CentralPanel::default()
@@ -3247,16 +3203,11 @@ fn placeholder(ui: &egui::Ui, rect: egui::Rect, radius: f32) {
     );
 }
 
-fn server_tint(i: usize) -> Color32 {
-    SERVER_TINTS[i % SERVER_TINTS.len()]
-}
-
 fn nav(ui: &mut egui::Ui, icon: Icon, title: &str, selected: bool) -> egui::Response {
-    nav_item(ui, icon, title, selected, false, false, None)
+    nav_item(ui, icon, title, selected, false, false)
 }
 
-/// A square-edged sidebar row. Top-level rows use ACCENT; a server's library
-/// rows pass that server's `tint` for their icons, fills and selection marker.
+/// A square-edged sidebar row, marked in ACCENT when selected.
 fn nav_item(
     ui: &mut egui::Ui,
     icon: Icon,
@@ -3264,7 +3215,6 @@ fn nav_item(
     selected: bool,
     draggable: bool,
     dragging: bool,
-    tint: Option<Color32>,
 ) -> egui::Response {
     let sense = if draggable {
         egui::Sense::click_and_drag()
@@ -3280,7 +3230,7 @@ fn nav_item(
             title,
         )
     });
-    let color = tint.unwrap_or(ACCENT);
+    let color = ACCENT;
     if selected || dragging || response.hovered() || response.has_focus() {
         ui.painter().rect_filled(
             rect,
@@ -3314,11 +3264,7 @@ fn nav_item(
         ui,
         rect.left_center() + Vec2::new(SIDEBAR_ICON_INSET + 10.0, 0.0),
         20.0,
-        if selected || dragging || tint.is_some() {
-            color
-        } else {
-            MUTED
-        },
+        if selected || dragging { color } else { MUTED },
     );
     ui.painter().with_clip_rect(rect.shrink(4.0)).text(
         rect.left_center() + Vec2::new(SIDEBAR_TEXT_INSET, 0.0),
@@ -3348,7 +3294,6 @@ struct Pill<'a> {
     icon: Icon,
     label: &'a str,
     style: PillStyle,
-    trailing: bool,
     tall: bool,
     icon_only: bool,
     min_width: f32,
@@ -3363,7 +3308,6 @@ impl<'a> Pill<'a> {
             icon,
             label,
             style: PillStyle::Primary,
-            trailing: false,
             tall: false,
             icon_only: false,
             min_width: 0.0,
@@ -3386,12 +3330,6 @@ impl<'a> Pill<'a> {
 
     fn min_width(mut self, width: f32) -> Self {
         self.min_width = width;
-        self
-    }
-
-    /// Places the icon after the label, for forward actions.
-    fn trailing(mut self) -> Self {
-        self.trailing = true;
         self
     }
 
@@ -3523,11 +3461,7 @@ impl egui::Widget for Pill<'_> {
             } else {
                 let content = galley.size().x + ICON + GAP;
                 let left = rect.center().x - content / 2.0;
-                let (icon_x, text_x) = if self.trailing {
-                    (left + galley.size().x + GAP + ICON / 2.0, left)
-                } else {
-                    (left + ICON / 2.0, left + ICON + GAP)
-                };
+                let (icon_x, text_x) = (left + ICON / 2.0, left + ICON + GAP);
                 self.icon
                     .paint(ui, egui::pos2(icon_x, rect.center().y), ICON, ink);
                 ui.painter().galley(
@@ -3613,6 +3547,7 @@ impl egui::Widget for IconButton<'_> {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Caption {
+    Pin,
     Minimize,
     Maximize,
     Restore,
@@ -3624,6 +3559,7 @@ enum Caption {
 struct CaptionButton<'a> {
     glyph: Caption,
     label: &'a str,
+    active: bool,
 }
 
 impl<'a> CaptionButton<'a> {
@@ -3631,7 +3567,17 @@ impl<'a> CaptionButton<'a> {
     const HEIGHT: f32 = 32.0;
 
     fn new(glyph: Caption, label: &'a str) -> Self {
-        Self { glyph, label }
+        Self {
+            glyph,
+            label,
+            active: false,
+        }
+    }
+
+    /// Shows a toggle as on, such as always on top.
+    fn active(mut self, active: bool) -> Self {
+        self.active = active;
+        self
     }
 }
 
@@ -3651,6 +3597,7 @@ impl egui::Widget for CaptionButton<'_> {
                 (true, false, true) => Color32::from_rgb(196, 43, 28),
                 (false, true, _) => Color32::from_white_alpha(10),
                 (false, false, true) => Color32::from_white_alpha(15),
+                _ if self.active => Color32::from_white_alpha(10),
                 _ => Color32::TRANSPARENT,
             };
             let painter = ui.painter();
@@ -3665,6 +3612,8 @@ impl egui::Widget for CaptionButton<'_> {
             }
             let ink = if close && (pressed || hovered) {
                 Color32::WHITE
+            } else if self.active {
+                ACCENT
             } else {
                 TEXT
             };
@@ -3672,6 +3621,11 @@ impl egui::Widget for CaptionButton<'_> {
             let c = rect.center();
             let half = 5.0;
             match self.glyph {
+                Caption::Pin => {
+                    // The 24-point pin outline at 14 points draws a hairline
+                    // stroke that matches the caption glyphs.
+                    Icon::Pin.paint(ui, c, 14.0, ink);
+                }
                 Caption::Minimize => {
                     painter.hline(c.x - half..=c.x + half, c.y, stroke);
                 }
@@ -3841,7 +3795,7 @@ fn control_fill(response: &egui::Response) -> Color32 {
 fn badge(ui: &mut egui::Ui, icon: Icon, text: &str, color: Color32) {
     egui::Frame::new()
         .fill(color.gamma_multiply(0.12))
-        .corner_radius(8)
+        .corner_radius(0)
         .inner_margin(egui::Margin::symmetric(8, 4))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -3877,7 +3831,7 @@ fn cover_view(
     size: Vec2,
     interactive: bool,
 ) -> egui::Response {
-    cover_view_rounded(ui, item, covers, size, interactive, 8)
+    cover_view_rounded(ui, item, covers, size, interactive, 0)
 }
 
 fn cover_view_rounded(
@@ -3984,8 +3938,8 @@ fn home_carousel<T>(
     let viewport = ui.available_width();
     let book_shelf = matches!(shelf, Shelf::Books { .. });
     let (rows, card_width, spacing) = match shelf {
-        Shelf::Video(rows) => (rows, HOME_CARD_WIDTH, ui.spacing().item_spacing.x),
-        Shelf::Books { .. } => (1, BOOK_CARD_WIDTH, 16.0),
+        Shelf::Video(rows) => (rows, HOME_CARD_WIDTH, ART_GAP),
+        Shelf::Books { .. } => (1, BOOK_CARD_WIDTH, ART_GAP),
     };
     let pitch = card_width + spacing;
     let visible_columns = ((viewport + spacing) / pitch).floor().max(1.0) as usize;
@@ -4113,7 +4067,7 @@ fn book_card(
             );
             let badge = egui::Rect::from_min_size(corner, Vec2::new(label.size().x + 32.0, 24.0));
             ui.painter()
-                .rect_filled(badge, 12, Color32::from_black_alpha(184));
+                .rect_filled(badge, 0, Color32::from_black_alpha(184));
             Icon::NowPlaying.paint(ui, corner + Vec2::new(13.0, 12.0), 14.0, Color32::WHITE);
             ui.painter().galley(
                 corner + Vec2::new(24.0, (24.0 - label.size().y) * 0.5),
@@ -4314,7 +4268,7 @@ fn poster(ui: &mut egui::Ui, item: &Item, covers: &Artwork, width: f32) -> bool 
                 galley.size() + Vec2::new(8.0, 6.0),
             );
             ui.painter()
-                .rect_filled(badge, 4.0, Color32::from_black_alpha(200));
+                .rect_filled(badge, 0.0, Color32::from_black_alpha(200));
             ui.painter()
                 .galley(badge.min + Vec2::new(4.0, 3.0), galley, Color32::WHITE);
         }
@@ -4363,9 +4317,9 @@ fn hero(ui: &mut egui::Ui, item: &Item, covers: &Artwork, eyebrow: &str) {
     let (rect, _) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 228.0), egui::Sense::hover());
     if covers.pending(item.art.as_ref()) {
-        placeholder(ui, rect, 22.0);
+        placeholder(ui, rect, 0.0);
     } else {
-        ui.painter().rect_filled(rect, 22.0, PANEL);
+        ui.painter().rect_filled(rect, 0.0, PANEL);
     }
     if let Some((texture, opacity)) = item.art.as_ref().and_then(|path| covers.get(path)) {
         // Crop to fill rather than stretching the server's backdrop.
@@ -4384,12 +4338,12 @@ fn hero(ui: &mut egui::Ui, item: &Item, covers: &Artwork, eyebrow: &str) {
         };
         egui::Image::new(texture)
             .uv(uv)
-            .corner_radius(22)
+            .corner_radius(0)
             .tint(Color32::WHITE.gamma_multiply(opacity))
             .paint_at(ui, rect);
         ui.painter().rect_filled(
             rect,
-            22.0,
+            0.0,
             Color32::from_black_alpha(155).gamma_multiply(opacity),
         );
     }

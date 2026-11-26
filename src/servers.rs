@@ -313,7 +313,7 @@ impl Server {
         control_row(ui, 58.0, |ui| {
             ui.spacing_mut().item_spacing.x = 12.0;
             let (tile, _) = ui.allocate_exact_size(Vec2::splat(32.0), egui::Sense::hover());
-            ui.painter().rect_filled(tile, 8, CONTROL);
+            ui.painter().rect_filled(tile, 0, CONTROL);
             self.icon().paint(ui, tile.center(), 18.0, TEXT);
             let (icon, color, status) = self.status();
             let offline = !self.online && !self.checking;
@@ -463,9 +463,7 @@ impl App {
             "Collapse libraries"
         };
         let kind = s.session.kind.plugin().name;
-        // Put the server mark on the sidebar icon column and its name on the text
-        // column, in the colour of the library menu below it.
-        let tint = server_tint(i);
+        // Put the server mark on the sidebar icon column and its name on the text column.
         let (mark, _) = ui.allocate_exact_size(
             Vec2::new(SIDEBAR_TEXT_INSET - ui.spacing().item_spacing.x, 28.0),
             egui::Sense::hover(),
@@ -474,7 +472,7 @@ impl App {
             ui,
             mark.left_center() + Vec2::new(SIDEBAR_ICON_INSET + 10.0, 0.0),
             16.0,
-            tint,
+            MUTED,
         );
         ui.interact(mark, ui.id().with("server_mark"), egui::Sense::hover())
             .on_hover_text(kind);
@@ -702,7 +700,7 @@ impl App {
                 let card_frame = egui::Frame::new()
                     .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(42, 42, 46)))
                     .inner_margin(16)
-                    .corner_radius(14);
+                    .corner_radius(0);
                 for (row_index, row) in self.servers.chunks_mut(cols).enumerate() {
                     ui.horizontal_top(|ui| {
                         ui.spacing_mut().item_spacing = Vec2::splat(gap);
@@ -724,7 +722,7 @@ impl App {
                                                 Vec2::splat(48.0),
                                                 egui::Sense::hover(),
                                             );
-                                            ui.painter().rect_filled(rect, 12, CONTROL);
+                                            ui.painter().rect_filled(rect, 0, CONTROL);
                                             s.icon().paint(ui, rect.center(), 26.0, TEXT);
                                             ui.vertical(|ui| {
                                                 ui.spacing_mut().item_spacing.y = 2.0;
@@ -776,7 +774,7 @@ impl App {
                             if button.has_focus() {
                                 ui.painter().rect_stroke(
                                     header,
-                                    12,
+                                    0,
                                     egui::Stroke::new(1.0_f32, ACCENT),
                                     egui::StrokeKind::Inside,
                                 );
@@ -943,7 +941,7 @@ impl App {
                         .color(Color32::BLACK),
                 )
                 .fill(ACCENT)
-                .corner_radius(18)
+                .corner_radius(0)
                 .min_size(Vec2::new(108.0, 36.0));
                 let button = ui.add_enabled(!self.busy, add);
                 self.form.focus("Add server", &button);
@@ -958,7 +956,7 @@ impl App {
         for (i, s) in self.servers.iter_mut().enumerate() {
             let row = egui::Frame::new()
                 .fill(PANEL)
-                .corner_radius(14)
+                .corner_radius(0)
                 .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(45, 46, 52)))
                 .inner_margin(16)
                 .show(ui, |ui| {
@@ -1013,7 +1011,7 @@ impl App {
                                 ),
                                 ServerKind::Audiobookshelf => (CONTROL, TEXT),
                             };
-                            ui.painter().rect_filled(rect, 12, fill);
+                            ui.painter().rect_filled(rect, 0, fill);
                             s.icon().paint(ui, rect.center(), 26.0, ink);
                             let name_width = (ui.available_width() - 190.0).max(65.0);
                             ui.allocate_ui_with_layout(
@@ -1148,7 +1146,7 @@ impl App {
                                         )
                                         .selected(shown)
                                         .truncate()
-                                        .corner_radius(10);
+                                        .corner_radius(0);
                                         if ui
                                         .add_sized([width, 28.0], btn)
                                         .on_hover_text(

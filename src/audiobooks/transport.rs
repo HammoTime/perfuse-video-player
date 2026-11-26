@@ -129,7 +129,7 @@ impl App {
                         &loaded.covers,
                         Vec2::splat(56.0),
                         false,
-                        6,
+                        0,
                     );
                 }
                 let text_width = now.available_width();
@@ -320,7 +320,7 @@ impl App {
                         &active.covers,
                         Vec2::splat(cover_size),
                         false,
-                        12,
+                        0,
                     );
                 }
                 ui.vertical(|ui| {
@@ -402,7 +402,7 @@ impl App {
             };
             egui::Frame::new()
                 .fill(PANEL)
-                .corner_radius(18)
+                .corner_radius(0)
                 .inner_margin(16)
                 .show(ui, |ui| {
                     ui.set_width(panel_width - 32.0);

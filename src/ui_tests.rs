@@ -1304,8 +1304,8 @@ fn library_snapshots() {
             let second = harness.get_by_label("Open Tide Tables").rect();
             assert!((first.width() - first.height()).abs() <= 1.0);
             assert_eq!(first.top(), second.top());
-            assert!((second.left() - first.right() - 16.0).abs() <= 1.0);
-            harness.get_by_label("Search audiobooks");
+            assert!((second.left() - first.right() - 24.0).abs() <= 1.0);
+            harness.get_by_label("Search library");
         }
         if screen == "book-player-menu" {
             harness.get_by_label("Speed 1×").click();

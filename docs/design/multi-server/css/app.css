@@ -86,19 +86,19 @@
   --c-track: #414141;             /* progress track (65) */
   --c-buffer: #6e6e6e;            /* buffered (110) */
 
-  /* Server identity colours for sidebar library menus (SERVER_TINTS). */
-  --tint-0: #2dd4bf;              /* teal   (45,212,191) */
-  --tint-1: #f5b142;              /* amber  (245,177,66) */
-  --tint-2: #a78bfa;              /* violet (167,139,250) */
-  --tint-3: #fb7185;              /* coral  (251,113,133) */
-  --tint-4: #a3e635;              /* lime   (163,230,53) */
+  /* Sidebar library menus use the accent only. */
+  --tint-0: var(--c-accent);
+  --tint-1: var(--c-accent);
+  --tint-2: var(--c-accent);
+  --tint-3: var(--c-accent);
+  --tint-4: var(--c-accent);
 
   /* Buttons, inputs, menu rows and popovers are square with a softened edge (EDGE). */
   --r-edge: 2px;
-  --r-card: 8px;
+  --r-card: 0;
   --r-item: var(--r-edge);
   --r-control: var(--r-edge);
-  --r-panel: 18px;
+  --r-panel: 0;
   --r-pill: var(--r-edge);
 
   --s-1: 4px; --s-2: 8px; --s-3: 12px; --s-4: 16px; --s-5: 20px; --s-6: 24px; --s-7: 28px; --s-8: 32px; --s-10: 40px; --s-12: 48px;
@@ -197,7 +197,7 @@ a { color: var(--c-accent); }
 .nav-item .od-icon { color: var(--c-muted); }
 .server-libs { margin-left: 20px; border-left: 2px solid color-mix(in srgb, var(--tint) 35%, transparent); }
 .server-libs .nav-item { --tone: var(--tint); margin-left: -2px; }
-.server-libs .nav-item .od-icon { color: var(--tint); }
+
 .nav-item[aria-current="page"] { background: color-mix(in srgb, var(--tone) 18%, var(--c-sidebar)); box-shadow: inset 3px 0 0 var(--tone); }
 .nav-item[aria-current="page"] .od-icon { color: var(--tone); }
 .nav-item:focus-visible { outline: 1px solid var(--tone); outline-offset: -1px; }
@@ -214,7 +214,7 @@ a { color: var(--c-accent); }
 }
 .server-head-link .name { flex: 1; min-width: 0; }
 .server-head-link[aria-current="page"] { color: var(--c-text); background: var(--c-selected); }
-.server-head-link .kind { color: var(--tint); }
+.server-head-link .kind { color: var(--c-muted); }
 @media (hover: hover) { .server-head-link:hover { color: var(--c-text); } }
 .server-head .icon-btn { width: 24px; height: 24px; --od-icon-size: 14px; background: transparent; color: var(--c-muted); }
 .server-head .icon-btn[aria-pressed="true"] { background: var(--c-control-pressed); color: #8cc8ff; }

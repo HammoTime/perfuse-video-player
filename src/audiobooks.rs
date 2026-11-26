@@ -158,7 +158,7 @@ pub(super) fn book_crumb(ui: &mut egui::Ui, server: &str, library: Option<&str>)
 fn book_panel() -> egui::Frame {
     egui::Frame::new()
         .fill(PANEL)
-        .corner_radius(18)
+        .corner_radius(0)
         .inner_margin(24)
 }
 
@@ -283,7 +283,7 @@ impl App {
             .show(ctx, |ui| {
                 egui::Frame::new()
                     .fill(CONTROL)
-                    .corner_radius(22)
+                    .corner_radius(0)
                     .inner_margin(egui::Margin::symmetric(18, 10))
                     .shadow(egui::epaint::Shadow {
                         offset: [0, 12],

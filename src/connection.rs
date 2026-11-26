@@ -527,7 +527,7 @@ impl App {
 
 fn glyph(ui: &egui::Ui, top_left: egui::Pos2, kind: ServerKind, size: f32) {
     let tile = egui::Rect::from_min_size(top_left, Vec2::splat(size));
-    ui.painter().rect_filled(tile, (size / 4.0) as u8, CONTROL);
+    ui.painter().rect_filled(tile, 0, CONTROL);
     source_icon(kind).paint(ui, tile.center(), size * 0.55, TEXT);
 }
 
@@ -573,7 +573,7 @@ impl App {
                 })
                 .stroke((1.0, if choice.checked { ACCENT } else { CONTROL }))
                 .inner_margin(12)
-                .corner_radius(12);
+                .corner_radius(0);
             frame.show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.spacing_mut().item_spacing.y = 4.0;
@@ -857,11 +857,11 @@ fn source_tile(ui: &mut egui::Ui, kind: ServerKind, compact: bool) -> egui::Resp
         Color32::from_rgb(52, 52, 58)
     };
     ui.painter()
-        .rect(rect, 14, fill, (1.0, border), egui::StrokeKind::Inside);
+        .rect(rect, EDGE, fill, (1.0, border), egui::StrokeKind::Inside);
     if response.has_focus() {
         ui.painter().rect_stroke(
             rect.expand(2.0),
-            16,
+            EDGE + 2,
             (2.0, ACCENT),
             egui::StrokeKind::Outside,
         );
@@ -925,7 +925,7 @@ impl App {
                     ui.add_space(((ui.available_width() - width) / 2.0).max(0.0));
                     egui::Frame::new()
                         .fill(PANEL)
-                        .corner_radius(26)
+                        .corner_radius(0)
                         .inner_margin(44)
                         .show(ui, |ui| {
                             ui.vertical(|ui| {
@@ -971,7 +971,7 @@ impl App {
             .frame(
                 egui::Frame::new()
                     .fill(PANEL)
-                    .corner_radius(22)
+                    .corner_radius(0)
                     .inner_margin(32)
                     .shadow(egui::epaint::Shadow {
                         offset: [0, 24],
@@ -1073,7 +1073,7 @@ impl App {
             egui::Frame::new()
                 .fill(Color32::from_rgb(44, 26, 26))
                 .inner_margin(12)
-                .corner_radius(10)
+                .corner_radius(0)
                 .show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.add(Icon::Alert.image(16.0, ERROR_TEXT));
@@ -1089,7 +1089,7 @@ impl App {
             egui::Frame::new()
                 .fill(Color32::from_rgb(44, 26, 26))
                 .inner_margin(12)
-                .corner_radius(10)
+                .corner_radius(0)
                 .show(ui, |ui| {
                     ui.label(RichText::new("Check the highlighted fields").color(ERROR_TEXT));
                     ui.horizontal_wrapped(|ui| {
