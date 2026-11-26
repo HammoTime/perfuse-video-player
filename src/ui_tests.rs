@@ -345,6 +345,23 @@ fn mixed_home_routes_audiobooks_to_continue_listening_and_respects_hidden_librar
 }
 
 #[test]
+fn settings_tabs_show_the_hand_cursor() {
+    let mut harness = library([860.0, 620.0], "movies");
+    harness.state_mut().connection_open = true;
+    harness.run_steps(4);
+
+    for label in ["Servers", "Playback", "Updates & about"] {
+        harness.get_by_label(label).hover();
+        harness.run_steps(2);
+        assert_eq!(
+            harness.output().platform_output.cursor_icon,
+            egui::CursorIcon::PointingHand,
+            "{label}"
+        );
+    }
+}
+
+#[test]
 fn settings_action_pairs_match_and_remove_requires_confirmation() {
     let mut harness = library([860.0, 620.0], "movies");
     harness.state_mut().connection_open = true;
@@ -733,6 +750,19 @@ fn show_book_collection(app: &mut App, ctx: &egui::Context, home: bool) {
     });
 }
 
+fn book_library_search(size: [f32; 2]) -> Harness<'static, App> {
+    let mut harness = book_detail(size);
+    let ctx = harness.ctx.clone();
+    let app = harness.state_mut();
+    show_book_collection(app, &ctx, false);
+    app.search = "Coast".into();
+    app.location.as_mut().unwrap().search = app.search.clone();
+    let page = app.page.as_mut().unwrap();
+    page.items.truncate(1);
+    page.total = Some(2);
+    harness
+}
+
 fn start_book_fixture(app: &mut App) {
     let item = app.detail.clone().unwrap();
     let source = app.source.clone().unwrap();
@@ -1101,7 +1131,7 @@ fn library_layout_and_scrolling() {
                 assert!(screen.contains_rect(harness.get_by_label("Still Life").rect()));
             }
             if view == "details" {
-                let art = harness.get_by_label("Open The Quiet Earth").rect();
+                let art = harness.get_by_label("Cover of The Quiet Earth").rect();
                 let resume = harness.get_by_label("Resume").rect();
                 assert!(screen.contains_rect(resume));
                 assert!(resume.top() > art.bottom(), "Resume overlaps the hero");
@@ -1128,12 +1158,101 @@ fn library_search_entry_and_keyboard_navigation() {
             "{label} is clipped"
         );
     }
+    harness.key_press(egui::Key::Enter);
+    harness.run_steps(4);
+    assert_eq!(
+        harness.state().location.as_ref().unwrap().search,
+        "Northern Lights"
+    );
     // Custom painted navigation still supports keyboard activation and exposes labels.
     harness.get_by_label("Servers & settings").focus();
-    harness.run();
+    harness.run_steps(4);
     harness.key_press(egui::Key::Space);
-    harness.run();
+    harness.run_steps(4);
     assert!(harness.state().connection_open);
+}
+
+#[test]
+fn parent_libraries_share_search_and_pagination_at_minimum_size() {
+    let size = [860.0, 620.0];
+    let mut movies = library(size, "search");
+    movies.state_mut().page.as_mut().unwrap().total = Some(2);
+    let mut books = book_library_search(size);
+    movies.run_steps(4);
+    books.run_steps(4);
+
+    for label in [
+        "Refresh",
+        "Search library",
+        "Search",
+        "Clear",
+        "Search Results",
+        "Previous page",
+        "Next page",
+    ] {
+        let rect = movies.get_by_label(label).rect();
+        assert_eq!(books.get_by_label(label).rect(), rect, "{label}");
+        assert!(books.ctx.content_rect().contains_rect(rect), "{label}");
+    }
+    let controls = ["Search library", "Search", "Clear", "Refresh"]
+        .map(|label| books.get_by_label(label).rect());
+    for pair in controls.windows(2) {
+        assert!(pair[0].right() < pair[1].left());
+        assert!((pair[0].center().y - pair[1].center().y).abs() <= 1.0);
+    }
+    let mut wide = book_library_search([1440.0, 900.0]);
+    wide.run_steps(4);
+    let wide_search = wide.get_by_label("Search library").rect();
+    assert_eq!(wide_search.width(), 360.0);
+    assert!(controls[0].width() < wide_search.width());
+
+    let poster = movies.get_by_label("Open The Quiet Earth").rect();
+    let cover = books.get_by_label("Open Listening to the Coast").rect();
+    assert_eq!(poster.min, cover.min);
+    assert_eq!(poster.width(), cover.width());
+    assert_eq!(cover.width(), cover.height());
+
+    for (harness, query) in [(&mut movies, "Quiet"), (&mut books, "Coast")] {
+        harness.get_by_label("Next page").click();
+        harness.run_steps(4);
+        let location = harness.state().location.as_ref().unwrap();
+        assert_eq!(location.offset, 1);
+        assert_eq!(location.previous_pages, [0]);
+        assert_eq!(location.search, query);
+    }
+}
+
+#[test]
+fn library_hover_cursors_match_the_control() {
+    let size = [860.0, 620.0];
+    let movies = library(size, "movies");
+    let mut books = book_detail(size);
+    let ctx = books.ctx.clone();
+    show_book_collection(books.state_mut(), &ctx, false);
+
+    for (mut harness, title) in [
+        (movies, "The Quiet Earth"),
+        (books, "Listening to the Coast"),
+    ] {
+        harness.run_steps(4);
+        for (label, cursor) in [
+            ("Servers & settings", egui::CursorIcon::PointingHand),
+            ("Search library", egui::CursorIcon::Text),
+            ("Search", egui::CursorIcon::PointingHand),
+            (&format!("Open {title}"), egui::CursorIcon::PointingHand),
+            (title, egui::CursorIcon::PointingHand),
+        ] {
+            harness.get_by_label(label).scroll_to_me();
+            harness.run_steps(4);
+            harness.get_by_label(label).hover();
+            harness.run_steps(2);
+            assert_eq!(
+                harness.output().platform_output.cursor_icon,
+                cursor,
+                "{label}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1193,6 +1312,12 @@ fn library_snapshots() {
         ("audiobook-home", "book-home", [1440.0, 960.0], 1.0),
         ("audiobook-details", "book-details", [1280.0, 900.0], 1.0),
         ("audiobook-library", "book-dock", [1440.0, 900.0], 1.0),
+        (
+            "audiobook-library-minimum",
+            "book-search",
+            [860.0, 620.0],
+            1.0,
+        ),
         ("audiobook-dock-volume", "book-dock", [1440.0, 900.0], 1.0),
         ("audiobook-dock-wide", "book-dock", [2560.0, 900.0], 1.0),
         (
@@ -1218,7 +1343,9 @@ fn library_snapshots() {
         ("library-search", "search", [860.0, 620.0], 1.0),
         ("library-missing-art", "missing-art", [860.0, 620.0], 1.0),
     ] {
-        let mut harness = if screen.starts_with("book-") {
+        let mut harness = if screen == "book-search" {
+            book_library_search(size)
+        } else if screen.starts_with("book-") {
             book_detail(size)
         } else {
             library(size, screen)
@@ -2346,6 +2473,12 @@ fn sidebar_libraries_can_be_sorted_and_reordered() {
 
     harness.get_by_label("Sort libraries").click();
     harness.run_steps(2);
+    harness.get_by_label("Name (A–Z)").hover();
+    harness.run_steps(2);
+    assert_eq!(
+        harness.output().platform_output.cursor_icon,
+        egui::CursorIcon::PointingHand
+    );
     harness.get_by_label("Name (A–Z)").click();
     harness.run_steps(2);
     assert_eq!(order(&harness), ["Anime", "Movies", "TV Shows"]);
@@ -2391,6 +2524,10 @@ fn sidebar_libraries_can_be_sorted_and_reordered() {
         .events
         .push(egui::Event::PointerMoved(to));
     harness.run_steps(2);
+    assert_eq!(
+        harness.output().platform_output.cursor_icon,
+        egui::CursorIcon::Grabbing
+    );
     harness.input_mut().events.push(egui::Event::PointerButton {
         pos: to,
         button: egui::PointerButton::Primary,

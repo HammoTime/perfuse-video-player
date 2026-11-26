@@ -191,6 +191,7 @@ impl Server {
                 if ui
                     .add_sized([width, HEIGHT], chip)
                     .on_hover_text(&lib.title)
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .clicked()
                 {
                     selected = Some(lib.clone());
@@ -231,7 +232,11 @@ impl Server {
                                         )
                                         .frame_when_inactive(false)
                                         .wrap();
-                                        if ui.add(button).clicked() {
+                                        if ui
+                                            .add(button)
+                                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                            .clicked()
+                                        {
                                             selected = Some(lib.clone());
                                             ui.close();
                                         }
@@ -340,6 +345,7 @@ impl Server {
                 if offline {
                     if ui
                         .add(egui::Button::new("Retry").corner_radius(EDGE))
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
                         .clicked()
                     {
                         self.check(ctx);
@@ -507,6 +513,7 @@ impl App {
             )
             .inner
             .on_hover_text(format!("{kind} – {name}"))
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
             .clicked();
         let icon = if collapsed {
             Icon::PageNext
@@ -570,6 +577,7 @@ impl App {
         };
         let (rect, response) =
             ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), egui::Sense::click());
+        let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
         response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
         let divider = Color32::from_rgb(42, 42, 46);
         let frame = popover_frame().inner_margin(egui::Margin {
@@ -638,7 +646,11 @@ impl App {
                         RichText::new("Check again").size(13.0).color(ACCENT),
                     )
                     .frame_when_inactive(false);
-                    if ui.add(check).clicked() {
+                    if ui
+                        .add(check)
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                    {
                         for server in self
                             .servers
                             .iter_mut()
@@ -655,6 +667,7 @@ impl App {
                                 )
                                 .frame_when_inactive(false),
                             )
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
                             .clicked()
                         {
                             self.settings_tab = SettingsTab::Servers;
@@ -779,7 +792,11 @@ impl App {
                                     egui::StrokeKind::Inside,
                                 );
                             }
-                            if button.on_hover_text(&s.session.server).clicked() {
+                            if button
+                                .on_hover_text(&s.session.server)
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .clicked()
+                            {
                                 open = Some(i);
                             }
                         }
@@ -905,10 +922,18 @@ impl App {
     pub(super) fn offline_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         if let Some(i) = self.active {
             ui.heading(format!("Can't reach {}", self.servers[i].name()));
-            if ui.button("Try again").clicked() {
+            if ui
+                .button("Try again")
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .clicked()
+            {
                 self.servers[i].check(ctx);
             }
-            if ui.button("Server settings").clicked() {
+            if ui
+                .button("Server settings")
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .clicked()
+            {
                 self.settings_tab = SettingsTab::Servers;
                 self.connection_open = true;
             }

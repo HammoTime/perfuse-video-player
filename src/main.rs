@@ -1169,6 +1169,7 @@ impl App {
                         ] {
                             if ui
                                 .selectable_label(self.servers[i].prefs.sort == mode, label)
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
                                 .clicked()
                             {
                                 requested_sort = Some(mode);
@@ -1252,6 +1253,7 @@ impl App {
                         response.context_menu(|ui| {
                             if ui
                                 .add_enabled(index > 0, egui::Button::new("Move up"))
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
                                 .clicked()
                             {
                                 pending_move = Some((index, index - 1));
@@ -1262,21 +1264,34 @@ impl App {
                                     index + 1 < section_count,
                                     egui::Button::new("Move down"),
                                 )
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
                                 .clicked()
                             {
                                 pending_move = Some((index, index + 1));
                                 ui.close();
                             }
                             ui.separator();
-                            if ui.button("Sort A–Z").clicked() {
+                            if ui
+                                .button("Sort A–Z")
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .clicked()
+                            {
                                 requested_sort = Some(prefs::LibrarySort::NameAsc);
                                 ui.close();
                             }
-                            if ui.button("Sort Z–A").clicked() {
+                            if ui
+                                .button("Sort Z–A")
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .clicked()
+                            {
                                 requested_sort = Some(prefs::LibrarySort::NameDesc);
                                 ui.close();
                             }
-                            if ui.button("Server order").clicked() {
+                            if ui
+                                .button("Server order")
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .clicked()
+                            {
                                 requested_sort = Some(prefs::LibrarySort::Server);
                                 ui.close();
                             }
@@ -1388,107 +1403,73 @@ impl App {
         }
     }
 
-    fn library_search_fields(
-        &mut self,
-        ui: &mut egui::Ui,
-        ctx: &egui::Context,
-        autofocus: bool,
-    ) -> bool {
-        ui.horizontal(|ui| {
-            let (search, clear) = Pill::pair(
-                ui,
-                Pill::secondary(Icon::Search, "Search"),
-                Pill::secondary(Icon::Clear, "Clear"),
-            );
-            let clearing = !self.search.is_empty();
-            let shown: &[&Pill] = if clearing {
-                &[&search, &clear]
-            } else {
-                &[&search]
-            };
-            // Keep the field usable; narrower rows drop the button labels.
-            let compact = !Pill::labels_fit(ui, shown, 264.0);
-            let (search, clear) = (search.icon_only(compact), clear.icon_only(compact));
-            let spacing = ui.spacing().item_spacing.x;
-            let mut buttons = search.width(ui) + spacing;
-            if clearing {
-                buttons += clear.width(ui) + spacing;
-            }
-            // The text edit adds its 12pt side margins to the desired width.
-            let search_width = (ui.available_width() - buttons - 24.0).max(80.0);
-            let response = ui.add_enabled(
-                !self.busy,
-                egui::TextEdit::singleline(&mut self.search)
-                    .hint_text("Search this library")
-                    .desired_width(search_width)
-                    .margin(Vec2::new(12.0, 10.0)),
-            );
-            if autofocus {
-                response.request_focus();
-            }
-            response.widget_info(|| {
-                egui::WidgetInfo::labeled(
-                    egui::WidgetType::TextEdit,
-                    ui.is_enabled(),
-                    "Search library",
-                )
-            });
-            let submitted = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if ui.add_enabled(!self.busy, search).clicked() || submitted {
-                self.search_library(ctx);
-                return true;
-            }
-            if clearing && ui.add_enabled(!self.busy, clear).clicked() {
-                self.search.clear();
-                self.search_library(ctx);
-                return true;
-            }
-            false
-        })
-        .inner
+    fn library_search_fields(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let (search, clear) = Pill::pair(
+            ui,
+            Pill::secondary(Icon::Search, "Search"),
+            Pill::secondary(Icon::Clear, "Clear"),
+        );
+        let clearing = !self.search.is_empty();
+        let shown: &[&Pill] = if clearing {
+            &[&search, &clear]
+        } else {
+            &[&search]
+        };
+        let spacing = ui.spacing().item_spacing.x;
+        let title_space = 168.0 + spacing;
+        // Preserve room for the title and field before adding button labels.
+        let compact = !Pill::labels_fit(ui, shown, title_space + 168.0);
+        let (search, clear) = (search.icon_only(compact), clear.icon_only(compact));
+        let mut buttons = search.width(ui) + spacing;
+        if clearing {
+            buttons += clear.width(ui) + spacing;
+        }
+        let margin = Vec2::new(12.0, 10.0);
+        let field_width =
+            (ui.available_width() - title_space - buttons).clamp(2.0 * margin.x, 360.0);
+        ui.allocate_ui_with_layout(
+            Vec2::new(field_width + buttons, 40.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                let response = ui.add_enabled(
+                    !self.busy,
+                    egui::TextEdit::singleline(&mut self.search)
+                        .hint_text("Search this library")
+                        .desired_width(field_width - 2.0 * margin.x)
+                        .margin(margin),
+                );
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::TextEdit,
+                        response.enabled(),
+                        "Search library",
+                    )
+                });
+                let submitted =
+                    response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if ui.add_enabled(!self.busy, search).clicked() || submitted {
+                    self.search_library(ctx);
+                } else if clearing && ui.add_enabled(!self.busy, clear).clicked() {
+                    self.search.clear();
+                    self.search_library(ctx);
+                }
+            },
+        );
     }
 
-    fn audiobook_collection_header(
+    fn audiobook_home_header(
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         server: usize,
         title: &str,
-        home: bool,
     ) {
         let name = self.servers[server].name();
-        let query = self
-            .location
-            .as_ref()
-            .map_or("", |location| location.search.trim());
-        let filtered = !query.is_empty();
-        let subtitle = if home {
-            let count = self.sections.len();
-            let noun = if count == 1 { "library" } else { "libraries" };
-            format!("Audiobookshelf server · {count} {noun}")
-        } else if let Some(page) = &self.page {
-            let count = match page.total {
-                Some(1) => "1 audiobook".to_owned(),
-                Some(n) => format!("{n} audiobooks"),
-                None => format!(
-                    "{}–{} audiobooks",
-                    page.offset + 1,
-                    page.offset + page.items.len()
-                ),
-            };
-            if filtered {
-                format!("{count} matching “{query}”")
-            } else {
-                count
-            }
-        } else {
-            String::new()
-        };
+        let count = self.sections.len();
+        let noun = if count == 1 { "library" } else { "libraries" };
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 16.0;
-            // Reserve the trailing button: the larger Refresh on Home, otherwise the library one.
-            let button = if home { 44.0 } else { 32.0 };
-            let width = (ui.available_width() - button - 16.0).max(0.0);
+            let width = (ui.available_width() - 44.0 - 16.0).max(0.0);
             ui.vertical(|ui| {
                 ui.set_width(width);
                 ui.spacing_mut().item_spacing.y = 8.0;
@@ -1498,37 +1479,23 @@ impl App {
                         .truncate(),
                 )
                 .on_hover_text(title);
-                if !subtitle.is_empty() {
-                    ui.label(
-                        RichText::new(subtitle)
-                            .size(15.0)
-                            .line_height(Some(22.5))
-                            .color(MUTED),
-                    );
-                }
+                ui.label(
+                    RichText::new(format!("Audiobookshelf server · {count} {noun}"))
+                        .size(15.0)
+                        .line_height(Some(22.5))
+                        .color(MUTED),
+                );
             });
-            if home {
-                if ui
-                    .add_enabled(
-                        !self.busy,
-                        IconButton::new(Icon::Refresh, "Refresh").size(44.0),
-                    )
-                    .clicked()
-                {
-                    self.load_page(ctx, false);
-                }
-            } else if ui
-                .add_enabled(!self.busy, IconButton::new(Icon::Refresh, "Refresh"))
+            if ui
+                .add_enabled(
+                    !self.busy,
+                    IconButton::new(Icon::Refresh, "Refresh").size(44.0),
+                )
                 .clicked()
             {
                 self.load_page(ctx, false);
             }
         });
-        // Search sits inline under the heading, as in movie and TV libraries.
-        if !home {
-            ui.add_space(26.0);
-            self.library_search_fields(ui, ctx, false);
-        }
         ui.add_space(28.0);
     }
 
@@ -1541,22 +1508,14 @@ impl App {
             .map(|l| l.title.as_str())
             .unwrap_or("Your library")
             .to_owned();
-        if let Some(i) = self.active.filter(|_| self.audiobook_server()) {
-            self.audiobook_collection_header(ui, ctx, i, &title, home);
+        if let Some(i) = self.active.filter(|_| home && self.audiobook_server()) {
+            self.audiobook_home_header(ui, ctx, i, &title);
         } else {
-            ui.horizontal(|ui| {
-                let title_width = (ui.available_width() - 110.0).max(80.0);
-                ui.allocate_ui_with_layout(
-                    Vec2::new(title_width, 40.0),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        ui.add(
-                            egui::Label::new(RichText::new(&title).size(30.0).strong()).truncate(),
-                        )
-                        .on_hover_text(&title);
-                    },
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let searchable = self.location.as_ref().is_some_and(|l| l.library);
+            ui.allocate_ui_with_layout(
+                Vec2::new(ui.available_width(), 40.0),
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
                     if ui
                         .add_enabled(!self.busy, IconButton::new(Icon::Refresh, "Refresh"))
                         .clicked()
@@ -1566,8 +1525,17 @@ impl App {
                     if self.busy {
                         ui.spinner();
                     }
-                });
-            });
+                    if searchable {
+                        self.library_search_fields(ui, ctx);
+                    }
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(
+                            egui::Label::new(RichText::new(&title).size(30.0).strong()).truncate(),
+                        )
+                        .on_hover_text(&title);
+                    });
+                },
+            );
             if let Some(i) = self.active {
                 let server = &self.servers[i];
                 let kind = server.session.kind.plugin().name;
@@ -1584,10 +1552,6 @@ impl App {
                 });
             }
             ui.add_space(34.0);
-            if self.location.as_ref().is_some_and(|l| l.library) {
-                self.library_search_fields(ui, ctx, false);
-                ui.add_space(28.0);
-            }
         }
         if self.sections.is_empty() {
             ui.heading(if self.audiobook_server() {
@@ -1697,57 +1661,41 @@ impl App {
                                 .is_none_or(|i| self.servers[i].item_visible(item))
                         })
                         .collect();
-                    if audiobook_server && !items.is_empty() {
-                        let mut draw = |ui: &mut egui::Ui, item: &Item, width| {
-                            if book_card(ui, item, &self.covers, width, book_status(item))
-                                && !self.busy
-                            {
-                                picked = Some(item.clone());
-                            }
-                        };
-                        if home {
-                            let range = format!(
-                                "{}–{}{}",
-                                page.offset + 1,
-                                page.offset + page.items.len(),
-                                page.total.map(|n| format!(" of {n}")).unwrap_or_default()
-                            );
-                            page_action = ui
-                                .push_id(page.offset, |ui| {
-                                    home_carousel(
-                                        ui,
-                                        "added_books",
-                                        "Recently Added",
-                                        self.carousel_offsets.entry("added_books").or_default(),
-                                        &items,
-                                        Shelf::Books {
-                                            meta: range,
-                                            previous_page: !self.busy && has_previous,
-                                            next_page: !self.busy && has_next,
-                                        },
-                                        |ui, item| draw(ui, item, BOOK_CARD_WIDTH),
-                                    )
-                                })
-                                .inner;
-                        } else {
-                            let columns = ((ui.available_width() + ART_GAP)
-                                / (BOOK_CARD_WIDTH + ART_GAP))
-                                .floor()
-                                .max(1.0) as usize;
-                            let width = (ui.available_width() - ART_GAP * (columns - 1) as f32)
-                                / columns as f32;
-                            egui::Grid::new("book_covers")
-                                .num_columns(columns)
-                                .spacing([ART_GAP, 28.0])
-                                .show(ui, |ui| {
-                                    for (index, item) in items.into_iter().enumerate() {
-                                        draw(ui, item, width);
-                                        if (index + 1) % columns == 0 {
-                                            ui.end_row();
+                    if home && audiobook_server && !items.is_empty() {
+                        let range = format!(
+                            "{}–{}{}",
+                            page.offset + 1,
+                            page.offset + page.items.len(),
+                            page.total.map(|n| format!(" of {n}")).unwrap_or_default()
+                        );
+                        page_action = ui
+                            .push_id(page.offset, |ui| {
+                                home_carousel(
+                                    ui,
+                                    "added_books",
+                                    "Recently Added",
+                                    self.carousel_offsets.entry("added_books").or_default(),
+                                    &items,
+                                    Shelf::Books {
+                                        meta: range,
+                                        previous_page: !self.busy && has_previous,
+                                        next_page: !self.busy && has_next,
+                                    },
+                                    |ui, &item| {
+                                        if book_card(
+                                            ui,
+                                            item,
+                                            &self.covers,
+                                            BOOK_CARD_WIDTH,
+                                            book_status(item),
+                                        ) && !self.busy
+                                        {
+                                            picked = Some(item.clone());
                                         }
-                                    }
-                                });
-                        }
+                                    },
+                                )
+                            })
+                            .inner;
                         return;
                     }
                     control_row(ui, 32.0, |ui| {
@@ -1866,6 +1814,7 @@ impl App {
                                                     .frame(false)
                                                     .wrap_mode(egui::TextWrapMode::Truncate),
                                                 )
+                                                .on_hover_cursor(egui::CursorIcon::PointingHand)
                                                 .clicked()
                                                 && !self.busy
                                             {
@@ -1895,7 +1844,12 @@ impl App {
                             .spacing([ART_GAP, 28.0])
                             .show(ui, |ui| {
                                 for (index, item) in items.into_iter().enumerate() {
-                                    if poster(ui, item, &self.covers, width) && !self.busy {
+                                    let clicked = if item.kind == Kind::Audiobook {
+                                        book_card(ui, item, &self.covers, width, book_status(item))
+                                    } else {
+                                        poster(ui, item, &self.covers, width)
+                                    };
+                                    if clicked && !self.busy {
                                         picked = Some(item.clone());
                                     }
                                     if (index + 1) % columns == 0 {
@@ -2163,7 +2117,9 @@ impl App {
                 )
                 .min_size(Vec2::new(154.0, 38.0))
                 .frame(false);
-                let response = ui.add(button);
+                let response = ui
+                    .add(button)
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
                 response.widget_info(|| {
                     egui::WidgetInfo::selected(
                         egui::WidgetType::SelectableLabel,
@@ -3037,7 +2993,10 @@ impl eframe::App for App {
                             .detail
                             .as_ref()
                             .is_some_and(|item| item.kind == Kind::Audiobook)
-                        || (!self.connection_open && !self.overview && self.audiobook_server())
+                        || (!self.connection_open
+                            && !self.overview
+                            && self.selected_library.is_none()
+                            && self.audiobook_server())
                     {
                         let padding = if ctx.content_rect().width() <= 1000.0 {
                             32
@@ -3281,7 +3240,7 @@ fn nav_item(
             Color32::from_gray(195)
         },
     );
-    response
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3908,7 +3867,11 @@ fn cover_view_rounded(
             egui::StrokeKind::Inside,
         );
     }
-    response
+    if interactive {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    }
 }
 
 enum Shelf {
@@ -4117,6 +4080,7 @@ fn book_card(
                     .truncate()
                     .sense(egui::Sense::click()),
                 )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .clicked();
             let duration = if finished {
                 Some("Finished".to_owned())
@@ -4152,6 +4116,7 @@ fn book_card(
                     .truncate()
                     .sense(egui::Sense::click()),
                 )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .clicked();
         });
     });
@@ -4196,6 +4161,7 @@ fn continue_card(ui: &mut egui::Ui, item: &Item, covers: &Artwork) -> bool {
                     .frame(false)
                     .wrap_mode(egui::TextWrapMode::Truncate),
             )
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
             .clicked();
         let subtitle = item
             .duration_ms
@@ -4228,6 +4194,7 @@ fn released_card(ui: &mut egui::Ui, item: &Item, covers: &Artwork) -> bool {
                     .frame(false)
                     .wrap_mode(egui::TextWrapMode::Truncate),
             )
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
             .clicked();
         let subtitle = match item.release_date.as_deref().and_then(release_date) {
             Some(date) => format!("{}  ·  {date}", item.subtitle()),
@@ -4311,6 +4278,7 @@ fn poster(ui: &mut egui::Ui, item: &Item, covers: &Artwork, width: f32) -> bool 
                     .frame(false)
                     .wrap_mode(egui::TextWrapMode::Truncate),
             )
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
             .clicked();
         ui.add(egui::Label::new(RichText::new(item.subtitle()).size(12.0).color(MUTED)).truncate());
     });
@@ -4361,7 +4329,13 @@ fn hero(ui: &mut egui::Ui, item: &Item, covers: &Artwork, eyebrow: &str) {
     content.set_clip_rect(ui.clip_rect().intersect(rect.shrink(20.0)));
     content.horizontal(|ui| {
         let art_width = 112.0;
-        cover(ui, item, covers, Vec2::new(art_width, art_width * 1.5));
+        cover_view(
+            ui,
+            item,
+            covers,
+            Vec2::new(art_width, art_width * 1.5),
+            false,
+        );
         ui.add_space(14.0);
         ui.vertical(|ui| {
             ui.set_width(ui.available_width());
