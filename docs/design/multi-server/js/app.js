@@ -193,7 +193,9 @@
   function navItem(iconName, label, current, attrs, fk, extraCls = '') {
     return `<button type="button" class="nav-item ${extraCls}" ${attrs} data-fk="${fk}" ${current ? 'aria-current="page"' : ''}>${icon(iconName)}<span class="od-truncate">${esc(label)}</span></button>`;
   }
-  function serverGroup(s) {
+  // Each server's library menu takes an identity colour by server order,
+  // matching SERVER_TINTS in the app.
+  function serverGroup(s, i) {
     const k = KINDS[s.kind];
     const v = state.view;
     const cur = v.name === 'server' && v.serverId === s.id;
@@ -202,7 +204,7 @@
     if (alpha) libs = [...libs].sort((a, b) => a.name.localeCompare(b.name));
     const off = s.status === 'offline';
     const glyph = s.status === 'online' ? '' : statusGlyph(serverLevel(s), s.status === 'checking' ? 'Checking' : 'Offline');
-    return `<section class="server-group" aria-label="${esc(k.label)} – ${esc(s.name)}">
+    return `<section class="server-group" style="--tint: var(--tint-${i % 5})" aria-label="${esc(k.label)} – ${esc(s.name)}">
       <div class="server-head">
         <button type="button" class="server-head-link" data-action="go-server" data-server="${s.id}" data-fk="sh-${s.id}" title="${esc(k.label)} – ${esc(s.name)}" ${cur ? 'aria-current="page"' : ''}>
           <span class="kind">${icon(k.icon, { label: k.label })}</span><span class="name od-truncate">${esc(s.name)}</span>${glyph}
@@ -210,7 +212,7 @@
         <button type="button" class="icon-btn" data-action="toggle-sort" data-server="${s.id}" data-fk="sort-${s.id}" aria-pressed="${alpha}" aria-label="Sort ${esc(s.name)} libraries A to Z" title="Sort A–Z">${icon('sort')}</button>
         <button type="button" class="icon-btn collapse-btn" data-action="toggle-collapse" data-server="${s.id}" data-fk="col-${s.id}" aria-expanded="${!s.collapsed}" aria-controls="libs-${s.id}" aria-label="${esc(s.name)} libraries">${icon('chevron-down')}</button>
       </div>
-      <div id="libs-${s.id}" ${s.collapsed ? 'hidden' : ''}>
+      <div id="libs-${s.id}" class="server-libs" ${s.collapsed ? 'hidden' : ''}>
         ${off ? `<p class="group-offline">Offline · last seen ${esc(s.lastSeen || 'a while ago')}</p>` : ''}
         ${libs.map((l) => navItem(LIB_ICONS[l.type] || 'movies', l.name, v.name === 'library' && v.libraryId === l.id && v.serverId === s.id, `data-action="go-library" data-server="${s.id}" data-lib="${l.id}"`, `lib-${l.id}`, off ? 'dim' : '')).join('')}
       </div>

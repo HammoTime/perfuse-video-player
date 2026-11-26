@@ -105,7 +105,7 @@ fn text_field(
                     &mut visuals.widgets.active,
                 ] {
                     widget.bg_stroke = (1.0, border).into();
-                    widget.corner_radius = egui::CornerRadius::same(12);
+                    widget.corner_radius = egui::CornerRadius::same(EDGE);
                     widget.expansion = 0.0;
                 }
                 ui.add(
@@ -125,7 +125,7 @@ fn text_field(
         if response.has_focus() {
             ui.painter().rect_stroke(
                 response.rect.expand(1.5),
-                13,
+                EDGE + 1,
                 (3.0, Color32::from_rgba_unmultiplied(61, 155, 255, 64)),
                 egui::StrokeKind::Middle,
             );

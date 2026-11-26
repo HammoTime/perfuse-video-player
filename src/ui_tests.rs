@@ -230,7 +230,10 @@ fn sidebar_actions_clear_the_scrollbar_when_libraries_overflow() {
     assert_eq!(expand.size(), Vec2::splat(24.0));
     assert_eq!(sort.size(), expand.size());
     assert!((sort.left() - expand.right() - 4.0).abs() < 1.0);
-    assert!(right - sort.right() >= harness.ctx.style().spacing.scroll.bar_width + 4.0);
+    // The group actions share the right edge of every sidebar row, and that edge
+    // stays clear of the floating scroll bar at the panel's 16-point margin.
+    assert!((right - sort.right()).abs() < 1.0);
+    assert!(244.0 - 16.0 - sort.right() >= harness.ctx.style().spacing.scroll.bar_width + 4.0);
     harness.get_by_label("Sort libraries").click();
     harness.run_steps(3);
     harness.get_by_label("Server order");
@@ -2643,15 +2646,18 @@ fn home_pagination_only_changes_recently_added_and_carousels_scroll_with_arrows(
     let close_btn = harness.get_by_label("Close window").rect();
     assert!((back_btn.left() - 20.0).abs() < 1.5);
     assert!((back_btn.top() - 20.0).abs() < 1.5);
-    assert!((screen.right() - close_btn.right() - 20.0).abs() < 1.5);
+    // Windows caption buttons sit flush with the window's top-right corner.
+    assert!((screen.right() - close_btn.right()).abs() < 1.5);
+    assert!((close_btn.top() - screen.top()).abs() < 1.5);
+    assert_eq!(close_btn.size(), Vec2::new(46.0, 32.0));
 
     let home_nav = harness
         .get_by_role_and_label(egui::accesskit::Role::Button, "Home")
         .rect();
     let settings_nav = harness.get_by_label("Servers & settings").rect();
-    // Home paints its icon 20 points inside the button. The provider glyph
-    // occupies the first 16 points of the sidebar content.
-    assert_eq!(home_nav.left() + 20.0, settings_nav.left() + 8.0);
+    // Top-level rows share one icon and text column from the sidebar edge.
+    assert_eq!(home_nav.left(), settings_nav.left());
+    assert_eq!(home_nav.right(), settings_nav.right());
     assert!((home_nav.top() - 72.0 - 28.0).abs() < 2.0);
     assert!((screen.bottom() - settings_nav.bottom() - 28.0).abs() < 2.0);
 

@@ -186,7 +186,7 @@ impl Server {
                     library_icon(lib).image(12.0, MUTED),
                     RichText::new(lib.title.replace(['\r', '\n'], " ")).size(12.0),
                 )
-                .corner_radius(14)
+                .corner_radius(EDGE)
                 .truncate();
                 if ui
                     .add_sized([width, HEIGHT], chip)
@@ -339,7 +339,7 @@ impl Server {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if offline {
                     if ui
-                        .add(egui::Button::new("Retry").corner_radius(14))
+                        .add(egui::Button::new("Retry").corner_radius(EDGE))
                         .clicked()
                     {
                         self.check(ctx);
@@ -463,10 +463,22 @@ impl App {
             "Collapse libraries"
         };
         let kind = s.session.kind.plugin().name;
-        ui.add(s.icon().image(16.0, MUTED)).on_hover_text(kind);
-        // Keep both controls together, inside the fully expanded floating scroll bar.
-        let scroll = &ui.spacing().scroll;
-        let gutter = scroll.bar_width + scroll.bar_outer_margin + 4.0;
+        // Put the server mark on the sidebar icon column and its name on the text
+        // column, in the colour of the library menu below it.
+        let tint = server_tint(i);
+        let (mark, _) = ui.allocate_exact_size(
+            Vec2::new(SIDEBAR_TEXT_INSET - ui.spacing().item_spacing.x, 28.0),
+            egui::Sense::hover(),
+        );
+        s.icon().paint(
+            ui,
+            mark.left_center() + Vec2::new(SIDEBAR_ICON_INSET + 10.0, 0.0),
+            16.0,
+            tint,
+        );
+        ui.interact(mark, ui.id().with("server_mark"), egui::Sense::hover())
+            .on_hover_text(kind);
+        // Keep both controls together at the shared right edge of the sidebar rows.
         let trailing = 24.0
             + if show_sort {
                 28.0
@@ -475,13 +487,14 @@ impl App {
             } else {
                 0.0
             };
-        let name_width = (ui.available_width() - trailing - 4.0 - gutter).max(0.0);
+        let name_width = (ui.available_width() - trailing - 4.0).max(0.0);
         let open = ui
             .allocate_ui_with_layout(
                 Vec2::new(name_width, 28.0),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
                     ui.set_width(name_width);
+                    ui.spacing_mut().button_padding = Vec2::ZERO;
                     ui.add(
                         egui::Button::new(
                             RichText::new(name.to_uppercase())
@@ -573,12 +586,12 @@ impl App {
             .frame(frame);
         let open = self.status_popover.update(&response, &popup);
         if open || response.has_focus() || response.hovered() {
-            ui.painter().rect_filled(rect, 8, PANEL);
+            ui.painter().rect_filled(rect, EDGE, PANEL);
         }
         if open || response.has_focus() {
             ui.painter().rect_stroke(
                 rect,
-                8,
+                EDGE,
                 egui::Stroke::new(1.0_f32, ACCENT),
                 egui::StrokeKind::Inside,
             );

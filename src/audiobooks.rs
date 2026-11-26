@@ -824,7 +824,7 @@ impl App {
                             self.book.pending.is_none(),
                             egui::Button::image(Icon::Close.image(14.0, MUTED).alt_text(&label))
                                 .min_size(Vec2::splat(28.0))
-                                .corner_radius(14)
+                                .corner_radius(EDGE)
                                 .frame_when_inactive(false),
                         );
                         delete.widget_info(|| {
@@ -916,11 +916,11 @@ fn chapter_row(
         } else {
             Color32::TRANSPARENT
         };
-        ui.painter().rect_filled(rect, 10, fill);
+        ui.painter().rect_filled(rect, EDGE, fill);
         if response.has_focus() {
             ui.painter().rect_stroke(
                 rect,
-                10,
+                EDGE,
                 egui::Stroke::new(2.0_f32, ACCENT),
                 egui::StrokeKind::Inside,
             );

@@ -42,14 +42,33 @@ const PANEL: Color32 = Color32::from_rgb(28, 28, 30);
 const GREEN: Color32 = Color32::from_rgb(126, 226, 160);
 const ERROR_TEXT: Color32 = Color32::from_rgb(255, 160, 150);
 const TEXT: Color32 = Color32::from_rgb(235, 235, 245);
+// Sidebar grid: every top-level row shares one icon column (20) and one text
+// column (40) from the panel's 16-point edge. Library rows indent by one step,
+// so their icons sit on the top-level text column.
+const SIDEBAR: Color32 = Color32::from_rgb(20, 20, 23);
+const SIDEBAR_EDGE: i8 = 16;
 const SIDEBAR_TEXT_INSET: f32 = 40.0;
+const SIDEBAR_INDENT: i8 = 20;
 const SIDEBAR_NAV_MARGIN: egui::Margin = egui::Margin {
-    left: 16,
+    left: SIDEBAR_INDENT,
     right: 0,
     top: 0,
     bottom: 0,
 };
 const SIDEBAR_ICON_INSET: f32 = 10.0;
+/// Identity colours for each server's library menu, assigned by server order so
+/// two servers of the same kind still differ. Each keeps at least 4.5:1 contrast
+/// on the sidebar and stays clear of ACCENT, which marks top-level navigation.
+const SERVER_TINTS: [Color32; 5] = [
+    Color32::from_rgb(45, 212, 191),  // teal
+    Color32::from_rgb(245, 177, 66),  // amber
+    Color32::from_rgb(167, 139, 250), // violet
+    Color32::from_rgb(251, 113, 133), // coral
+    Color32::from_rgb(163, 230, 53),  // lime
+];
+/// Corner radius for buttons, inputs, menu rows and popovers: square with a
+/// softened edge.
+const EDGE: u8 = 2;
 const UPDATE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 // Button state fills from assets/buttons.
 const CONTROL: Color32 = Color32::from_rgb(44, 44, 48);
@@ -253,7 +272,7 @@ impl App {
             &mut visuals.widgets.hovered,
             &mut visuals.widgets.active,
         ] {
-            widget.corner_radius = egui::CornerRadius::same(14);
+            widget.corner_radius = egui::CornerRadius::same(EDGE);
             widget.bg_stroke = egui::Stroke::NONE;
         }
         ctx.set_visuals(visuals);
@@ -1007,29 +1026,8 @@ impl App {
                     ui.add(Icon::Mark.image(18.0, Color32::WHITE));
                     ui.label(RichText::new("PERFUSE").strong().color(ACCENT));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add(IconButton::new(Icon::Close, "Close window"))
-                            .clicked()
-                        {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                        let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-                        if ui
-                            .add(if maximized {
-                                IconButton::new(Icon::Restore, "Restore")
-                            } else {
-                                IconButton::new(Icon::Maximize, "Maximize")
-                            })
-                            .clicked()
-                        {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
-                        }
-                        if ui
-                            .add(IconButton::new(Icon::Minimize, "Minimize"))
-                            .clicked()
-                        {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                        }
+                        // Leave the corner to the Windows caption buttons.
+                        ui.add_space(3.0 * CaptionButton::WIDTH - 20.0 + 12.0);
                         let pin_label = if self.always_on_top {
                             "Disable always on top"
                         } else {
@@ -1044,73 +1042,113 @@ impl App {
                     });
                 });
             });
+        self.caption_buttons(ctx);
+    }
+
+    /// Minimize, maximize and close, flush with the window's top-right corner
+    /// in the Windows 11 caption button style.
+    fn caption_buttons(&mut self, ctx: &egui::Context) {
+        let screen = ctx.content_rect();
+        let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        egui::Area::new(egui::Id::new("caption_buttons"))
+            .order(egui::Order::Middle)
+            .fixed_pos(egui::pos2(
+                screen.right() - 3.0 * CaptionButton::WIDTH,
+                screen.top(),
+            ))
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(CaptionButton::new(Caption::Minimize, "Minimize"))
+                        .clicked()
+                    {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                    }
+                    let (glyph, label) = if maximized {
+                        (Caption::Restore, "Restore")
+                    } else {
+                        (Caption::Maximize, "Maximize")
+                    };
+                    if ui.add(CaptionButton::new(glyph, label)).clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                    }
+                    if ui
+                        .add(CaptionButton::new(Caption::Close, "Close window"))
+                        .clicked()
+                    {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+            });
     }
 
     fn sidebar(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("sidebar")
             .exact_width(244.0)
             .resizable(false)
-            .frame(
-                egui::Frame::new()
-                    .fill(Color32::from_rgb(20, 20, 23))
-                    .inner_margin(egui::Margin::same(28)),
-            )
+            .frame(egui::Frame::new().fill(SIDEBAR).inner_margin(egui::Margin {
+                left: SIDEBAR_EDGE,
+                right: SIDEBAR_EDGE,
+                top: 28,
+                bottom: 28,
+            }))
             .show(ctx, |ui| {
-                egui::Frame::new().show(ui, |ui| {
-                    ui.set_min_height(ui.available_height());
-                    ui.set_width(ui.available_width());
-                    let row_spacing = ui.spacing().item_spacing.y;
-                    ui.spacing_mut().item_spacing.y = 24.0;
-                    // Center the Home glyph on the 16-point provider icons below.
-                    if egui::Frame::new()
-                        .inner_margin(egui::Margin {
-                            left: -12,
-                            ..Default::default()
-                        })
-                        .show(ui, |ui| {
-                            nav(
-                                ui,
-                                Icon::Home,
-                                "Home",
-                                self.overview && !self.connection_open && !self.book.full,
-                            )
-                        })
-                        .inner
-                        .clicked()
-                        && !self.busy
-                    {
-                        self.book.full = false;
-                        self.overview = true;
-                        self.connection_open = false;
-                        self.detail = None;
-                    }
-                    ui.spacing_mut().item_spacing.y = row_spacing;
-                    egui::ScrollArea::vertical()
-                        .id_salt("server_groups")
-                        .max_height((ui.available_height() - 130.0).max(60.0))
-                        .show(ui, |ui| {
-                            for i in 0..self.servers.len() {
-                                ui.push_id(i, |ui| {
-                                    self.server_group(ui, ctx, i);
-                                });
-                                ui.add_space(12.0);
-                            }
-                        });
-                    ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                // Keep every row's right edge clear of the floating scroll bar so
+                // the group controls line up with the rows above and below.
+                let scroll = &ui.spacing().scroll;
+                let gutter = (scroll.bar_width + scroll.bar_outer_margin + 4.0).round() as i8;
+                egui::Frame::new()
+                    .inner_margin(egui::Margin {
+                        right: gutter,
+                        ..Default::default()
+                    })
+                    .show(ui, |ui| {
+                        ui.set_min_height(ui.available_height());
+                        ui.set_width(ui.available_width());
+                        let row_spacing = ui.spacing().item_spacing.y;
+                        ui.spacing_mut().item_spacing.y = 24.0;
                         if nav(
                             ui,
-                            Icon::Settings,
-                            "Servers & settings",
-                            self.connection_open && !self.book.full,
+                            Icon::Home,
+                            "Home",
+                            self.overview && !self.connection_open && !self.book.full,
                         )
                         .clicked()
+                            && !self.busy
                         {
                             self.book.full = false;
-                            self.connection_open = true;
+                            self.overview = true;
+                            self.connection_open = false;
+                            self.detail = None;
                         }
-                        self.status_button(ui, ctx);
+                        ui.spacing_mut().item_spacing.y = row_spacing;
+                        egui::ScrollArea::vertical()
+                            .id_salt("server_groups")
+                            .max_height((ui.available_height() - 130.0).max(60.0))
+                            .show(ui, |ui| {
+                                for i in 0..self.servers.len() {
+                                    ui.push_id(i, |ui| {
+                                        self.server_group(ui, ctx, i);
+                                    });
+                                    ui.add_space(12.0);
+                                }
+                            });
+                        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                            if nav(
+                                ui,
+                                Icon::Settings,
+                                "Servers & settings",
+                                self.connection_open && !self.book.full,
+                            )
+                            .clicked()
+                            {
+                                self.book.full = false;
+                                self.connection_open = true;
+                            }
+                            self.status_button(ui, ctx);
+                        });
                     });
-                });
             });
     }
 
@@ -1174,7 +1212,18 @@ impl App {
         egui::Frame::new()
             .inner_margin(SIDEBAR_NAV_MARGIN)
             .show(ui, |ui| {
-                let home = nav(ui, Icon::Home, "Home", server_home);
+                let tint = server_tint(i);
+                let rail = ui.painter().add(egui::Shape::Noop);
+                let home = nav_item(
+                    ui,
+                    Icon::Home,
+                    "Home",
+                    server_home,
+                    false,
+                    false,
+                    Some(tint),
+                );
+                let home_rect = home.rect;
                 let label = format!("{} Home", self.servers[i].name());
                 home.widget_info(|| {
                     egui::WidgetInfo::selected(
@@ -1203,6 +1252,7 @@ impl App {
                         selected,
                         can_reorder,
                         dragging_this,
+                        Some(tint),
                     );
                     row_rects.push(response.rect);
                     if can_reorder && response.drag_started_by(egui::PointerButton::Primary) {
@@ -1249,6 +1299,21 @@ impl App {
                         });
                     }
                 }
+                // A thin rail in the server's colour ties its library menu together.
+                let last = row_rects
+                    .last()
+                    .map_or(home_rect.bottom(), |rect| rect.bottom());
+                ui.painter().set(
+                    rail,
+                    egui::Shape::rect_filled(
+                        egui::Rect::from_x_y_ranges(
+                            home_rect.left()..=home_rect.left() + 1.0,
+                            home_rect.top()..=last,
+                        ),
+                        0,
+                        tint.gamma_multiply(0.35),
+                    ),
+                );
                 if let Some(from) = self.servers[i].dragging_section {
                     if from >= row_rects.len() {
                         self.servers[i].dragging_section = None;
@@ -1275,7 +1340,7 @@ impl App {
                             ui.painter().hline(
                                 row_rects[0].x_range(),
                                 y,
-                                egui::Stroke::new(2.0_f32, ACCENT),
+                                egui::Stroke::new(2.0_f32, tint),
                             );
                         }
                         if !ui.ctx().input(|i| i.pointer.primary_down()) {
@@ -3182,10 +3247,16 @@ fn placeholder(ui: &egui::Ui, rect: egui::Rect, radius: f32) {
     );
 }
 
-fn nav(ui: &mut egui::Ui, icon: Icon, title: &str, selected: bool) -> egui::Response {
-    nav_item(ui, icon, title, selected, false, false)
+fn server_tint(i: usize) -> Color32 {
+    SERVER_TINTS[i % SERVER_TINTS.len()]
 }
 
+fn nav(ui: &mut egui::Ui, icon: Icon, title: &str, selected: bool) -> egui::Response {
+    nav_item(ui, icon, title, selected, false, false, None)
+}
+
+/// A square-edged sidebar row. Top-level rows use ACCENT; a server's library
+/// rows pass that server's `tint` for their icons, fills and selection marker.
 fn nav_item(
     ui: &mut egui::Ui,
     icon: Icon,
@@ -3193,6 +3264,7 @@ fn nav_item(
     selected: bool,
     draggable: bool,
     dragging: bool,
+    tint: Option<Color32>,
 ) -> egui::Response {
     let sense = if draggable {
         egui::Sense::click_and_drag()
@@ -3208,24 +3280,33 @@ fn nav_item(
             title,
         )
     });
+    let color = tint.unwrap_or(ACCENT);
     if selected || dragging || response.hovered() || response.has_focus() {
         ui.painter().rect_filled(
             rect,
-            8.0,
-            if dragging {
-                CONTROL_PRESSED
-            } else if selected {
-                Color32::from_rgb(23, 42, 64)
-            } else {
-                PANEL
-            },
+            EDGE,
+            SIDEBAR.lerp_to_gamma(
+                color,
+                if dragging {
+                    0.26
+                } else if selected {
+                    0.18
+                } else {
+                    0.07
+                },
+            ),
         );
+    }
+    if selected || dragging {
+        // Selection is marked by shape as well as colour.
+        let marker = egui::Rect::from_min_size(rect.min, Vec2::new(3.0, rect.height()));
+        ui.painter().rect_filled(marker, 0, color);
     }
     if response.has_focus() || dragging {
         ui.painter().rect_stroke(
             rect,
-            8.0,
-            egui::Stroke::new(1.0_f32, ACCENT),
+            EDGE,
+            egui::Stroke::new(1.0_f32, color),
             egui::StrokeKind::Inside,
         );
     }
@@ -3233,7 +3314,11 @@ fn nav_item(
         ui,
         rect.left_center() + Vec2::new(SIDEBAR_ICON_INSET + 10.0, 0.0),
         20.0,
-        if selected || dragging { ACCENT } else { MUTED },
+        if selected || dragging || tint.is_some() {
+            color
+        } else {
+            MUTED
+        },
     );
     ui.painter().with_clip_rect(rect.shrink(4.0)).text(
         rect.left_center() + Vec2::new(SIDEBAR_TEXT_INSET, 0.0),
@@ -3256,9 +3341,9 @@ enum PillStyle {
     Danger,
 }
 
-/// Labelled pill button following assets/buttons/button-primary.svg and
+/// Labelled square-edged button following assets/buttons/button-primary.svg and
 /// button-secondary.svg. When a row is too narrow for labels it can show only
-/// its icon in a round button; the label stays as tooltip and accessible name.
+/// its icon in a square button; the label stays as tooltip and accessible name.
 struct Pill<'a> {
     icon: Icon,
     label: &'a str,
@@ -3396,11 +3481,7 @@ impl egui::Widget for Pill<'_> {
         const ICON: f32 = Pill::ICON;
         const GAP: f32 = Pill::GAP;
         let height = self.height();
-        let radius = if self.style == PillStyle::Primary || self.tall || self.icon_only {
-            height / 2.0
-        } else {
-            14.0
-        };
+        let radius = f32::from(EDGE);
         let ink = self.ink();
         let galley = self.galley(ui);
         let width = self.width(ui);
@@ -3465,7 +3546,7 @@ impl egui::Widget for Pill<'_> {
     }
 }
 
-/// Circular icon-only button following assets/buttons/button-icon.svg. The
+/// Square icon-only button following assets/buttons/button-icon.svg. The
 /// label is announced to assistive technology and shown as a tooltip.
 struct IconButton<'a> {
     icon: Icon,
@@ -3502,7 +3583,6 @@ impl egui::Widget for IconButton<'_> {
             egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), self.label)
         });
         if ui.is_rect_visible(rect) {
-            let radius = self.size / 2.0;
             let fill = if self.active {
                 if response.hovered() {
                     Color32::from_rgb(39, 72, 114)
@@ -3513,12 +3593,13 @@ impl egui::Widget for IconButton<'_> {
                 control_fill(&response)
             };
             let ink = if self.active { ACCENT } else { TEXT };
-            ui.painter().circle_filled(rect.center(), radius, fill);
+            ui.painter().rect_filled(rect, EDGE, fill);
             if response.has_focus() {
-                ui.painter().circle_stroke(
-                    rect.center(),
-                    radius + 3.0,
+                ui.painter().rect_stroke(
+                    rect.expand(3.0),
+                    EDGE,
                     egui::Stroke::new(2.0_f32, ACCENT),
+                    egui::StrokeKind::Middle,
                 );
             }
             self.icon
@@ -3530,7 +3611,116 @@ impl egui::Widget for IconButton<'_> {
     }
 }
 
-/// Centered circular primary Play/Pause button for compact picture-in-picture playback.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Caption {
+    Minimize,
+    Maximize,
+    Restore,
+    Close,
+}
+
+/// A Windows 11 caption button: a flat 46 × 32 cell with a thin 10-point
+/// glyph, a faint wash on hover and the system red behind Close.
+struct CaptionButton<'a> {
+    glyph: Caption,
+    label: &'a str,
+}
+
+impl<'a> CaptionButton<'a> {
+    const WIDTH: f32 = 46.0;
+    const HEIGHT: f32 = 32.0;
+
+    fn new(glyph: Caption, label: &'a str) -> Self {
+        Self { glyph, label }
+    }
+}
+
+impl egui::Widget for CaptionButton<'_> {
+    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
+        let (rect, response) =
+            ui.allocate_exact_size(Vec2::new(Self::WIDTH, Self::HEIGHT), egui::Sense::click());
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), self.label)
+        });
+        if ui.is_rect_visible(rect) {
+            let pressed = response.is_pointer_button_down_on();
+            let hovered = response.hovered() || response.has_focus();
+            let close = self.glyph == Caption::Close;
+            let fill = match (close, pressed, hovered) {
+                (true, true, _) => Color32::from_rgb(148, 20, 30),
+                (true, false, true) => Color32::from_rgb(196, 43, 28),
+                (false, true, _) => Color32::from_white_alpha(10),
+                (false, false, true) => Color32::from_white_alpha(15),
+                _ => Color32::TRANSPARENT,
+            };
+            let painter = ui.painter();
+            painter.rect_filled(rect, 0, fill);
+            if response.has_focus() {
+                painter.rect_stroke(
+                    rect.shrink(1.0),
+                    0,
+                    egui::Stroke::new(2.0_f32, ACCENT),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            let ink = if close && (pressed || hovered) {
+                Color32::WHITE
+            } else {
+                TEXT
+            };
+            let stroke = egui::Stroke::new(1.0_f32, ink);
+            let c = rect.center();
+            let half = 5.0;
+            match self.glyph {
+                Caption::Minimize => {
+                    painter.hline(c.x - half..=c.x + half, c.y, stroke);
+                }
+                Caption::Maximize => {
+                    painter.rect_stroke(
+                        egui::Rect::from_center_size(c, Vec2::splat(2.0 * half)),
+                        1,
+                        stroke,
+                        egui::StrokeKind::Middle,
+                    );
+                }
+                Caption::Restore => {
+                    let front = egui::Rect::from_min_size(
+                        c + Vec2::new(-half, -half + 2.0),
+                        Vec2::splat(2.0 * half - 2.0),
+                    );
+                    painter.rect_stroke(front, 1, stroke, egui::StrokeKind::Middle);
+                    // The rear window shows only above and to the right of the front one.
+                    let top = c.y - half;
+                    let right = c.x + half;
+                    painter.line_segment(
+                        [egui::pos2(front.left() + 2.0, top), egui::pos2(right, top)],
+                        stroke,
+                    );
+                    painter.line_segment(
+                        [
+                            egui::pos2(right, top),
+                            egui::pos2(right, front.bottom() - 2.0),
+                        ],
+                        stroke,
+                    );
+                }
+                Caption::Close => {
+                    painter.line_segment(
+                        [c + Vec2::new(-half, -half), c + Vec2::new(half, half)],
+                        stroke,
+                    );
+                    painter.line_segment(
+                        [c + Vec2::new(half, -half), c + Vec2::new(-half, half)],
+                        stroke,
+                    );
+                }
+            }
+        }
+        response.on_hover_text(self.label)
+    }
+}
+
+/// Centered square primary Play/Pause button for compact picture-in-picture playback.
 struct MiniPlayButton<'a> {
     icon: Icon,
     label: &'a str,
@@ -3544,7 +3734,6 @@ impl egui::Widget for MiniPlayButton<'_> {
             egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), self.label)
         });
         if ui.is_rect_visible(rect) {
-            let radius = self.size / 2.0;
             let fill = if response.is_pointer_button_down_on() {
                 Color32::from_rgb(212, 212, 219)
             } else if response.hovered() {
@@ -3553,13 +3742,14 @@ impl egui::Widget for MiniPlayButton<'_> {
                 Color32::WHITE
             };
             ui.painter()
-                .circle_filled(rect.center(), radius + 4.0, Color32::from_black_alpha(96));
-            ui.painter().circle_filled(rect.center(), radius, fill);
+                .rect_filled(rect.expand(4.0), EDGE, Color32::from_black_alpha(96));
+            ui.painter().rect_filled(rect, EDGE, fill);
             if response.has_focus() {
-                ui.painter().circle_stroke(
-                    rect.center(),
-                    radius + 3.0,
+                ui.painter().rect_stroke(
+                    rect.expand(3.0),
+                    EDGE,
                     egui::Stroke::new(2.0_f32, ACCENT),
+                    egui::StrokeKind::Middle,
                 );
             }
             self.icon.paint(
@@ -3629,7 +3819,7 @@ fn popover_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(PANEL)
         .stroke((1.0, Color32::from_rgb(42, 42, 46)))
-        .corner_radius(14)
+        .corner_radius(EDGE)
         .inner_margin(16)
         .shadow(egui::epaint::Shadow {
             offset: [0, 16],

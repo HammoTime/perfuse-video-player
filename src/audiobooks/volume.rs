@@ -24,7 +24,7 @@ impl App {
                 egui::RectAlign::BOTTOM_START
             })
             .gap(8.0)
-            .frame(popover_frame().inner_margin(12).corner_radius(12))
+            .frame(popover_frame().inner_margin(12))
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
         let escape = popup.is_open() && ui.input(|i| i.key_pressed(egui::Key::Escape));
         let shown = popup

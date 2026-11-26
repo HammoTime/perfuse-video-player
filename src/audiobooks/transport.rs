@@ -24,10 +24,14 @@ pub(super) fn book_icon(
     } else {
         Color32::TRANSPARENT
     };
-    ui.painter().circle_filled(rect.center(), size * 0.5, fill);
+    ui.painter().rect_filled(rect, EDGE, fill);
     if response.has_focus() {
-        ui.painter()
-            .circle_stroke(rect.center(), size * 0.5 + 3.0, (2.0, ACCENT));
+        ui.painter().rect_stroke(
+            rect.expand(3.0),
+            EDGE,
+            (2.0, ACCENT),
+            egui::StrokeKind::Middle,
+        );
     }
     icon.paint(
         ui,
@@ -406,7 +410,7 @@ impl App {
                     ui.spacing_mut().item_spacing.y = 12.0;
                     egui::Frame::new()
                         .fill(Color32::from_rgb(20, 20, 23))
-                        .corner_radius(12)
+                        .corner_radius(EDGE)
                         .inner_margin(4)
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
@@ -430,7 +434,7 @@ impl App {
                                                     .color(if selected { TEXT } else { MUTED }),
                                             )
                                             .min_size(Vec2::new(tab_width, 36.0))
-                                            .corner_radius(9)
+                                            .corner_radius(EDGE)
                                             .stroke(egui::Stroke::NONE)
                                             .selected(selected)
                                             .fill(
@@ -855,7 +859,7 @@ fn tool_button(
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
     });
     let ink = if active { TOOL_ON_TEXT } else { TEXT };
-    let rounding = rect.height() * 0.5;
+    let rounding = f32::from(EDGE);
     ui.painter().rect_filled(
         rect,
         rounding,
@@ -906,7 +910,7 @@ fn choice_menu(
         })
         .gap(8.0)
         .width(200.0)
-        .frame(popover_frame().corner_radius(12).inner_margin(6));
+        .frame(popover_frame().inner_margin(6));
     let mut picked = None;
     let shown = popup
         .show(|ui| {
@@ -965,12 +969,12 @@ fn choice_menu(
                             node.set_role(egui::accesskit::Role::MenuItemRadio)
                         });
                         if response.hovered() {
-                            ui.painter().rect_filled(rect, 8.0, CONTROL);
+                            ui.painter().rect_filled(rect, EDGE, CONTROL);
                         }
                         if keyboard_focus && response.has_focus() {
                             ui.painter().rect_stroke(
                                 rect,
-                                8.0,
+                                EDGE,
                                 (2.0, ACCENT),
                                 egui::StrokeKind::Inside,
                             );
