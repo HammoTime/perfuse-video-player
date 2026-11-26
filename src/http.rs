@@ -17,8 +17,7 @@ pub fn base_url(server: &str) -> Result<Url, String> {
         || base.path() != "/"
     {
         return Err(
-            "Use a server origin, e.g. http://192.168.1.10:32400, without a path or credentials."
-                .into(),
+            "Enter an HTTP or HTTPS server address without a path, query or credentials.".into(),
         );
     }
     Ok(base)

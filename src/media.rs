@@ -149,6 +149,7 @@ pub struct Playback {
 
 #[derive(Clone, Copy)]
 pub enum PlaybackState {
+    Started,
     Playing,
     Paused,
     Stopped,

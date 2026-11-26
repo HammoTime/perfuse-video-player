@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod connection;
 mod icons;
 mod mpv;
 mod player;
@@ -18,7 +19,10 @@ use eframe::egui::{self, Color32, RichText, Vec2};
 use icons::Icon;
 use perfuse::{
     media::{Browse, Item, Kind, Library, Page, Source, Stream},
-    plugins::plex::{self, auth},
+    plugins::{
+        ServerKind,
+        plex::{self, auth},
+    },
 };
 use std::{
     collections::HashMap,
@@ -104,6 +108,7 @@ struct Location {
 
 enum Reply {
     Connected(Source, Vec<Library>, session::Session),
+    QuickConnectCode(String),
     /// A page plus optional Home Continue Watching and Recently Released rows.
     Page {
         page: Page,
@@ -149,11 +154,15 @@ struct App {
     active: Option<usize>,
     overview: bool,
     adding: bool,
-    removing: Option<usize>,
+    removing: Option<(usize, egui::Id)>,
     next_health_check: Instant,
-    status_popover: servers::StatusPopover,
+    status_popover: servers::HoverPopover,
     server: String,
     token: String,
+    form: connection::Form,
+    username: String,
+    password: String,
+    quick_code: Option<String>,
     client_id: String,
     source: Option<Source>,
     sections: Vec<Library>,
@@ -198,7 +207,6 @@ struct App {
     speed: f64,
     login: Option<auth::Login>,
     login_url: Option<String>,
-    available_servers: Vec<auth::Server>,
     remember: bool,
     runtime_rx: Option<Receiver<runtime::Update>>,
     runtime_prompt: Option<RuntimePrompt>,
@@ -219,7 +227,11 @@ impl App {
         icons::install(ctx);
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = Color32::BLACK;
-        visuals.window_fill = PANEL;
+        let popup = popover_frame();
+        visuals.window_fill = popup.fill;
+        visuals.window_stroke = popup.stroke;
+        visuals.menu_corner_radius = popup.corner_radius;
+        visuals.popup_shadow = popup.shadow;
         visuals.override_text_color = Some(TEXT);
         visuals.selection.bg_fill = Color32::from_rgb(24, 49, 82);
         visuals.selection.stroke.color = ACCENT;
@@ -238,6 +250,7 @@ impl App {
         ctx.set_visuals(visuals);
         ctx.style_mut(|style| {
             style.spacing.item_spacing = Vec2::new(14.0, 14.0);
+            style.spacing.menu_margin = popup.inner_margin;
             style.spacing.button_padding = Vec2::new(16.0, 12.0);
             style
                 .text_styles
@@ -255,10 +268,14 @@ impl App {
             adding: false,
             removing: None,
             next_health_check: Instant::now() + Duration::from_secs(60),
-            status_popover: servers::StatusPopover::default(),
+            status_popover: servers::HoverPopover::default(),
             server: std::env::var("PLEX_URL")
                 .unwrap_or_else(|_| plex::PLUGIN.default_address.into()),
-            token: std::env::var("PLEX_TOKEN").unwrap_or_default(),
+            token: String::new(),
+            form: connection::Form::default(),
+            username: String::new(),
+            password: String::new(),
+            quick_code: None,
             client_id: format!(
                 "perfuse-{}-{}",
                 std::process::id(),
@@ -310,7 +327,6 @@ impl App {
             speed: 1.0,
             login: None,
             login_url: None,
-            available_servers: vec![],
             remember: cfg!(windows),
             runtime_rx: None,
             runtime_prompt: None,
@@ -350,17 +366,23 @@ impl App {
                 return;
             }
         };
-        let single = sessions.len() == 1;
+        let single_plex = sessions
+            .iter()
+            .filter(|s| s.kind == ServerKind::Plex)
+            .count()
+            == 1;
         for mut saved in sessions {
-            let matches = session::origin(&saved.server) == session::origin(&self.server);
-            if std::env::var_os("PLEX_URL").is_some() && !matches {
-                continue;
-            }
-            if let Ok(token) = std::env::var("PLEX_TOKEN") {
-                if !matches && !single {
+            if saved.kind == ServerKind::Plex {
+                let matches = session::origin(&saved.server) == session::origin(&self.server);
+                if std::env::var_os("PLEX_URL").is_some() && !matches {
                     continue;
                 }
-                saved.token = token;
+                if let Ok(token) = std::env::var("PLEX_TOKEN") {
+                    if !matches && !single_plex {
+                        continue;
+                    }
+                    saved.token = token;
+                }
             }
             if let Ok(source) = session::open(&saved) {
                 self.client_id = saved.client_id.clone();
@@ -423,8 +445,10 @@ impl App {
                 }
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
-                    let confirm = ui.add(egui::Button::new(confirm_label).fill(CONTROL_PRESSED)).clicked();
-                    let cancel = ui.button(if first_run { "Decline and exit" } else { "Cancel" }).clicked();
+                    let (accept, cancel) = Pill::pair(ui, Pill::primary(Icon::Check, confirm_label),
+                        Pill::secondary(Icon::Cancel, if first_run { "Decline and exit" } else { "Cancel" }));
+                    let confirm = ui.add(accept).clicked();
+                    let cancel = ui.add(cancel).clicked();
                     (confirm, cancel)
                 }).inner
             });
@@ -481,35 +505,6 @@ impl App {
         // Any earlier artwork worker is cancelled with its generation.
         self.covers.loading = false;
         self.generation.fetch_add(1, Ordering::Relaxed) + 1
-    }
-
-    fn connect(&mut self, ctx: &egui::Context) {
-        if self
-            .servers
-            .iter()
-            .any(|s| session::origin(&self.server) == session::origin(&s.session.server))
-        {
-            self.error = Some("This server has already been added.".into());
-            return;
-        }
-        let generation = self.begin();
-        let session = session::Session {
-            server: self.server.clone(),
-            token: self.token.clone(),
-            client_id: self.client_id.clone(),
-        };
-        let (tx, ctx) = (self.tx.clone(), ctx.clone());
-        thread::spawn(move || {
-            let result = session::open(&session)
-                .and_then(|source| {
-                    source
-                        .libraries()
-                        .map(|sections| Reply::Connected(source, sections, session))
-                })
-                .unwrap_or_else(Reply::Failed);
-            let _ = tx.send((generation, result));
-            ctx.request_repaint();
-        });
     }
 
     fn load_page(&mut self, ctx: &egui::Context, recently_added_only: bool) {
@@ -725,41 +720,9 @@ impl App {
                 continue;
             }
             match reply {
+                Reply::QuickConnectCode(code) => self.quick_code = Some(code),
                 Reply::Connected(source, sections, session) => {
-                    self.busy = false;
-                    let save_error = if self.remember {
-                        session::save(&session).err()
-                    } else {
-                        None
-                    };
-                    let mut entry = Server::new(
-                        session,
-                        source,
-                        sections,
-                        self.remember && save_error.is_none(),
-                    );
-                    if entry.prefs.name.is_empty()
-                        && let Some(discovered) = self.available_servers.iter().find(|s| {
-                            s.connections.iter().any(|c| {
-                                session::origin(&c.uri) == session::origin(&entry.session.server)
-                            })
-                        })
-                    {
-                        entry.prefs.name = discovered.name.clone();
-                    }
-                    entry.prefs.position = self.servers.len();
-                    entry.persist();
-                    entry.check(ctx);
-                    self.servers.push(entry);
-                    self.activate(self.servers.len() - 1);
-                    self.overview = true;
-                    self.adding = false;
-                    self.connection_open = false;
-                    self.token.clear();
-                    self.available_servers.clear();
-                    if let Some(error) = save_error {
-                        self.error = Some(error);
-                    }
+                    self.connected(ctx, source, sections, session);
                 }
                 Reply::Page {
                     page,
@@ -800,6 +763,8 @@ impl App {
                 Reply::ArtworkDone => self.covers.loading = false,
                 Reply::Failed(error) => {
                     self.busy = false;
+                    self.quick_code = None;
+                    self.form.pending.clear();
                     self.covers.loading = false;
                     self.error = Some(error);
                 }
@@ -827,35 +792,7 @@ impl App {
                     if servers.is_empty() {
                         self.error = Some("Signed in, but Plex returned no compatible movie or TV servers for this account.".into());
                     } else {
-                        let matching = servers.iter().find_map(|server| {
-                            server
-                                .connections
-                                .iter()
-                                .find(|connection| {
-                                    reqwest::Url::parse(&connection.uri).ok()
-                                        == reqwest::Url::parse(&self.server).ok()
-                                })
-                                .map(|c| {
-                                    (
-                                        c.uri.clone(),
-                                        server.access_token.clone().unwrap_or_default(),
-                                    )
-                                })
-                        });
-                        let selected = matching.or_else(|| {
-                            (servers.len() == 1).then(|| {
-                                (
-                                    servers[0].connections[0].uri.clone(),
-                                    servers[0].access_token.clone().unwrap_or_default(),
-                                )
-                            })
-                        });
-                        self.available_servers = servers;
-                        if let Some((server, token)) = selected {
-                            self.server = server;
-                            self.token = token;
-                            self.connect(ctx);
-                        }
+                        self.offer_plex_servers(servers);
                     }
                 }
             }
@@ -901,116 +838,11 @@ impl App {
             }
             match result {
                 Ok(()) => {
-                    // Re-fetch on the next opening so resume uses Plex's latest saved position.
+                    // Re-fetch on the next opening to get the server's latest saved position.
                     self.detail = None;
                 }
                 Err(error) => self.error = Some(error),
             }
-        }
-    }
-
-    fn connection_fields(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        if self.login.is_some() {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("Finish signing in in your browser…");
-            });
-            if let Some(url) = &self.login_url {
-                ui.hyperlink_to("Open Plex sign-in again", url);
-            }
-            if ui
-                .add(Pill::secondary(Icon::Cancel, "Cancel sign-in"))
-                .clicked()
-            {
-                self.login = None;
-                self.login_url = None;
-            }
-        } else if ui
-            .add_enabled(
-                !self.busy && self.player.is_none(),
-                Pill::primary(Icon::ServerPlex, "Sign in with Plex").min_width(210.0),
-            )
-            .clicked()
-        {
-            self.error = None;
-            self.available_servers.clear();
-            self.login = Some(auth::Login::start(self.client_id.clone()));
-        }
-        ui.label(
-            RichText::new("Sign in securely in your browser, then choose your server.")
-                .small()
-                .color(MUTED),
-        );
-        ui.add_enabled(
-            cfg!(windows) && !self.busy,
-            egui::Checkbox::new(&mut self.remember, "Remember me on this computer"),
-        );
-        ui.label(
-            RichText::new("Remembered sign-ins are stored in Windows Credential Manager.")
-                .small()
-                .color(MUTED),
-        );
-        let mut selected = None;
-        for (index, server) in self.available_servers.iter().enumerate() {
-            ui.add_space(10.0);
-            if self.servers.iter().any(|s| {
-                server
-                    .connections
-                    .iter()
-                    .any(|c| session::origin(&c.uri) == session::origin(&s.session.server))
-            }) {
-                ui.label(format!("{} · Already added", server.name));
-                continue;
-            }
-            if ui
-                .add_enabled(
-                    !self.busy,
-                    Pill::secondary(Icon::Connect, &format!("Connect to {}", server.name)),
-                )
-                .clicked()
-            {
-                selected = Some((
-                    server.connections[0].uri.clone(),
-                    server.access_token.clone().unwrap_or_default(),
-                ));
-            }
-            ui.push_id(index, |ui| {
-                ui.collapsing("Other server addresses", |ui| {
-                    for connection in &server.connections {
-                        if ui
-                            .add_enabled(!self.busy, Pill::secondary(Icon::Server, &connection.uri))
-                            .clicked()
-                        {
-                            selected = Some((
-                                connection.uri.clone(),
-                                server.access_token.clone().unwrap_or_default(),
-                            ));
-                        }
-                    }
-                });
-            });
-        }
-        if let Some((server, token)) = selected {
-            self.server = server;
-            self.token = token;
-            self.connect(ctx);
-        }
-        ui.add_space(10.0);
-        ui.collapsing("Manual server connection", |ui| {
-            ui.add_enabled_ui(!self.busy && self.login.is_none(), |ui| {
-                let server_label = ui.label("Plex server");
-                ui.add(egui::TextEdit::singleline(&mut self.server).desired_width(400.0).hint_text("http://192.168.1.10:32400")).labelled_by(server_label.id);
-                let token_label = ui.label("Plex token");
-                ui.add(egui::TextEdit::singleline(&mut self.token).password(true).desired_width(400.0)).labelled_by(token_label.id);
-                if ui.add(Pill::secondary(Icon::Connect, "Connect to server")).clicked() { self.connect(ctx); }
-            });
-            ui.hyperlink_to("How to find a Plex token", "https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/");
-        });
-        if self.busy {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("Connecting…");
-            });
         }
     }
 
@@ -1243,16 +1075,17 @@ impl App {
         let mut sections = self.servers[i].libraries();
         let mut requested_sort = None;
         control_row(ui, 28.0, |ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            self.group_heading(ui, i, ctx);
-            if sections.len() > 1 && self.servers[i].online {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let sort_btn = ui.add(
-                        IconButton::new(Icon::Sort, "Sort libraries")
-                            .size(24.0)
-                            .active(self.servers[i].prefs.sort != prefs::LibrarySort::Server),
-                    );
-                    egui::Popup::menu(&sort_btn).show(|ui| {
+            let show_sort = sections.len() > 1 && self.servers[i].online;
+            self.group_heading(ui, i, ctx, show_sort);
+            if show_sort {
+                let sort_btn = ui.add(
+                    IconButton::new(Icon::Sort, "Sort libraries")
+                        .size(24.0)
+                        .active(self.servers[i].prefs.sort != prefs::LibrarySort::Server),
+                );
+                egui::Popup::menu(&sort_btn)
+                    .frame(popover_frame())
+                    .show(|ui| {
                         for (mode, label) in [
                             (prefs::LibrarySort::Server, "Server order"),
                             (prefs::LibrarySort::NameAsc, "Name (A–Z)"),
@@ -1276,7 +1109,6 @@ impl App {
                                 .color(MUTED),
                         );
                     });
-                });
             }
         });
         let mut pending_move: Option<(usize, usize)> = None;
@@ -1556,14 +1388,16 @@ impl App {
             });
         });
         if let Some(i) = self.active {
+            let server = &self.servers[i];
+            let kind = server.session.kind.plugin().name;
             ui.horizontal(|ui| {
-                ui.add(Icon::ServerPlex.image(15.0, MUTED));
+                ui.add(server.icon().image(15.0, MUTED));
                 ui.colored_label(
                     MUTED,
                     if home {
-                        format!("Plex server · {} libraries", self.sections.len())
+                        format!("{kind} server · {} libraries", self.sections.len())
                     } else {
-                        format!("Plex / {}", self.servers[i].name())
+                        format!("{kind} / {}", server.name())
                     },
                 );
             });
@@ -1620,7 +1454,7 @@ impl App {
         }
         if self.sections.is_empty() {
             ui.heading("No movie or TV libraries available");
-            ui.label("Check this user's access in Plex, then reconnect in settings.");
+            ui.label("Check this user's library access on the server, then reconnect in settings.");
             return;
         }
         let mut picked = None;
@@ -2046,14 +1880,7 @@ impl App {
                     icon.image(16.0, if active { ACCENT } else { MUTED }),
                     RichText::new(text).size(15.0).color(color),
                 )
-                .min_size(Vec2::new(
-                    if tab == SettingsTab::Updates {
-                        154.0
-                    } else {
-                        104.0
-                    },
-                    38.0,
-                ))
+                .min_size(Vec2::new(154.0, 38.0))
                 .frame(false);
                 let response = ui.add(button);
                 response.widget_info(|| {
@@ -2148,12 +1975,17 @@ impl App {
                     }
                 });
                 ui.horizontal_wrapped(|ui| {
+                    let (check, update) = Pill::pair(
+                        ui,
+                        Pill::secondary(Icon::Refresh, "Check for Perfuse updates"),
+                        Pill::secondary(Icon::Refresh, "Update Perfuse"),
+                    );
                     if ui
                         .add_enabled(
                             cfg!(all(windows, target_arch = "x86_64"))
                                 && !self.client_updates.busy()
                                 && self.client_after_runtime.is_none(),
-                            egui::Button::new("Check for Perfuse updates"),
+                            check,
                         )
                         .clicked()
                     {
@@ -2164,7 +1996,7 @@ impl App {
                         && ui
                             .add_enabled(
                                 self.runtime_rx.is_none() && !self.client_updates.busy(),
-                                egui::Button::new("Update Perfuse"),
+                                update,
                             )
                             .clicked()
                     {
@@ -2211,11 +2043,12 @@ impl App {
             ui.add_space(16.0);
             let idle = self.runtime_rx.is_none() && self.player.is_none();
             ui.horizontal_wrapped(|ui| {
-                if ui.add_enabled(idle && cfg!(windows), egui::Button::new("Check for Updates")).clicked() {
+                let (check, update) = Pill::pair(ui, Pill::secondary(Icon::Refresh, "Check for Updates"), Pill::secondary(Icon::Refresh, "Update"));
+                if ui.add_enabled(idle && cfg!(windows), check).clicked() {
                     self.dismissed_updates = None;
                     self.check_runtime(ctx);
                 }
-                if ui.add_enabled(idle && !self.client_updates.downloading && cfg!(windows) && !overridden && self.runtime_available.is_some(), egui::Button::new("Update")).clicked() {
+                if ui.add_enabled(idle && !self.client_updates.downloading && cfg!(windows) && !overridden && self.runtime_available.is_some(), update).clicked() {
                     self.update_available(ctx, false);
                 }
             });
@@ -2693,7 +2526,7 @@ impl App {
                                 let speed = ui
                                     .add(Pill::secondary(Icon::Speed, &format!("{}×", self.speed)))
                                     .on_hover_text("Playback speed");
-                                egui::Popup::menu(&speed).show(|ui| {
+                                egui::Popup::menu(&speed).frame(popover_frame()).show(|ui| {
                                     for speed in [0.5, 0.75, 1.0, 1.25, 1.5, 2.0] {
                                         if ui
                                             .selectable_value(
@@ -2842,7 +2675,11 @@ impl eframe::App for App {
         if self.source.is_some() && self.player.is_none() {
             self.sidebar(ctx);
         }
-        if !mini && (self.error.is_some() || self.notice.is_some() || self.runtime_status.is_some())
+        let show_global_error = self.source.is_some() && !self.adding;
+        if !mini
+            && ((show_global_error && self.error.is_some())
+                || self.notice.is_some()
+                || self.runtime_status.is_some())
         {
             egui::TopBottomPanel::bottom("messages")
                 .frame(
@@ -2865,7 +2702,7 @@ impl eframe::App for App {
                             }
                         });
                     }
-                    if let Some(error) = self.error.clone() {
+                    if show_global_error && let Some(error) = self.error.clone() {
                         ui.horizontal_wrapped(|ui| {
                             ui.add(Icon::Alert.image(18.0, ERROR_TEXT));
                             ui.colored_label(ERROR_TEXT, error);
@@ -2953,46 +2790,7 @@ impl eframe::App for App {
                     let rect = ui.available_rect_before_wrap();
                     ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
                 } else if self.source.is_none() {
-                    // Short windows tighten the card so discovered servers stay in view.
-                    let roomy = ui.available_height() > 640.0;
-                    let space =
-                        |roomy_space: f32, compact: f32| if roomy { roomy_space } else { compact };
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        ui.add_space(space(32.0, 4.0));
-                        ui.horizontal(|ui| {
-                            ui.add_space((ui.available_width() - 480.0).max(0.0) / 2.0);
-                            egui::Frame::new()
-                                .fill(PANEL)
-                                .corner_radius(26)
-                                .inner_margin(space(42.0, 28.0) as i8)
-                                .show(ui, |ui| {
-                                    // A frame inherits its parent's layout; the centering row
-                                    // is horizontal, while the card's contents must stack.
-                                    ui.vertical(|ui| {
-                                        ui.set_width(420.0);
-                                        ui.horizontal(|ui| {
-                                            ui.add(Icon::Mark.image(38.0, Color32::WHITE));
-                                            ui.label(
-                                                RichText::new("PERFUSE")
-                                                    .size(38.0)
-                                                    .strong()
-                                                    .color(ACCENT),
-                                            );
-                                        });
-                                        ui.add_space(space(20.0, 10.0));
-                                        ui.heading("Make yourself at home.");
-                                        ui.label(
-                                            RichText::new(
-                                                "Connect a Plex server to watch your films and shows. You can add more servers later.",
-                                            )
-                                            .color(MUTED),
-                                        );
-                                        ui.add_space(space(34.0, 18.0));
-                                        self.connection_fields(ui, ctx);
-                                    });
-                                });
-                        });
-                    });
+                    self.onboarding(ui, ctx);
                 } else {
                     egui::Frame::new().show(ui, |ui| {
                         ui.set_min_size(ui.available_size());
@@ -3200,13 +2998,20 @@ fn nav_item(
     response
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PillStyle {
+    Primary,
+    Secondary,
+    Danger,
+}
+
 /// Labelled pill button following assets/buttons/button-primary.svg and
 /// button-secondary.svg. When a row is too narrow for labels it can show only
 /// its icon in a round button; the label stays as tooltip and accessible name.
 struct Pill<'a> {
     icon: Icon,
     label: &'a str,
-    primary: bool,
+    style: PillStyle,
     trailing: bool,
     tall: bool,
     icon_only: bool,
@@ -3221,7 +3026,7 @@ impl<'a> Pill<'a> {
         Self {
             icon,
             label,
-            primary: true,
+            style: PillStyle::Primary,
             trailing: false,
             tall: false,
             icon_only: false,
@@ -3231,8 +3036,15 @@ impl<'a> Pill<'a> {
 
     fn secondary(icon: Icon, label: &'a str) -> Self {
         Self {
-            primary: false,
+            style: PillStyle::Secondary,
             ..Self::primary(icon, label)
+        }
+    }
+
+    fn danger(icon: Icon, label: &'a str) -> Self {
+        Self {
+            style: PillStyle::Danger,
+            ..Self::secondary(icon, label)
         }
     }
 
@@ -3255,8 +3067,8 @@ impl<'a> Pill<'a> {
     /// Gives two side-by-side buttons one size: the wider width, and the
     /// primary height when either is primary.
     fn pair(ui: &egui::Ui, first: Self, second: Self) -> (Self, Self) {
-        let width = first.natural_width(ui).max(second.natural_width(ui));
-        let tall = first.primary || second.primary;
+        let width = first.width(ui).max(second.width(ui));
+        let tall = first.height().max(second.height()) == 44.0;
         let even = |pill: Self| Self {
             tall,
             ..pill.min_width(width)
@@ -3276,7 +3088,7 @@ impl<'a> Pill<'a> {
     }
 
     fn height(&self) -> f32 {
-        if self.primary || self.tall {
+        if self.style == PillStyle::Primary || self.tall {
             44.0
         } else {
             36.0
@@ -3284,16 +3096,29 @@ impl<'a> Pill<'a> {
     }
 
     fn padding(&self) -> f32 {
-        if self.primary { 20.0 } else { 14.0 }
+        if self.style == PillStyle::Primary {
+            20.0
+        } else {
+            14.0
+        }
     }
 
     fn ink(&self) -> Color32 {
-        if self.primary { Color32::BLACK } else { TEXT }
+        match self.style {
+            PillStyle::Primary => Color32::BLACK,
+            PillStyle::Secondary => TEXT,
+            PillStyle::Danger => Color32::from_rgb(255, 217, 212),
+        }
     }
 
     fn galley(&self, ui: &egui::Ui) -> std::sync::Arc<egui::Galley> {
         let text = RichText::new(self.label).color(self.ink());
-        egui::WidgetText::from(if self.primary { text.strong() } else { text }).into_galley(
+        egui::WidgetText::from(if self.style == PillStyle::Primary {
+            text.strong()
+        } else {
+            text
+        })
+        .into_galley(
             ui,
             Some(egui::TextWrapMode::Truncate),
             (ui.available_width() - 2.0 * self.padding() - Self::ICON - Self::GAP).max(0.0),
@@ -3320,7 +3145,7 @@ impl egui::Widget for Pill<'_> {
         const ICON: f32 = Pill::ICON;
         const GAP: f32 = Pill::GAP;
         let height = self.height();
-        let radius = if self.primary || self.tall || self.icon_only {
+        let radius = if self.style == PillStyle::Primary || self.tall || self.icon_only {
             height / 2.0
         } else {
             14.0
@@ -3335,7 +3160,15 @@ impl egui::Widget for Pill<'_> {
         });
         if ui.is_rect_visible(rect) {
             let pressed = response.is_pointer_button_down_on();
-            let fill = if !self.primary {
+            let fill = if self.style == PillStyle::Danger {
+                if pressed {
+                    Color32::from_rgb(73, 23, 21)
+                } else if response.hovered() {
+                    Color32::from_rgb(116, 39, 31)
+                } else {
+                    Color32::from_rgb(90, 31, 28)
+                }
+            } else if self.style == PillStyle::Secondary {
                 control_fill(&response)
             } else if pressed {
                 Color32::from_rgb(212, 212, 219)
@@ -3541,6 +3374,19 @@ fn resize_cursor(direction: egui::ResizeDirection) -> egui::CursorIcon {
     }
 }
 
+fn popover_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(PANEL)
+        .stroke((1.0, Color32::from_rgb(42, 42, 46)))
+        .corner_radius(14)
+        .inner_margin(16)
+        .shadow(egui::epaint::Shadow {
+            offset: [0, 16],
+            blur: 40,
+            spread: 0,
+            color: Color32::from_black_alpha(140),
+        })
+}
 fn control_fill(response: &egui::Response) -> Color32 {
     if response.is_pointer_button_down_on() {
         CONTROL_PRESSED
@@ -3711,7 +3557,7 @@ fn released_card(ui: &mut egui::Ui, item: &Item, covers: &Artwork) -> bool {
     clicked
 }
 
-/// Formats Plex's `YYYY-MM-DD` as e.g. `20 Nov 2026`.
+/// Formats a `YYYY-MM-DD` release date as e.g. `20 Nov 2026`.
 fn release_date(date: &str) -> Option<String> {
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",

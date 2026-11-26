@@ -126,6 +126,10 @@ fn installed_libraries_and_update_availability() {
     harness.run_steps(2);
     harness.get_by_label("Update").scroll_to_me();
     harness.run_steps(3);
+    assert_eq!(
+        harness.get_by_label("Check for Updates").rect().size(),
+        harness.get_by_label("Update").rect().size()
+    );
     assert!(harness.query_by_label("3rd party libraries").is_some());
     assert!(harness.query_by_label("FFmpeg").is_some());
     assert!(harness.query_by_label("N-128766-gcd4e96eb3").is_some());
@@ -210,16 +214,164 @@ fn sidebar_shows_server_groups_and_connection_count() {
 }
 
 #[test]
+fn sidebar_actions_clear_the_scrollbar_when_libraries_overflow() {
+    let mut harness = library([860.0, 620.0], "movies");
+    let server = &mut harness.state_mut().servers[0];
+    server.prefs.name = "A long server name that must truncate before the actions".into();
+    server.sections.extend((3..30).map(|i| Library {
+        id: i.to_string(),
+        title: format!("Library {i}"),
+        kind: Kind::Movie,
+    }));
+    harness.run_steps(4);
+    let expand = harness.get_by_label("Collapse libraries").rect();
+    let sort = harness.get_by_label("Sort libraries").rect();
+    let right = harness.get_by_label("Servers & settings").rect().right();
+    assert_eq!(expand.size(), Vec2::splat(24.0));
+    assert_eq!(sort.size(), expand.size());
+    assert!((sort.left() - expand.right() - 4.0).abs() < 1.0);
+    assert!(right - sort.right() >= harness.ctx.style().spacing.scroll.bar_width + 4.0);
+    harness.get_by_label("Sort libraries").click();
+    harness.run_steps(3);
+    harness.get_by_label("Server order");
+}
+
+#[test]
+fn home_cards_reserve_the_library_row_and_overflow_opens_all_visible_libraries() {
+    let mut harness = library([860.0, 780.0], "movies");
+    let app = harness.state_mut();
+    app.overview = true;
+    app.servers[0].prefs.name = "Glass".into();
+    app.servers[0].prefs.collapsed = true;
+    app.servers[0].sections.clear();
+    let other = session::Session {
+        kind: ServerKind::Plex,
+        server: "http://127.0.0.1:0".into(),
+        token: "synthetic".into(),
+        client_id: "ui-test".into(),
+    };
+    let mut second = Server::new(other.clone(), fixture_source(&other.server), vec![], false);
+    second.prefs.name = "Archive".into();
+    app.servers.push(second);
+    harness.run_steps(4);
+    let next_top = |h: &Harness<'_, App>| {
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Archive")
+            .rect()
+            .top()
+    };
+    let empty_top = next_top(&harness);
+    let libraries = |names: &[&str]| {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| Library {
+                id: i.to_string(),
+                title: (*name).into(),
+                kind: Kind::Movie,
+            })
+            .collect::<Vec<_>>()
+    };
+    harness.state_mut().servers[0].sections = libraries(&["A", "B", "C"]);
+    harness.run_steps(3);
+    assert_eq!(empty_top, next_top(&harness));
+    assert!(
+        harness
+            .query_by_label("Show all libraries on Glass")
+            .is_none()
+    );
+    harness.get_by_label("C");
+    let names = [
+        "Documentary films from around the world",
+        "TV Shows",
+        "Music concerts",
+        "Kids",
+        "Hidden",
+    ];
+    let server = &mut harness.state_mut().servers[0];
+    server.sections = libraries(&names);
+    server.prefs.hidden = vec!["4".into()];
+    harness.run_steps(3);
+    assert_eq!(empty_top, next_top(&harness));
+    let more = harness.get_by_label("Show all libraries on Glass");
+    let first = harness.get_by_label(names[0]).rect();
+    let second = harness.get_by_label(names[1]).rect();
+    assert!(first.right() < second.left() && second.right() < more.rect().left());
+    assert_eq!(first.center().y, more.rect().center().y);
+    assert!(harness.query_by_label("Music concerts").is_none());
+    more.hover();
+    harness.run_steps(5);
+    harness.get_by_label("Libraries on Glass");
+    assert_eq!(harness.get_all_by_label(names[0]).count(), 2);
+    harness.get_by_label("Music concerts").hover();
+    harness.run_steps(3);
+    harness.get_by_label("Kids");
+    assert!(harness.query_by_label("Hidden").is_none());
+    harness.key_press(egui::Key::Escape);
+    harness.run_steps(3);
+    assert!(harness.query_by_label("Libraries on Glass").is_none());
+    harness.get_by_label("Show all libraries on Glass").focus();
+    harness.run_steps(3);
+    harness.get_by_label("Libraries on Glass");
+    harness.state_mut().servers[0].source = fixture_source("http://127.0.0.1:0");
+    harness.get_by_label("Music concerts").click();
+    harness.run_steps(3);
+    assert_eq!(harness.state().selected_library.as_deref(), Some("2"));
+}
+
+#[test]
+fn settings_action_pairs_match_and_remove_requires_confirmation() {
+    let mut harness = library([860.0, 620.0], "movies");
+    harness.state_mut().connection_open = true;
+    harness.state_mut().servers[0].prefs.name = "Glass".into();
+    harness.state_mut().servers[0].prefs.collapsed = true;
+    harness.run_steps(4);
+    assert_eq!(
+        harness.get_by_label("Movies").rect().size(),
+        harness.get_by_label("TV Shows").rect().size()
+    );
+    let check = harness.get_by_label("Check connection").rect();
+    let remove = harness.get_by_label("Remove server");
+    assert_eq!(check.size(), remove.rect().size());
+    assert!(check.right() < remove.rect().left());
+    remove.scroll_to_me();
+    harness.run_steps(4);
+    for dismiss in ["Cancel", "Escape", "Remove"] {
+        harness.get_by_label("Remove server").click();
+        harness.run_steps(4);
+        harness.get_by_label("Remove Glass?");
+        let cancel = harness.get_by_label("Cancel");
+        assert!(cancel.is_focused());
+        let confirm = harness.get_by_label("Remove");
+        assert_eq!(cancel.rect().size(), confirm.rect().size());
+        assert!(cancel.rect().right() < confirm.rect().left());
+        if dismiss == "Escape" {
+            harness.key_press(egui::Key::Escape);
+        } else {
+            harness.get_by_label(dismiss).click();
+        }
+        harness.run_steps(4);
+        assert!(harness.state().removing.is_none());
+        if dismiss == "Remove" {
+            harness.get_by_label("Make yourself at home.");
+        } else {
+            assert_eq!(harness.state().servers.len(), 1);
+            assert!(harness.get_by_label("Remove server").is_focused());
+        }
+    }
+}
+
+#[test]
 fn server_switch_discards_stale_items_and_cancel_keeps_both_servers() {
     let mut harness = library([1000.0, 720.0], "movies");
     let app = harness.state_mut();
     let second = "http://127.0.0.1:32500";
-    let source = fixture_source(second);
     let session = session::Session {
+        kind: ServerKind::Jellyfin,
         server: second.into(),
         token: "synthetic".into(),
         client_id: "ui-test".into(),
     };
+    let source = session::open(&session).unwrap();
     app.servers.push(Server::new(
         session,
         source.clone(),
@@ -245,9 +397,23 @@ fn server_switch_discards_stale_items_and_cancel_keeps_both_servers() {
     harness.get_by_label("Add server").click();
     harness.run_steps(3);
     assert!(harness.state().adding && harness.state().token.is_empty());
+    assert!(harness.get_by_label("Plex").is_focused());
+    assert!(harness.query_by_label("Server address").is_none());
+    harness.get_by_label("Jellyfin").click();
+    harness.run_steps(3);
+    harness.get_by_label("Connect to Jellyfin");
+    assert!(harness.get_by_label("Server address").is_focused());
+    harness.get_by_label("Back to server types").click();
+    harness.run_steps(3);
+    assert!(harness.get_by_label("Jellyfin").is_focused());
+    assert!(harness.query_by_label("Username").is_none());
+    harness.get_by_label("Plex").click();
+    harness.run_steps(3);
+    harness.get_by_label("Connect to Plex");
     harness.key_press(egui::Key::Escape);
     harness.run_steps(3);
     assert!(!harness.state().adding);
+    assert!(harness.get_by_label("Add server").is_focused());
     assert_eq!(harness.state().servers.len(), 2);
     assert!(Arc::ptr_eq(
         harness.state().source.as_ref().unwrap(),
@@ -295,6 +461,7 @@ fn each_server_home_opens_its_own_recently_added_view() {
         }
     });
     let session = session::Session {
+        kind: ServerKind::Plex,
         server: address.clone(),
         token: "synthetic".into(),
         client_id: "ui-test".into(),
@@ -389,6 +556,7 @@ fn library_art(index: usize, [width, height]: [usize; 2]) -> egui::ColorImage {
 
 fn fixture_source(server: &str) -> Source {
     session::open(&session::Session {
+        kind: ServerKind::Plex,
         server: server.into(),
         token: "synthetic".into(),
         client_id: "ui-test".into(),
@@ -400,6 +568,7 @@ fn attach_server(app: &mut App) {
     let source = app.source.clone().unwrap();
     app.servers.push(Server::new(
         session::Session {
+            kind: ServerKind::Plex,
             server: app.server.clone(),
             token: "synthetic".into(),
             client_id: "ui-test".into(),
@@ -666,6 +835,7 @@ fn library_snapshots() {
         ("home-desktop", "home", [1440.0, 900.0], 1.0),
         ("home-minimum", "home", [860.0, 620.0], 1.0),
         ("server-status", "home", [860.0, 620.0], 1.0),
+        ("home-library-menu", "home", [1280.0, 800.0], 1.0),
         ("movies-desktop", "movies", [1440.0, 900.0], 1.0),
         ("movies-minimum", "movies", [860.0, 620.0], 1.0),
         ("movies-high-dpi", "movies", [860.0, 620.0], 1.5),
@@ -690,6 +860,7 @@ fn library_snapshots() {
             app.servers[0].items = app.on_deck.clone();
             app.servers[0].artwork = app.covers.clone();
             let session = session::Session {
+                kind: ServerKind::Plex,
                 server: "http://second.example.test".into(),
                 token: "synthetic".into(),
                 client_id: "ui-test".into(),
@@ -703,6 +874,14 @@ fn library_snapshots() {
             second.prefs.name = "Living Room".into();
             app.servers.push(second);
             app.overview = true;
+        }
+        if name == "home-library-menu" {
+            let server = &mut harness.state_mut().servers[0];
+            server.sections.push(Library {
+                id: "4".into(),
+                title: "Concert films".into(),
+                kind: Kind::Movie,
+            });
         }
         harness.set_pixels_per_point(scale);
         // A zoom change rescales the first frame's input rectangle. Restore
@@ -718,7 +897,17 @@ fn library_snapshots() {
             harness.run_steps(5);
             assert!(harness.query_by_label("All servers connected").is_some());
         }
-        if screen == "home" {
+        if screen == "loading" {
+            // The initial chooser can take extra frames to size and load its icons.
+            // Capture the library spinner at a fixed time regardless of that work.
+            harness.input_mut().time = Some(8.0);
+            harness.step();
+        }
+        if name == "home-library-menu" {
+            harness.get_by_label("Show all libraries on Glass").hover();
+            harness.run_steps(5);
+            harness.get_by_label("Libraries on Glass");
+        } else if screen == "home" {
             let card_header = |name| {
                 harness
                     .get_by_role_and_label(egui::accesskit::Role::Button, name)
@@ -922,6 +1111,18 @@ fn login_controls_fit_the_window() {
         let mut harness = login(size);
         harness.run();
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size.into());
+        assert!(harness.query_by_label("Sign in with Plex").is_none());
+        assert!(harness.query_by_label("Server address").is_none());
+        let plex = harness.get_by_label("Plex");
+        let jellyfin = harness.get_by_label("Jellyfin").rect();
+        assert!(screen.contains_rect(plex.rect()) && screen.contains_rect(jellyfin));
+        if size[0] > 1000.0 {
+            assert_eq!(plex.rect().top(), jellyfin.top());
+        } else {
+            assert!(jellyfin.top() > plex.rect().bottom());
+        }
+        plex.click();
+        harness.run();
         let sign_in = harness.get_by_label("Sign in with Plex").rect();
         let remember = harness.get_by_label("Remember me on this computer").rect();
         assert!(
@@ -940,11 +1141,15 @@ fn login_controls_fit_the_window() {
 fn manual_login_accepts_keyboard_input_and_scrolls_into_view() {
     let mut harness = login([860.0, 620.0]);
     harness.run();
-    harness.get_by_label("Manual server connection").click();
+    harness.get_by_label("Plex").click();
     harness.run();
-    harness.get_by_label("Plex server").focus();
+    harness
+        .get_by_label("Connect manually with an address and token")
+        .click();
     harness.run();
-    assert!(harness.get_by_label("Plex server").is_focused());
+    harness.get_by_label("Server address").focus();
+    harness.run();
+    assert!(harness.get_by_label("Server address").is_focused());
     // Replace the default address using Windows' Ctrl+A shortcut.
     harness.key_press_modifiers(
         egui::Modifiers {
@@ -955,32 +1160,127 @@ fn manual_login_accepts_keyboard_input_and_scrolls_into_view() {
         egui::Key::A,
     );
     harness
-        .get_by_label("Plex server")
+        .get_by_label("Server address")
         .type_text("http://localhost:32499");
     harness.run();
     assert_eq!(harness.state().server, "http://localhost:32499");
     harness.key_press(egui::Key::Tab);
     harness.run();
-    assert!(harness.get_by_label("Plex token").is_focused());
+    assert!(harness.get_by_label("Access token").is_focused());
     harness
-        .get_by_label("Plex token")
+        .get_by_label("Access token")
         .type_text("synthetic-ui-token");
     harness.run();
     assert_eq!(harness.state().token, "synthetic-ui-token");
     assert_eq!(
-        harness.get_by_label("Plex token").accesskit_node().role(),
+        harness.get_by_label("Access token").accesskit_node().role(),
         egui::accesskit::Role::PasswordInput
     );
-    harness.get_by_label("Connect to server").scroll_to_me();
+    harness.get_by_label("Connect").scroll_to_me();
     harness.run();
     let screen = harness.ctx.content_rect();
-    assert!(screen.contains_rect(harness.get_by_label("Connect to server").rect()));
+    assert!(screen.contains_rect(harness.get_by_label("Connect").rect()));
     // Intentionally don't click Connect: UI tests never access a real server.
+}
+
+#[test]
+fn add_server_dialog_grows_to_fit_each_form_and_keeps_headings_left_aligned() {
+    let mut harness = library([1280.0, 800.0], "movies");
+    harness.state_mut().connection_open = true;
+    harness.run_steps(4);
+    harness.get_by_label("Add server").click();
+    harness.run_steps(4);
+    let bounds = |h: &Harness<'_, App>| h.ctx.memory(|m| m.area_rect("add_server").unwrap());
+    let chooser = bounds(&harness);
+    assert!((chooser.width() - 640.0).abs() <= 1.0);
+    assert!(
+        (harness.get_by_label("Add a server").rect().left() - chooser.left() - 32.0).abs() <= 1.0
+    );
+    for (kind, title, last) in [
+        ("Jellyfin", "Connect to Jellyfin", "Use Quick Connect"),
+        ("Plex", "Connect to Plex", "Connect"),
+    ] {
+        harness.get_by_label(kind).click();
+        harness.run_steps(4);
+        if kind == "Plex" {
+            harness
+                .get_by_label("Connect manually with an address and token")
+                .click();
+            harness.run_steps(4);
+        }
+        let form = bounds(&harness);
+        assert!(
+            (form.width() - 640.0).abs() <= 1.0,
+            "{kind} width: {form:?}"
+        );
+        assert!(form.height() > chooser.height());
+        assert!(
+            form.shrink(30.0)
+                .contains_rect(harness.get_by_label(last).rect())
+        );
+        assert!((harness.get_by_label(title).rect().left() - form.left() - 128.0).abs() <= 1.0);
+        harness.get_by_label("Back to server types").click();
+        harness.run_steps(4);
+    }
+    harness.get_by_label("Close").click();
+    harness.run_steps(4);
+    assert!(harness.get_by_label("Add server").is_focused());
+}
+
+#[test]
+fn jellyfin_sign_in_isolated_from_plex_and_quick_connect_can_be_cancelled() {
+    let mut harness = login([860.0, 620.0]);
+    harness.state_mut().token = "synthetic-plex-token".into();
+    harness.run();
+    harness.get_by_label("Jellyfin").click();
+    harness.run();
+    assert!(harness.state().server.is_empty() && harness.state().token.is_empty());
+    assert!(harness.get_by_label("Server address").is_focused());
+    let username = harness.get_by_label("Username").rect();
+    let password = harness.get_by_label("Password");
+    assert!(password.rect().left() > username.right());
+    assert_eq!(
+        password.accesskit_node().role(),
+        egui::accesskit::Role::PasswordInput
+    );
+    harness.get_by_label("Connect").scroll_to_me();
+    harness.run();
+    harness.get_by_label("Connect").click();
+    harness.run();
+    harness.get_by_label("Check the highlighted fields");
+    harness.get_by_label("Enter your server address.");
+    harness.get_by_label("Enter your Jellyfin username.");
+    assert!(!harness.state().busy);
+    harness.state_mut().server = "http://127.0.0.1:8096".into();
+    harness.get_by_label("Use Quick Connect").scroll_to_me();
+    harness.run();
+    assert!(
+        harness
+            .ctx
+            .content_rect()
+            .contains_rect(harness.get_by_label("Use Quick Connect").rect())
+    );
+    let app = harness.state_mut();
+    let generation = app.begin();
+    app.quick_code = Some("012345".into());
+    harness.run_steps(2);
+    harness.get_by_label("012 345");
+    harness.get_by_label("Cancel").click();
+    harness.run();
+    harness
+        .state()
+        .tx
+        .send((generation, Reply::QuickConnectCode("123456".into())))
+        .unwrap();
+    harness.run_steps(2);
+    assert!(!harness.state().busy && harness.state().quick_code.is_none());
 }
 
 #[test]
 fn cancelled_and_failed_login_can_be_retried() {
     let mut harness = login([860.0, 620.0]);
+    harness.get_by_label("Plex").click();
+    harness.run();
     let (pending, events) = auth::Login::test_channel();
     harness.state_mut().login = Some(pending);
     events
@@ -989,9 +1289,9 @@ fn cancelled_and_failed_login_can_be_retried() {
         ))
         .unwrap();
     harness.run_steps(2);
-    assert!(harness.get_by_label("Cancel sign-in").rect().is_positive());
+    assert!(harness.get_by_label("Cancel").rect().is_positive());
     // OpenUrl remains egui output in this harness; no OS browser is launched.
-    harness.get_by_label("Cancel sign-in").click();
+    harness.get_by_label("Cancel").click();
     harness.run();
     assert!(harness.state().login.is_none());
     assert!(harness.state().login_url.is_none());
@@ -1022,6 +1322,7 @@ fn discovered_servers() -> Vec<auth::Server> {
     vec![
         auth::Server {
             name: "Living Room · A server with a deliberately long name".into(),
+            owned: Some(true),
             access_token: Some("synthetic-resource-token".into()),
             provides: "server".into(),
             connections: vec![auth::Connection {
@@ -1031,6 +1332,7 @@ fn discovered_servers() -> Vec<auth::Server> {
         },
         auth::Server {
             name: "Family Library".into(),
+            owned: Some(false),
             access_token: Some("synthetic-other-token".into()),
             provides: "server".into(),
             connections: vec![auth::Connection {
@@ -1044,15 +1346,145 @@ fn discovered_servers() -> Vec<auth::Server> {
 #[test]
 fn discovered_server_controls_fit_the_window() {
     let mut harness = login([860.0, 620.0]);
-    harness.state_mut().available_servers = discovered_servers();
+    harness.state_mut().choose_source(Some(ServerKind::Plex));
+    harness.state_mut().offer_plex_servers(discovered_servers());
     harness.run();
     for server in discovered_servers() {
-        let label = format!("Connect to {}", server.name);
+        let label = server.name;
         let rect = harness.get_by_label(&label).rect();
         assert!(
             harness.ctx.content_rect().contains_rect(rect),
             "Server choice is clipped: {rect:?}"
         );
+    }
+    harness.get_by_label("Add 1 server");
+    harness.get_by_label("Family Library").click();
+    harness.run();
+    harness.get_by_label("Add 2 servers");
+}
+
+#[test]
+fn plex_selection_keeps_connected_servers_when_a_later_server_is_offline() {
+    use std::{
+        io::{BufRead, BufReader, Write},
+        net::TcpListener,
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = format!("http://{}", listener.local_addr().unwrap());
+    let worker = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(&socket);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.starts_with("GET /library/sections "));
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                break;
+            }
+        }
+        let body =
+            r#"{"MediaContainer":{"Directory":[{"key":"1","type":"movie","title":"Movies"}]}}"#;
+        write!(
+            socket,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+    });
+    let mut harness = login([1280.0, 800.0]);
+    let mut choices = discovered_servers();
+    choices[0].connections[0].uri = address;
+    choices[1].connections[0].uri = "http://127.0.0.1:0".into();
+    let app = harness.state_mut();
+    app.choose_source(Some(ServerKind::Plex));
+    app.remember = false;
+    let (login, events) = auth::Login::test_channel();
+    app.login = Some(login);
+    events.send(auth::Event::SignedIn(choices)).unwrap();
+    harness.run_steps(3);
+    harness.get_by_label("Family Library").click();
+    harness.run_steps(2);
+    harness.get_by_label("Add 2 servers").click();
+    harness.run_steps(2);
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while harness.state().busy && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+        harness.run_steps(1);
+    }
+    assert!(harness.state().error.is_some());
+    assert_eq!(harness.state().servers.len(), 1);
+    harness.get_by_label("Already added");
+    harness
+        .get_by_label("Finish with connected servers")
+        .click();
+    harness.run_steps(3);
+    harness.get_by_label("Found 1 library: Movies");
+    worker.join().unwrap();
+}
+
+#[test]
+fn connected_server_can_be_named_and_finished_from_either_entry_point() {
+    for settings in [false, true] {
+        let mut harness = if settings {
+            library([1280.0, 800.0], "movies")
+        } else {
+            login([1280.0, 800.0])
+        };
+        if settings {
+            harness.state_mut().connection_open = true;
+            harness.run_steps(3);
+            harness.get_by_label("Add server").click();
+            harness.run_steps(3);
+        }
+        harness.get_by_label("Jellyfin").click();
+        harness.run_steps(3);
+        let app = harness.state_mut();
+        app.remember = false;
+        let session = session::Session {
+            kind: ServerKind::Jellyfin,
+            server: "http://127.0.0.1:0".into(),
+            token: "synthetic".into(),
+            client_id: "ui-test".into(),
+        };
+        let source = session::open(&session).unwrap();
+        let generation = app.begin();
+        app.tx
+            .send((
+                generation,
+                Reply::Connected(
+                    source,
+                    vec![Library {
+                        id: "a".into(),
+                        title: "Movies".into(),
+                        kind: Kind::Movie,
+                    }],
+                    session,
+                ),
+            ))
+            .unwrap();
+        harness.run_steps(3);
+        harness.get_by_label("Found 1 library: Movies");
+        let field = harness.get_by_label("Name in Perfuse");
+        assert!(field.is_focused());
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.get_by_label("Name in Perfuse").type_text("Media");
+        harness.run_steps(2);
+        if settings {
+            harness.get_by_label("Done").click();
+            harness.run_steps(3);
+            assert!(harness.get_by_label("Add server").is_focused());
+            assert_eq!(harness.state().active, Some(0));
+        } else {
+            harness.get_by_label("Add another server").click();
+            harness.run_steps(3);
+            harness.get_by_label("Connected so far");
+            harness.get_by_label("Continue to Perfuse").click();
+            harness.run_steps(3);
+            assert!(harness.state().overview && harness.state().source.is_some());
+        }
+        assert_eq!(harness.state().servers.last().unwrap().name(), "Media");
     }
 }
 
@@ -1066,7 +1498,13 @@ fn login_snapshots() {
         ("login-minimum", [860.0, 620.0], 1.0),
         ("login-desktop", [1440.0, 900.0], 1.0),
         ("login-high-dpi", [860.0, 620.0], 1.5),
+        ("login-plex", [1200.0, 900.0], 1.0),
         ("login-manual", [860.0, 620.0], 1.0),
+        ("login-jellyfin", [1200.0, 900.0], 1.0),
+        ("add-server-types", [1280.0, 800.0], 1.0),
+        ("remove-server", [1100.0, 800.0], 1.0),
+        ("add-server-plex-manual", [1280.0, 800.0], 1.0),
+        ("add-server-jellyfin", [1280.0, 800.0], 1.0),
         ("login-waiting", [860.0, 620.0], 1.0),
         ("login-expired", [860.0, 620.0], 1.0),
         ("login-servers", [860.0, 620.0], 1.0),
@@ -1082,21 +1520,34 @@ fn login_snapshots() {
             harness.set_size(size.into());
         }
         match name {
+            "login-plex" => {
+                harness.get_by_label("Plex").click();
+            }
+            "login-jellyfin" => {
+                harness.get_by_label("Jellyfin").click();
+            }
             "login-manual" => {
-                harness.get_by_label("Manual server connection").click();
+                harness.get_by_label("Plex").click();
+                harness.run();
+                harness
+                    .get_by_label("Connect manually with an address and token")
+                    .click();
             }
             "login-waiting" => {
+                harness.state_mut().choose_source(Some(ServerKind::Plex));
                 let (pending, _events) = auth::Login::test_channel();
                 harness.state_mut().login = Some(pending);
                 harness.state_mut().login_url =
                     Some("https://app.source.tv/auth#?code=synthetic".into());
             }
             "login-expired" => {
+                harness.state_mut().choose_source(Some(ServerKind::Plex));
                 harness.state_mut().error =
                     Some("Plex sign-in expired. Sign in again to continue.".into());
             }
             "login-servers" => {
-                harness.state_mut().available_servers = discovered_servers();
+                harness.state_mut().choose_source(Some(ServerKind::Plex));
+                harness.state_mut().offer_plex_servers(discovered_servers());
             }
             "login-download-permission" => {
                 harness.state_mut().runtime_prompt = Some(RuntimePrompt::FirstRun {
@@ -1104,7 +1555,13 @@ fn login_snapshots() {
                     error: None,
                 });
             }
-            "login-settings" | "settings-desktop" | "login-libraries" => {
+            "login-settings"
+            | "settings-desktop"
+            | "login-libraries"
+            | "remove-server"
+            | "add-server-types"
+            | "add-server-plex-manual"
+            | "add-server-jellyfin" => {
                 let app = harness.state_mut();
                 app.source = Some(fixture_source("http://127.0.0.1:32499"));
                 app.sections.push(Library {
@@ -1122,6 +1579,7 @@ fn login_snapshots() {
                 if name == "settings-desktop" {
                     let address = "http://archive.example.test:32400";
                     let session = session::Session {
+                        kind: ServerKind::Plex,
                         server: address.into(),
                         token: "synthetic".into(),
                         client_id: "ui-test".into(),
@@ -1146,10 +1604,28 @@ fn login_snapshots() {
             }
             _ => {}
         }
+        if name.starts_with("add-server-") {
+            harness.run_steps(4);
+            harness.get_by_label("Add server").click();
+            harness.run_steps(4);
+            if name == "add-server-jellyfin" {
+                harness.get_by_label("Jellyfin").click();
+            } else if name == "add-server-plex-manual" {
+                harness.get_by_label("Plex").click();
+                harness.run_steps(4);
+                harness
+                    .get_by_label("Connect manually with an address and token")
+                    .click();
+            }
+        }
+        if name == "remove-server" {
+            harness.run_steps(4);
+            harness.get_by_label("Remove server").click();
+        }
         harness.remove_cursor();
         harness.run_steps(4);
         if name == "login-manual" {
-            harness.get_by_label("Connect to server").scroll_to_me();
+            harness.get_by_label("Connect").scroll_to_me();
             harness.run_steps(4);
         }
         if name == "login-libraries" {

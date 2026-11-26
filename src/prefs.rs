@@ -1,7 +1,10 @@
 //! Non-sensitive UI preferences (such as sidebar library ordering).
 //! Never stores tokens, credentials, or raw server URLs.
 
-use perfuse::media::{Kind, Library};
+use perfuse::{
+    media::{Kind, Library},
+    plugins::{Credentials, ServerKind},
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -106,19 +109,27 @@ fn save_to(path: &Path, server: &str, order: &LibraryOrder) {
     }
 }
 
-pub fn load_library_order(server: &str) -> LibraryOrder {
-    file()
-        .map(|path| load_from(&path, server))
-        .unwrap_or_default()
-}
-
-pub fn save_library_order(server: &str, order: &LibraryOrder) {
-    if let Some(path) = file() {
-        save_to(&path, server, order);
+fn preference_scope(session: &Credentials) -> String {
+    match session.kind {
+        // Keep the existing hash for Plex libraries, names and ordering.
+        ServerKind::Plex => session.server.clone(),
+        ServerKind::Jellyfin => format!("jellyfin/{}", session.server.trim()),
     }
 }
 
-/// Applies the chosen library sort or custom drag order to Plex's raw section list.
+pub fn load_library_order(session: &Credentials) -> LibraryOrder {
+    file()
+        .map(|path| load_from(&path, &preference_scope(session)))
+        .unwrap_or_default()
+}
+
+pub fn save_library_order(session: &Credentials, order: &LibraryOrder) {
+    if let Some(path) = file() {
+        save_to(&path, &preference_scope(session), order);
+    }
+}
+
+/// Applies the chosen library sort or custom drag order to the server's section list.
 pub fn apply_library_order(server_sections: &[Library], order: &LibraryOrder) -> Vec<Library> {
     let mut result = server_sections.to_vec();
     match order.sort {

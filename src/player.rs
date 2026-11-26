@@ -229,7 +229,16 @@ fn play(
             }
         }
         match mpv.event(0.1) {
-            mpv::Event::Loaded => loaded = true,
+            mpv::Event::Loaded => {
+                if !loaded {
+                    loaded = true;
+                    if report(PlaybackState::Started, seconds, duration).is_err() {
+                        let _ = events.send(Event::Warning(
+                            "Could not report the start of playback to the server.".into(),
+                        ));
+                    }
+                }
+            }
             mpv::Event::Ended { eof, failed } => {
                 if eof {
                     seconds = duration;
@@ -267,7 +276,7 @@ fn play(
             };
             if report(state, seconds, duration).is_err() && !warned {
                 let _ = events.send(Event::Warning(
-                    "Playback continues, but progress could not be saved to Plex.".into(),
+                    "Playback continues, but progress could not be saved to the server.".into(),
                 ));
                 warned = true;
             }
@@ -277,7 +286,7 @@ fn play(
     drop(mpv);
     if loaded && report(PlaybackState::Stopped, seconds, duration).is_err() {
         let _ = events.send(Event::Warning(
-            "Playback stopped, but the final progress update could not reach Plex.".into(),
+            "Playback stopped, but the final progress update could not reach the server.".into(),
         ));
     }
     result
@@ -318,6 +327,7 @@ mod tests {
         use perfuse::plugins::{Credentials, plex::PLUGIN};
         let source = (PLUGIN.open)(
             &Credentials {
+                kind: perfuse::plugins::ServerKind::Plex,
                 server: "http://127.0.0.1:32499".into(),
                 token: "demo".into(),
                 client_id: "perfuse-embedded-test".into(),

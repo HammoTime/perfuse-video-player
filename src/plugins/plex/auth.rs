@@ -22,6 +22,7 @@ pub enum Event {
 #[serde(rename_all = "camelCase")]
 pub struct Server {
     pub name: String,
+    pub owned: Option<bool>,
     pub access_token: Option<String>,
     #[serde(default)]
     pub provides: String,

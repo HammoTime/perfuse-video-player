@@ -1,6 +1,6 @@
 pub mod auth;
 
-use super::Plugin;
+use super::{Plugin, ServerKind};
 use crate::{
     cache::Artwork,
     http,
@@ -16,6 +16,7 @@ use std::{sync::Arc, time::Duration};
 const RELEASED_LIMIT: usize = 24;
 
 pub static PLUGIN: Plugin = Plugin {
+    kind: ServerKind::Plex,
     id: "plex",
     name: "Plex",
     default_address: "http://localhost:32400",
@@ -361,6 +362,7 @@ impl MediaSource for Plex {
 
     fn report(&self, item: &Item, _: &Version, progress: Progress) -> Result<(), String> {
         let state = match progress.state {
+            PlaybackState::Started => return Ok(()),
             PlaybackState::Playing => "playing",
             PlaybackState::Paused => "paused",
             PlaybackState::Stopped => "stopped",

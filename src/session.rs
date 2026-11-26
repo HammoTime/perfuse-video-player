@@ -1,12 +1,12 @@
 //! The complete session lives in Windows Credential Manager, never a plaintext file.
+use perfuse::media::Source;
 pub use perfuse::plugins::Credentials as Session;
-use perfuse::{media::Source, plugins::plex};
 
 pub fn open(session: &Session) -> Result<Source, String> {
     if session.client_id.is_empty() || session.client_id.len() > 200 {
         return Err("The saved device identifier is invalid. Sign in again.".into());
     }
-    (plex::PLUGIN.open)(session, !cfg!(test))
+    (session.kind.plugin().open)(session, !cfg!(test))
 }
 
 #[cfg(windows)]
@@ -21,6 +21,7 @@ pub fn origin(server: &str) -> Option<String> {
 #[cfg(windows)]
 mod windows {
     use super::Session;
+    use perfuse::plugins::{BUILTIN, ServerKind};
     use windows_sys::Win32::{
         Foundation::{ERROR_NOT_FOUND, GetLastError},
         Security::Credentials::*,
@@ -32,26 +33,33 @@ mod windows {
         value.encode_utf16().chain(Some(0)).collect()
     }
 
-    const PREFIX: &str = "Perfuse/Plex/";
-    fn target(server: &str) -> Result<String, String> {
-        super::origin(server)
-            .map(|id| format!("{PREFIX}{id}"))
+    fn target(session: &Session) -> Result<String, String> {
+        super::origin(&session.server)
+            .map(|id| format!("Perfuse/{}/{id}", session.kind.plugin().name))
             .ok_or_else(|| "Invalid server address.".into())
     }
     pub fn load() -> Result<Vec<Session>, String> {
         let mut sessions = Vec::new();
+        for plugin in BUILTIN {
+            load_kind(plugin.kind, &mut sessions)?;
+        }
+        if let Some(legacy) = read(TARGET)?
+            && legacy.kind == ServerKind::Plex
+            && !sessions.iter().any(|s| {
+                s.kind == legacy.kind && super::origin(&s.server) == super::origin(&legacy.server)
+            })
+        {
+            sessions.push(legacy);
+        }
+        Ok(sessions)
+    }
+
+    fn load_kind(kind: ServerKind, sessions: &mut Vec<Session>) -> Result<(), String> {
+        let filter = wide(&format!("Perfuse/{}/*", kind.plugin().name));
         let mut count = 0;
         let mut list = std::ptr::null_mut();
         // SAFETY: the filter is terminated and both output pointers are valid.
-        if unsafe {
-            CredEnumerateW(
-                wide(&format!("{PREFIX}*")).as_ptr(),
-                0,
-                &mut count,
-                &mut list,
-            )
-        } != 0
-        {
+        if unsafe { CredEnumerateW(filter.as_ptr(), 0, &mut count, &mut list) } != 0 {
             // SAFETY: Windows owns the array and each terminated target name until CredFree.
             let names: Vec<_> = unsafe { std::slice::from_raw_parts(list, count as usize) }
                 .iter()
@@ -67,30 +75,32 @@ mod windows {
             // SAFETY: releases the entire result returned by CredEnumerateW.
             unsafe { CredFree(list.cast()) };
             for name in names {
-                if let Some(session) = read(&name)? {
+                if let Some(session) = read(&name)?
+                    && session.kind == kind
+                    && target(&session)? == name
+                {
                     sessions.push(session);
                 }
             }
         } else if unsafe { GetLastError() } != ERROR_NOT_FOUND {
-            return Err("Could not list saved Plex sign-ins.".into());
+            return Err(format!(
+                "Could not list saved {} sign-ins.",
+                kind.plugin().name
+            ));
         }
-        if let Some(legacy) = read(TARGET)?
-            && !sessions
-                .iter()
-                .any(|s| super::origin(&s.server) == super::origin(&legacy.server))
-        {
-            sessions.push(legacy);
-        }
-        Ok(sessions)
+        Ok(())
     }
     pub fn save(session: &Session) -> Result<(), String> {
-        write(&target(&session.server)?, session)
+        write(&target(session)?, session)
     }
-    pub fn clear(server: &str) -> Result<(), String> {
-        if read(TARGET)?.is_some_and(|s| super::origin(&s.server) == super::origin(server)) {
+    pub fn clear(session: &Session) -> Result<(), String> {
+        if session.kind == ServerKind::Plex
+            && read(TARGET)?
+                .is_some_and(|s| super::origin(&s.server) == super::origin(&session.server))
+        {
             delete(TARGET)?;
         }
-        delete(&target(server)?)
+        delete(&target(session)?)
     }
 
     fn read(target: &str) -> Result<Option<Session>, String> {
@@ -138,7 +148,7 @@ mod windows {
             return Err("This credential is too large for Windows Credential Manager.".into());
         }
         let mut target = wide(target);
-        let mut username = wide("Plex");
+        let mut username = wide(session.kind.plugin().name);
         let value = CREDENTIALW {
             Type: CRED_TYPE_GENERIC,
             TargetName: target.as_mut_ptr(),
@@ -178,6 +188,25 @@ mod windows {
         use super::*;
 
         #[test]
+        fn targets_separate_sources_at_the_same_origin() {
+            let mut session = Session {
+                kind: ServerKind::Plex,
+                server: "https://MEDiA.example.test:443/".into(),
+                token: "synthetic".into(),
+                client_id: "perfuse-test".into(),
+            };
+            assert_eq!(
+                target(&session).unwrap(),
+                "Perfuse/Plex/https://media.example.test"
+            );
+            session.kind = ServerKind::Jellyfin;
+            assert_eq!(
+                target(&session).unwrap(),
+                "Perfuse/Jellyfin/https://media.example.test"
+            );
+        }
+
+        #[test]
         #[ignore = "requires an interactive Windows Credential Manager session"]
         fn credential_manager_roundtrip() {
             let target = format!(
@@ -189,6 +218,7 @@ mod windows {
                     .as_nanos()
             );
             let session = Session {
+                kind: ServerKind::Plex,
                 server: "http://127.0.0.1:32499".into(),
                 token: "synthetic-credential".into(),
                 client_id: "perfuse-test".into(),
@@ -219,17 +249,19 @@ pub fn save(session: &Session) -> Result<(), String> {
     Err("Saved sign-in currently requires Windows Credential Manager.".into())
 }
 #[cfg(not(windows))]
-pub fn clear(_server: &str) -> Result<(), String> {
+pub fn clear(_session: &Session) -> Result<(), String> {
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use perfuse::plugins::ServerKind;
 
     #[test]
     fn saved_session_rejects_invalid_origin_and_header() {
         let mut session = Session {
+            kind: ServerKind::Plex,
             server: "https://plex.example.test".into(),
             token: "synthetic".into(),
             client_id: "perfuse-test".into(),
@@ -240,5 +272,16 @@ mod tests {
         session.server = "https://plex.example.test".into();
         session.token = "bad\r\nHeader: injected".into();
         assert!(open(&session).is_err());
+    }
+
+    #[test]
+    fn legacy_sessions_open_as_plex_and_jellyfin_roundtrips_with_its_kind() {
+        let legacy = r#"{"server":"https://media.example.test","client_id":"perfuse-test","token":"synthetic"}"#;
+        let mut session: Session = serde_json::from_str(legacy).unwrap();
+        assert!(session.kind == ServerKind::Plex && open(&session).is_ok());
+        session.kind = ServerKind::Jellyfin;
+        let restored: Session =
+            serde_json::from_slice(&serde_json::to_vec(&session).unwrap()).unwrap();
+        assert!(restored.kind == ServerKind::Jellyfin && open(&restored).is_ok());
     }
 }

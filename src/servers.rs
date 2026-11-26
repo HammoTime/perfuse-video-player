@@ -1,7 +1,7 @@
 use super::*;
 
 #[derive(Default, PartialEq)]
-pub(super) enum StatusPopover {
+pub(super) enum HoverPopover {
     #[default]
     Closed,
     Waiting(f64),
@@ -10,7 +10,19 @@ pub(super) enum StatusPopover {
     Dismissed,
 }
 
-impl StatusPopover {
+impl HoverPopover {
+    fn dismiss_if_closed(
+        &mut self,
+        panel: Option<egui::InnerResponse<()>>,
+        trigger: &egui::Response,
+    ) {
+        if panel.is_some_and(|p| {
+            p.response.should_close() || (p.response.clicked_elsewhere() && !trigger.clicked())
+        }) {
+            *self = Self::Dismissed;
+            trigger.ctx.request_repaint();
+        }
+    }
     fn update(&mut self, trigger: &egui::Response, popup: &egui::Popup<'_>) -> bool {
         let ctx = &trigger.ctx;
         let now = ctx.input(|i| i.time);
@@ -78,6 +90,8 @@ pub(super) struct Server {
     pub(super) artwork: Artwork,
     expanded: Option<bool>,
     rename: Option<String>,
+    library_popover: HoverPopover,
+    focus_remove: bool,
 }
 
 impl Server {
@@ -88,7 +102,7 @@ impl Server {
         remembered: bool,
     ) -> Self {
         Self {
-            prefs: prefs::load_library_order(&session.server),
+            prefs: prefs::load_library_order(&session),
             session,
             source,
             sections,
@@ -102,6 +116,8 @@ impl Server {
             artwork: Artwork::default(),
             expanded: None,
             rename: None,
+            library_popover: HoverPopover::default(),
+            focus_remove: false,
         }
     }
 
@@ -110,20 +126,118 @@ impl Server {
             reqwest::Url::parse(&self.session.server)
                 .ok()
                 .and_then(|url| url.host_str().map(str::to_owned))
-                .unwrap_or_else(|| "Plex server".into())
+                .unwrap_or_else(|| format!("{} server", self.session.kind.plugin().name))
         } else {
             self.prefs.name.clone()
         }
     }
 
     pub fn persist(&self) {
-        prefs::save_library_order(&self.session.server, &self.prefs);
+        prefs::save_library_order(&self.session, &self.prefs);
+    }
+    pub fn icon(&self) -> Icon {
+        connection::source_icon(self.session.kind)
     }
     pub fn libraries(&self) -> Vec<Library> {
         prefs::apply_library_order(&self.sections, &self.prefs)
             .into_iter()
             .filter(|lib| !self.prefs.hidden.contains(&lib.id))
             .collect()
+    }
+
+    fn card_libraries(&mut self, ui: &mut egui::Ui) -> Option<Library> {
+        const HEIGHT: f32 = 28.0;
+        const GAP: f32 = 6.0;
+        let libraries = self.libraries();
+        let available = ui.available_width();
+        let mut selected = None;
+        control_row(ui, HEIGHT, |ui| {
+            ui.set_min_height(HEIGHT);
+            ui.spacing_mut().item_spacing.x = GAP;
+            ui.spacing_mut().button_padding = Vec2::new(8.0, 3.0);
+            let widths: Vec<_> = libraries
+                .iter()
+                .map(|lib| chip_width(ui, &lib.title, 12.0, 12.0))
+                .collect();
+            let fits = widths.iter().sum::<f32>() + GAP * widths.len().saturating_sub(1) as f32
+                <= available;
+            let overflow = !fits && libraries.len() > 2;
+            let count = if overflow { 2 } else { libraries.len() };
+            let mut room = available - GAP * count.saturating_sub(1) as f32;
+            if overflow {
+                room -= HEIGHT + GAP;
+            }
+            for (index, lib) in libraries.iter().take(count).enumerate() {
+                // Give a short second chip its natural width when the first title is long.
+                let limit = if index == 0 && count == 2 {
+                    room - widths[1].min(room / 2.0)
+                } else {
+                    room
+                };
+                let width = widths[index].min(limit);
+                let chip = egui::Button::image_and_text(
+                    library_icon(lib).image(12.0, MUTED),
+                    RichText::new(lib.title.replace(['\r', '\n'], " ")).size(12.0),
+                )
+                .corner_radius(14)
+                .truncate();
+                if ui
+                    .add_sized([width, HEIGHT], chip)
+                    .on_hover_text(&lib.title)
+                    .clicked()
+                {
+                    selected = Some(lib.clone());
+                }
+                room -= width;
+            }
+            if overflow {
+                let label = format!("Show all libraries on {}", self.name());
+                let more = ui.add(IconButton::new(Icon::ChevronDown, &label).size(HEIGHT));
+                let frame = popover_frame();
+                let popup = egui::Popup::from_response(&more)
+                    .align(egui::RectAlign::BOTTOM_END)
+                    .gap(8.0)
+                    .width(280.0)
+                    .frame(frame);
+                let open = self.library_popover.update(&more, &popup);
+                ui.ctx()
+                    .accesskit_node_builder(more.id, |node| node.set_expanded(open));
+                if open {
+                    let panel = popup
+                        .close_behavior(egui::PopupCloseBehavior::IgnoreClicks)
+                        .show(|ui| {
+                            ui.set_width(280.0 - frame.total_margin().sum().x);
+                            ui.spacing_mut().item_spacing.y = 6.0;
+                            ui.label(
+                                RichText::new(format!("Libraries on {}", self.name()))
+                                    .size(15.0)
+                                    .strong(),
+                            );
+                            ui.separator();
+                            egui::ScrollArea::vertical()
+                                .max_height((ui.ctx().content_rect().height() * 0.45).min(320.0))
+                                .show(ui, |ui| {
+                                    for lib in &libraries {
+                                        let button = egui::Button::image_and_text(
+                                            library_icon(lib).image(16.0, MUTED),
+                                            &lib.title,
+                                        )
+                                        .frame_when_inactive(false)
+                                        .wrap();
+                                        if ui.add(button).clicked() {
+                                            selected = Some(lib.clone());
+                                            ui.close();
+                                        }
+                                    }
+                                });
+                        });
+                    self.library_popover.dismiss_if_closed(panel, &more);
+                }
+            } else {
+                self.library_popover = HoverPopover::Closed;
+            }
+        });
+        selected
     }
 
     pub fn check(&mut self, ctx: &egui::Context) {
@@ -193,7 +307,7 @@ impl Server {
             ui.spacing_mut().item_spacing.x = 12.0;
             let (tile, _) = ui.allocate_exact_size(Vec2::splat(32.0), egui::Sense::hover());
             ui.painter().rect_filled(tile, 8, CONTROL);
-            Icon::ServerPlex.paint(ui, tile.center(), 18.0, TEXT);
+            self.icon().paint(ui, tile.center(), 18.0, TEXT);
             let (icon, color, status) = self.status();
             let offline = !self.online && !self.checking;
             let width = ui.available_width() - if offline { 68.0 } else { 28.0 };
@@ -324,7 +438,13 @@ impl App {
         self.home(ctx);
     }
 
-    pub(super) fn group_heading(&mut self, ui: &mut egui::Ui, i: usize, ctx: &egui::Context) {
+    pub(super) fn group_heading(
+        &mut self,
+        ui: &mut egui::Ui,
+        i: usize,
+        ctx: &egui::Context,
+        show_sort: bool,
+    ) {
         let s = &mut self.servers[i];
         let name = s.name();
         let collapsed = s.prefs.collapsed;
@@ -334,14 +454,26 @@ impl App {
         } else {
             "Collapse libraries"
         };
-        ui.add(Icon::ServerPlex.image(16.0, MUTED))
-            .on_hover_text("Plex");
+        let kind = s.session.kind.plugin().name;
+        ui.add(s.icon().image(16.0, MUTED)).on_hover_text(kind);
+        // Keep both controls together, inside the fully expanded floating scroll bar.
+        let scroll = &ui.spacing().scroll;
+        let gutter = scroll.bar_width + scroll.bar_outer_margin + 4.0;
+        let trailing = 24.0
+            + if show_sort {
+                28.0
+            } else if !s.online {
+                18.0
+            } else {
+                0.0
+            };
+        let name_width = (ui.available_width() - trailing - 4.0 - gutter).max(0.0);
         let open = ui
             .allocate_ui_with_layout(
-                Vec2::new(92.0, 28.0),
+                Vec2::new(name_width, 28.0),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
-                    ui.set_width(92.0);
+                    ui.set_width(name_width);
                     ui.add(
                         egui::Button::new(
                             RichText::new(name.to_uppercase())
@@ -355,7 +487,7 @@ impl App {
                 },
             )
             .inner
-            .on_hover_text(format!("Plex – {name}"))
+            .on_hover_text(format!("{kind} – {name}"))
             .clicked();
         let icon = if collapsed {
             Icon::PageNext
@@ -421,21 +553,11 @@ impl App {
             ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), egui::Sense::click());
         response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
         let divider = Color32::from_rgb(42, 42, 46);
-        let frame = egui::Frame::popup(ui.style())
-            .fill(PANEL)
-            .stroke(egui::Stroke::new(1.0_f32, divider))
-            .corner_radius(14)
-            .inner_margin(egui::Margin {
-                top: 22,
-                bottom: 5,
-                ..egui::Margin::same(16)
-            })
-            .shadow(egui::epaint::Shadow {
-                offset: [0, 16],
-                blur: 40,
-                spread: 0,
-                color: Color32::from_black_alpha(140),
-            });
+        let frame = popover_frame().inner_margin(egui::Margin {
+            top: 22,
+            bottom: 5,
+            ..egui::Margin::same(16)
+        });
         let popup = egui::Popup::from_response(&response)
             .align(egui::RectAlign::TOP_START)
             .gap(8.0)
@@ -523,12 +645,7 @@ impl App {
                     });
                 });
             });
-        if panel.is_some_and(|p| {
-            p.response.should_close() || (p.response.clicked_elsewhere() && !response.clicked())
-        }) {
-            self.status_popover = StatusPopover::Dismissed;
-            ctx.request_repaint();
-        }
+        self.status_popover.dismiss_if_closed(panel, &response);
     }
 
     pub(super) fn servers_home(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -564,10 +681,10 @@ impl App {
                     .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(42, 42, 46)))
                     .inner_margin(16)
                     .corner_radius(14);
-                for (row_index, row) in self.servers.chunks(cols).enumerate() {
+                for (row_index, row) in self.servers.chunks_mut(cols).enumerate() {
                     ui.horizontal_top(|ui| {
                         ui.spacing_mut().item_spacing = Vec2::splat(gap);
-                        for (column, s) in row.iter().enumerate() {
+                        for (column, s) in row.iter_mut().enumerate() {
                             let i = row_index * cols + column;
                             let card = card_frame
                                 .fill(if s.online {
@@ -586,7 +703,7 @@ impl App {
                                                 egui::Sense::hover(),
                                             );
                                             ui.painter().rect_filled(rect, 12, CONTROL);
-                                            Icon::ServerPlex.paint(ui, rect.center(), 26.0, TEXT);
+                                            s.icon().paint(ui, rect.center(), 26.0, TEXT);
                                             ui.vertical(|ui| {
                                                 ui.spacing_mut().item_spacing.y = 2.0;
                                                 let text_height = ui.fonts_mut(|fonts| {
@@ -604,7 +721,9 @@ impl App {
                                                     .truncate(),
                                                 );
                                                 ui.label(
-                                                    RichText::new("Plex").color(MUTED).size(12.0),
+                                                    RichText::new(s.session.kind.plugin().name)
+                                                        .color(MUTED)
+                                                        .size(12.0),
                                                 );
                                             });
                                         });
@@ -614,26 +733,9 @@ impl App {
                                             ui.add(icon.image(14.0, color));
                                             ui.label(RichText::new(status).size(13.0));
                                         });
-                                        ui.horizontal_wrapped(|ui| {
-                                            ui.spacing_mut().item_spacing = Vec2::splat(6.0);
-                                            ui.spacing_mut().button_padding = Vec2::new(8.0, 3.0);
-                                            for lib in s.libraries() {
-                                                let glyph = if lib.kind == Kind::Series {
-                                                    Icon::TvShows
-                                                } else {
-                                                    Icon::Movies
-                                                };
-                                                let chip = egui::Button::image_and_text(
-                                                    glyph.image(12.0, MUTED),
-                                                    RichText::new(&lib.title).size(12.0),
-                                                )
-                                                .min_size(Vec2::new(0.0, 26.0))
-                                                .corner_radius(13);
-                                                if ui.add(chip).clicked() {
-                                                    library = Some((i, lib));
-                                                }
-                                            }
-                                        });
+                                        if let Some(lib) = s.card_libraries(ui) {
+                                            library = Some((i, lib));
+                                        }
                                     });
                                 });
                             // Register behind the chips, which have their own library destinations.
@@ -693,7 +795,7 @@ impl App {
                                             item = Some((i, entry.clone()));
                                         }
                                         ui.horizontal(|ui| {
-                                            ui.add(Icon::ServerPlex.image(13.0, MUTED));
+                                            ui.add(s.icon().image(13.0, MUTED));
                                             ui.small(s.name());
                                         });
                                     });
@@ -782,13 +884,11 @@ impl App {
                 .fill(ACCENT)
                 .corner_radius(18)
                 .min_size(Vec2::new(108.0, 36.0));
-                if ui.add_enabled(!self.busy, add).clicked() {
+                let button = ui.add_enabled(!self.busy, add);
+                self.form.focus("Add server", &button);
+                if button.clicked() {
                     self.adding = true;
-                    self.server.clear();
-                    self.token.clear();
-                    self.remember = cfg!(windows);
-                    self.available_servers.clear();
-                    self.error = None;
+                    self.choose_source(None);
                 }
             });
         });
@@ -802,7 +902,12 @@ impl App {
                 .inner_margin(16)
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    ui.push_id(("settings_server", &s.session.server.clone()), |ui| {
+                    let row_id = (
+                        "settings_server",
+                        s.session.kind.plugin().id,
+                        s.session.server.clone(),
+                    );
+                    ui.push_id(row_id, |ui| {
                         let mut expanded = s.expanded.unwrap_or(i == 0);
                         control_row(ui, 44.0, |ui| {
                             ui.spacing_mut().item_spacing.x = 8.0;
@@ -836,14 +941,18 @@ impl App {
                             }
                             let (rect, _) =
                                 ui.allocate_exact_size(Vec2::splat(44.0), egui::Sense::hover());
-                            ui.painter()
-                                .rect_filled(rect, 12, Color32::from_rgb(56, 46, 32));
-                            Icon::ServerPlex.paint(
-                                ui,
-                                rect.center(),
-                                26.0,
-                                Color32::from_rgb(244, 189, 95),
-                            );
+                            let (fill, ink) = match s.session.kind {
+                                ServerKind::Plex => (
+                                    Color32::from_rgb(56, 46, 32),
+                                    Color32::from_rgb(244, 189, 95),
+                                ),
+                                ServerKind::Jellyfin => (
+                                    Color32::from_rgb(38, 40, 64),
+                                    Color32::from_rgb(161, 170, 255),
+                                ),
+                            };
+                            ui.painter().rect_filled(rect, 12, fill);
+                            s.icon().paint(ui, rect.center(), 26.0, ink);
                             let name_width = (ui.available_width() - 190.0).max(65.0);
                             ui.allocate_ui_with_layout(
                                 Vec2::new(name_width, 44.0),
@@ -861,7 +970,8 @@ impl App {
                                     ui.add(
                                         egui::Label::new(
                                             RichText::new(format!(
-                                                "Plex · {} {}",
+                                                "{} · {} {}",
+                                                s.session.kind.plugin().name,
                                                 s.sections.len(),
                                                 if s.sections.len() == 1 {
                                                     "library"
@@ -961,21 +1071,24 @@ impl App {
                                 ui.horizontal_wrapped(|ui| {
                                     ui.spacing_mut().item_spacing = Vec2::splat(6.0);
                                     ui.spacing_mut().button_padding = Vec2::new(10.0, 5.0);
+                                    let width = s
+                                        .sections
+                                        .iter()
+                                        .map(|lib| chip_width(ui, &lib.title, 14.0, 15.0))
+                                        .fold(0.0_f32, f32::max)
+                                        .min(ui.available_width());
                                     for lib in &s.sections {
                                         let shown = !s.prefs.hidden.contains(&lib.id);
-                                        let glyph = if lib.kind == Kind::Series {
-                                            Icon::TvShows
-                                        } else {
-                                            Icon::Movies
-                                        };
+                                        let glyph = library_icon(lib);
                                         let btn = egui::Button::image_and_text(
                                             glyph.image(15.0, if shown { ACCENT } else { MUTED }),
                                             RichText::new(&lib.title).size(14.0),
                                         )
                                         .selected(shown)
+                                        .truncate()
                                         .corner_radius(10);
                                         if ui
-                                        .add(btn)
+                                        .add_sized([width, 28.0], btn)
                                         .on_hover_text(
                                             "Show or hide this library in the sidebar and on Home",
                                         )
@@ -1010,7 +1123,7 @@ impl App {
                                     let result = if remembered {
                                         session::save(&s.session)
                                     } else {
-                                        session::clear(&s.session.server)
+                                        session::clear(&s.session)
                                     };
                                     match result {
                                         Ok(()) => s.remembered = remembered,
@@ -1020,30 +1133,22 @@ impl App {
                             });
                             ui.separator();
                             ui.horizontal(|ui| {
-                                ui.spacing_mut().button_padding = Vec2::new(9.0, 5.0);
-                                let check = egui::Button::image_and_text(
-                                    Icon::Refresh.image(15.0, MUTED),
-                                    "Check connection",
-                                )
-                                .frame(false);
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                let (check, remove) = Pill::pair(
+                                    ui,
+                                    Pill::secondary(Icon::Refresh, "Check connection"),
+                                    Pill::danger(Icon::SignOut, "Remove server"),
+                                );
                                 if ui.add_enabled(!s.checking, check).clicked() {
                                     s.check(ctx);
                                 }
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        let remove = egui::Button::image_and_text(
-                                            Icon::SignOut.image(15.0, ERROR_TEXT),
-                                            RichText::new("Remove server")
-                                                .size(14.0)
-                                                .color(ERROR_TEXT),
-                                        )
-                                        .frame(false);
-                                        if ui.add(remove).clicked() {
-                                            self.removing = Some(i);
-                                        }
-                                    },
-                                );
+                                let remove = ui.add(remove);
+                                if std::mem::take(&mut s.focus_remove) {
+                                    remove.request_focus();
+                                }
+                                if remove.clicked() {
+                                    self.removing = Some((i, remove.id));
+                                }
                             });
                         }
                     });
@@ -1077,45 +1182,46 @@ impl App {
 
     pub(super) fn server_dialogs(&mut self, ctx: &egui::Context) {
         if self.adding {
-            let modal = egui::Modal::new("add_server".into()).show(ctx, |ui| {
-                ui.set_width(440.0);
-                ui.heading("Add a Plex server");
-                egui::ScrollArea::vertical()
-                    .max_height(ctx.content_rect().height() * 0.68)
-                    .show(ui, |ui| self.connection_fields(ui, ctx));
-                if let Some(error) = &self.error {
-                    ui.colored_label(ERROR_TEXT, error);
-                }
-                ui.add(Pill::secondary(Icon::Close, "Close")).clicked()
-            });
-            if modal.inner || modal.should_close() {
-                self.generation.fetch_add(1, Ordering::Relaxed);
-                self.busy = false;
-                self.login = None;
-                self.login_url = None;
-                self.adding = false;
-                self.token.clear();
-                self.available_servers.clear();
-                self.error = None;
-            }
+            self.add_server_dialog(ctx);
         }
-        if let Some(i) = self.removing {
-            let modal = egui::Modal::new("remove_server".into()).show(ctx, |ui| {
-                ui.heading(format!("Remove {}?", self.servers[i].name()));
-                ui.label(
-                    "Perfuse will forget this server's sign-in. Your progress stays on the server.",
-                );
-                ui.horizontal(|ui| {
-                    if ui.button("Cancel").clicked() {
-                        self.removing = None;
-                    }
-                    ui.button("Remove").clicked()
-                })
-                .inner
-            });
+        if let Some((i, trigger)) = self.removing {
+            let frame = popover_frame();
+            let modal = egui::Modal::new("remove_server".into())
+                .frame(frame)
+                .backdrop_color(Color32::from_black_alpha(153))
+                .show(ctx, |ui| {
+                    let width = 460.0_f32.min(ctx.content_rect().width() - 48.0);
+                    ui.set_width(width - frame.total_margin().sum().x);
+                    ui.spacing_mut().item_spacing.y = 12.0;
+                    let server = &self.servers[i];
+                    ui.label(RichText::new(format!("Remove {}?", server.name())).heading().size(22.0));
+                    let kind = server.session.kind.plugin().name;
+                    let message = format!(
+                        "Perfuse will sign out of this {kind} server and forget its saved sign-in. Your progress stays on the server."
+                    );
+                    ui.label(RichText::new(message).color(MUTED));
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        let (cancel, remove) = Pill::pair(
+                            ui,
+                            Pill::secondary(Icon::Cancel, "Cancel").min_width(116.0),
+                            Pill::danger(Icon::SignOut, "Remove"),
+                        );
+                        ui.add_space((ui.available_width() - cancel.width(ui) - remove.width(ui) - 8.0).max(0.0));
+                        let cancel = ui.add(cancel);
+                        if ui.memory(|m| m.focused().is_none() || m.has_focus(trigger)) {
+                            cancel.request_focus();
+                        }
+                        if cancel.clicked() {
+                            ui.close();
+                        }
+                        ui.add(remove).clicked()
+                    }).inner
+                });
             if modal.inner {
                 if self.servers[i].remembered
-                    && let Err(error) = session::clear(&self.servers[i].session.server)
+                    && let Err(error) = session::clear(&self.servers[i].session)
                 {
                     self.error = Some(error);
                 } else {
@@ -1146,11 +1252,28 @@ impl App {
                 self.removing = None;
             } else if modal.should_close() {
                 self.removing = None;
+                self.servers[i].focus_remove = true;
             }
         }
     }
 }
 
+fn library_icon(lib: &Library) -> Icon {
+    if lib.kind == Kind::Series {
+        Icon::TvShows
+    } else {
+        Icon::Movies
+    }
+}
+
+fn chip_width(ui: &egui::Ui, title: &str, font_size: f32, icon: f32) -> f32 {
+    let label = ui.painter().layout_no_wrap(
+        title.replace(['\r', '\n'], " "),
+        egui::FontId::proportional(font_size),
+        TEXT,
+    );
+    (label.size().x + 2.0 * ui.spacing().button_padding.x + icon + ui.spacing().icon_spacing).ceil()
+}
 fn setting_line(ui: &mut egui::Ui, label: &str, content: impl FnOnce(&mut egui::Ui)) {
     ui.horizontal_top(|ui| {
         ui.allocate_ui_with_layout(

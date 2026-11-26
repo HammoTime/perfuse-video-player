@@ -1,12 +1,13 @@
 [package]
 name = "perfuse"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.88"
-description = "A small, open-source Plex desktop client with mpv playback"
+description = "A native Plex and Jellyfin desktop client with mpv playback"
 license = "AGPL-3.0-only"
 
 [dependencies]
+chrono = { version = "0.4", default-features = false }
 eframe = { version = "0.33", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
 egui_extras = { version = "0.33", default-features = false, features = ["svg"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
