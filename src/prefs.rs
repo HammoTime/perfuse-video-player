@@ -11,8 +11,59 @@ use std::{
     fs,
     io::{ErrorKind, Write},
     path::{Path, PathBuf},
+    sync::{Arc, OnceLock, mpsc},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+// Serialize local edits in the order the UI made them, independently of network work.
+// The map tracks removals that are still waiting for Credential Manager.
+type PendingRemovals = HashMap<String, Arc<()>>;
+type FileJob = Box<dyn FnOnce(&mut PendingRemovals) + Send>;
+static FILE_WORKER: OnceLock<mpsc::Sender<FileJob>> = OnceLock::new();
+
+fn enqueue(job: impl FnOnce(&mut PendingRemovals) + Send + 'static) {
+    let worker = FILE_WORKER.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<FileJob>();
+        std::thread::spawn(move || {
+            let mut removals = PendingRemovals::new();
+            for job in rx {
+                job(&mut removals);
+            }
+        });
+        tx
+    });
+    let _ = worker.send(Box::new(job));
+}
+
+pub fn flush() {
+    if FILE_WORKER.get().is_some() {
+        let (done, wait) = mpsc::channel();
+        enqueue(move |_| {
+            let _ = done.send(());
+        });
+        let _ = wait.recv();
+    }
+}
+
+/// Windows' animation preference for effects inside application windows.
+#[cfg(windows)]
+pub fn client_animations_enabled() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SPI_GETCLIENTAREAANIMATION, SystemParametersInfoW,
+    };
+
+    let mut enabled: windows_sys::core::BOOL = 0;
+    // SAFETY: SPI_GETCLIENTAREAANIMATION writes one BOOL into the supplied buffer.
+    let success = unsafe {
+        SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, (&raw mut enabled).cast(), 0)
+    };
+    success == 0 || enabled != 0
+}
+
+#[cfg(not(windows))]
+pub fn client_animations_enabled() -> bool {
+    true
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -108,7 +159,8 @@ impl Volume {
     pub fn save(&mut self) {
         if self.changed {
             if let Some(path) = file() {
-                self.save_to(&path);
+                let volume = *self;
+                enqueue(move |_| volume.save_to(&path));
             }
             self.changed = false;
         }
@@ -297,7 +349,7 @@ fn new_device_id() -> Option<String> {
 }
 
 /// Used only if the system random generator fails; it is not saved.
-fn fallback_device_id() -> String {
+pub fn fallback_device_id() -> String {
     format!(
         "perfuse-{}-{}",
         std::process::id(),
@@ -309,29 +361,74 @@ fn fallback_device_id() -> String {
 }
 
 fn preference_scope(session: &Credentials) -> String {
+    let address = session
+        .server
+        .trim()
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
     match session.kind {
         // Keep the existing hash for Plex libraries, names and ordering.
-        ServerKind::Plex => session.server.clone(),
-        kind => format!("{}/{}", kind.plugin().id, session.server.trim()),
+        ServerKind::Plex => address,
+        kind => format!("{}/{address}", kind.plugin().id),
     }
 }
 
 pub fn load_library_order(session: &Credentials) -> LibraryOrder {
-    file()
-        .map(|path| load_from(&path, &preference_scope(session)))
-        .unwrap_or_default()
+    let Some(path) = file() else {
+        return LibraryOrder::default();
+    };
+    let scope = preference_scope(session);
+    let (done, wait) = mpsc::channel();
+    enqueue(move |pending| {
+        let order = if pending.contains_key(&scope) {
+            LibraryOrder::default()
+        } else {
+            load_from(&path, &scope)
+        };
+        let _ = done.send(order);
+    });
+    // Called from the sign-in or restore worker.
+    wait.recv().unwrap_or_default()
 }
 
 pub fn save_library_order(session: &Credentials, order: &LibraryOrder) {
     if let Some(path) = file() {
-        save_to(&path, &preference_scope(session), order);
+        queue_order(path, preference_scope(session), order.clone());
     }
 }
 
-/// Removes a server's saved library order, sidebar name and hidden libraries.
-pub fn forget_server(session: &Credentials) {
-    if let Some(path) = file() {
-        forget_in(&path, &preference_scope(session));
+fn queue_order(path: PathBuf, scope: String, order: LibraryOrder) {
+    enqueue(move |pending| {
+        pending.remove(&scope);
+        save_to(&path, &scope, &order);
+    });
+}
+
+/// Reserve the removal now. A failed credential deletion keeps the preferences, and a
+/// server added again while sign-out is in flight owns its newly saved preferences.
+pub fn begin_removal(session: &Credentials) -> impl FnOnce(bool) + Send + use<> {
+    queue_removal(file(), preference_scope(session))
+}
+
+fn queue_removal(path: Option<PathBuf>, scope: String) -> impl FnOnce(bool) + Send + 'static {
+    let request = Arc::new(());
+    let server = scope.clone();
+    let reservation = request.clone();
+    enqueue(move |pending| {
+        pending.insert(server, reservation);
+    });
+    move |forgotten| {
+        enqueue(move |pending| {
+            if pending
+                .get(&scope)
+                .is_some_and(|action| Arc::ptr_eq(action, &request))
+            {
+                pending.remove(&scope);
+                if forgotten && let Some(path) = path {
+                    forget_in(&path, &scope);
+                }
+            }
+        })
     }
 }
 
@@ -410,6 +507,36 @@ pub fn apply_library_order(server_sections: &[Library], order: &LibraryOrder) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queued_edits_and_server_removal_preserve_user_order() {
+        let dir = std::env::temp_dir().join(format!("perfuse-pref-queue-{}", std::process::id()));
+        let path = dir.join("preferences.json");
+        let scope = "queued-server";
+        let order = |name: &str| LibraryOrder {
+            name: name.into(),
+            ..Default::default()
+        };
+        let save = |name| queue_order(path.clone(), scope.into(), order(name));
+        let remove = || queue_removal(Some(path.clone()), scope.into());
+
+        save("First");
+        save("Last");
+        remove()(false);
+        flush();
+        assert_eq!(load_from(&path, scope), order("Last"));
+
+        let finish_old_sign_out = remove();
+        save("Added again");
+        finish_old_sign_out(true);
+        flush();
+        assert_eq!(load_from(&path, scope), order("Added again"));
+
+        remove()(true);
+        flush();
+        assert!(!read_store(&path).libraries.contains_key(&server_key(scope)));
+        let _ = fs::remove_dir_all(dir);
+    }
 
     fn sample_sections() -> Vec<Library> {
         vec![

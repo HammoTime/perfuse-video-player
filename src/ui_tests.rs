@@ -1,4 +1,7 @@
 //! Runs the real eframe update loop without creating an OS window.
+mod artwork_trace;
+mod screen_fade;
+
 use super::*;
 use egui_kittest::{
     Harness,
@@ -336,8 +339,12 @@ fn mixed_home_routes_audiobooks_to_continue_listening_and_respects_hidden_librar
     let app = harness.state_mut();
     app.overview = true;
     app.servers[0].items = app.on_deck.clone();
+    app.servers[0].artwork = app.covers.clone();
     let mut shelf = book_server();
-    shelf.items = vec![book_item()];
+    shelf.items = vec![Item {
+        thumb: None,
+        ..book_item()
+    }];
     app.servers.push(shelf);
     harness.run_steps(4);
     harness.get_by_label("Continue Watching");
@@ -351,6 +358,121 @@ fn mixed_home_routes_audiobooks_to_continue_listening_and_respects_hidden_librar
     harness.run_steps(3);
     assert!(harness.query_by_label("Continue Listening").is_none());
     harness.get_by_label("Continue Watching");
+}
+
+fn overview_shelves(size: [f32; 2]) -> Harness<'static, App> {
+    let mut harness = library(size, "home");
+    let app = harness.state_mut();
+    let films = &app.page.as_ref().unwrap().items;
+    app.servers[0].prefs.name = "Glass".into();
+    app.servers[0].items = (0..21)
+        .map(|index| {
+            let mut film = films[index % films.len()].clone();
+            film.id = format!("film-{index}");
+            film.title = format!("Shelf film {}", index + 1);
+            film
+        })
+        .collect();
+    app.servers[0].artwork = app.covers.clone();
+    let mut books = book_server();
+    let mut book = book_item();
+    book.thumb = None;
+    books.items = vec![book];
+    app.servers.push(living_room_server(&app.sections));
+    app.servers.push(books);
+    app.overview = true;
+    harness.run_steps(4);
+    harness
+}
+
+#[test]
+fn home_shelves_fit_the_pane_width_and_height() {
+    for (size, columns, rows) in [
+        ([860.0, 620.0], 2, 1),
+        ([1440.0, 900.0], 4, 1),
+        ([1440.0, 1600.0], 4, 2),
+        ([2560.0, 1440.0], 8, 2),
+    ] {
+        let harness = overview_shelves(size);
+        let pane = harness.ctx.content_rect();
+        let first = harness.get_by_label("Open Shelf film 1").rect();
+        assert!(
+            pane.contains_rect(first),
+            "{size:?} first preview {first:?}"
+        );
+        if size == [860.0, 620.0] {
+            let mut previous: Option<egui::Rect> = None;
+            for name in ["Glass", "Living Room", "Reading Room"] {
+                let card = harness
+                    .get_by_role_and_label(egui::accesskit::Role::Button, name)
+                    .rect();
+                assert!(pane.contains_rect(card));
+                assert!(
+                    harness
+                        .query_all_by_label("Connected")
+                        .any(|status| card.contains_rect(status.rect()))
+                );
+                if let Some(left) = previous {
+                    assert_eq!(card.top(), left.top());
+                    assert!((card.left() - left.right() - 8.0).abs() <= 1.0);
+                }
+                previous = Some(card);
+            }
+            assert!(pane.contains_rect(harness.get_by_label("Shelf film 1").rect()));
+        }
+        let mut visible = 0;
+        for node in harness.query_all_by_label_contains("Open Shelf film ") {
+            let art = node.rect();
+            if art.left() >= first.left() - 1.0 && art.right() <= pane.right() {
+                visible += 1;
+                assert!(pane.contains_rect(art), "{size:?} clipped preview {art:?}");
+                assert!((art.height() - art.width() * 9.0 / 16.0).abs() <= 1.0);
+                assert!((art.width() - first.width()).abs() <= 1.0);
+            }
+        }
+        assert_eq!(visible, columns * rows, "{size:?} visible previews");
+        let second = harness.get_by_label("Open Shelf film 2").rect();
+        assert!((second.left() - first.right() - 16.0).abs() <= 1.0);
+        if rows == 2 {
+            let next_row = harness
+                .get_by_label(&format!("Open Shelf film {}", columns + 1))
+                .rect();
+            assert!(next_row.top() > first.bottom());
+            assert!((next_row.left() - first.left()).abs() <= 1.0);
+            let book = harness.get_by_label("Open Listening to the Coast").rect();
+            assert!(pane.contains_rect(book), "{size:?} next shelf {book:?}");
+        }
+    }
+}
+
+#[test]
+fn home_reflow_keeps_keyboard_focus_and_pages_to_the_last_title() {
+    let mut harness = overview_shelves([1440.0, 900.0]);
+    let selected = "Open Shelf film 4";
+    harness.get_by_label(selected).focus();
+    harness.run_steps(4);
+    assert!(harness.get_by_label(selected).is_focused());
+    harness.set_size(MIN_BROWSE_SIZE);
+    harness.run_steps(20);
+    let selected = harness.get_by_label(selected);
+    let pane = harness.ctx.content_rect();
+    let left = harness.get_by_label("Continue Watching").rect().left();
+    assert!(selected.is_focused());
+    assert!(selected.rect().left() >= left - 1.0 && pane.contains_rect(selected.rect()));
+
+    let forward = "Scroll Continue Watching forward";
+    for _ in 0..11 {
+        let next = harness.get_by_label(forward);
+        if next.accesskit_node().is_disabled() {
+            break;
+        }
+        next.click();
+        harness.run_steps(20);
+    }
+    assert!(harness.get_by_label(forward).accesskit_node().is_disabled());
+    let last = harness.get_by_label("Open Shelf film 21").rect();
+    assert!(pane.contains_rect(last));
+    assert!((last.left() - left).abs() <= 1.0, "last page {last:?}");
 }
 
 #[test]
@@ -650,6 +772,19 @@ fn book_server() -> Server {
     server
 }
 
+fn living_room_server(libraries: &[Library]) -> Server {
+    let session = session::Session {
+        kind: ServerKind::Plex,
+        server: "http://second.example.test".into(),
+        token: "synthetic".into(),
+        client_id: "ui-test".into(),
+    };
+    let source = fixture_source(&session.server);
+    let mut server = Server::new(session, source, libraries.to_vec(), false);
+    server.prefs.name = "Living Room".into();
+    server
+}
+
 fn book_item() -> Item {
     Item {
         id: "coast".into(),
@@ -696,12 +831,9 @@ fn book_detail(size: [f32; 2]) -> Harness<'static, App> {
         .ctx
         .load_texture("shore", library_art(3, [256, 256]), Default::default());
     let app = harness.state_mut();
-    let server = book_server();
+    app.servers.push(book_server());
+    app.activate(0);
     app.covers.insert("/fixture/shore".into(), texture);
-    app.source = Some(server.source.clone());
-    app.sections = server.sections.clone();
-    app.servers.push(server);
-    app.active = Some(0);
     app.selected_library = Some("books".into());
     app.detail = Some(book_item());
     harness
@@ -1041,7 +1173,12 @@ fn library(size: [f32; 2], screen: &str) -> Harness<'static, App> {
     app.on_deck = items[..3].to_vec();
     app.page = Some(Page::new(items, 0, Some(12)));
     match screen {
-        "missing-art" => app.covers.clear(),
+        "missing-art" => {
+            for item in &mut app.page.as_mut().unwrap().items {
+                item.thumb = None;
+                item.art = None;
+            }
+        }
         "search" => {
             app.search = "Quiet".into();
             app.location.as_mut().unwrap().search = app.search.clone();
@@ -1117,8 +1254,9 @@ fn library_layout_and_scrolling() {
                 if view == "home"
                     && rect.top() < harness.get_by_label("Recently Added").rect().top()
                 {
-                    // Continue Watching intentionally scrolls horizontally.
-                    assert_eq!(rect.size(), Vec2::new(232.0, 130.0) * scale);
+                    // The shelf can extend horizontally. Its artwork keeps a readable 16:9 frame.
+                    assert!(rect.width() >= 239.0 * scale);
+                    assert!((rect.height() - rect.width() * 9.0 / 16.0).abs() <= scale);
                     continue;
                 }
                 assert!(
@@ -1135,8 +1273,7 @@ fn library_layout_and_scrolling() {
                 assert!(recent_heading.top() > continue_heading.bottom() + 150.0 * scale);
             }
             if view == "movies" {
-                harness.get_by_label("Still Life").scroll_to_me();
-                harness.run_steps(4);
+                scroll_to_library_item(&mut harness, "Still Life");
                 assert!(screen.contains_rect(harness.get_by_label("Still Life").rect()));
             }
             if view == "details" {
@@ -1147,6 +1284,26 @@ fn library_layout_and_scrolling() {
             }
         }
     }
+}
+
+fn scroll_to_library_item(harness: &mut Harness<'_, App>, label: &str) {
+    let pane = harness.ctx.content_rect();
+    // Distant rows are created as the user scrolls. Move the wheel over the content pane.
+    for _ in 0..8 {
+        if let Some(item) = harness.query_by_label(label) {
+            item.scroll_to_me();
+            harness.run_steps(4);
+            return;
+        }
+        harness.hover_at(egui::pos2(pane.right() - 64.0, pane.bottom() - 64.0));
+        harness.input_mut().events.push(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: Vec2::new(0.0, -pane.height() * 0.65),
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run_steps(4);
+    }
+    panic!("{label} was unreachable by scrolling");
 }
 
 #[test]
@@ -1220,7 +1377,9 @@ fn parent_libraries_share_search_and_pagination_at_minimum_size() {
     let poster = movies.get_by_label("Open The Quiet Earth").rect();
     let cover = books.get_by_label("Open Listening to the Coast").rect();
     assert_eq!(poster.min, cover.min);
-    assert_eq!(poster.width(), cover.width());
+    assert!((160.0..=210.0).contains(&poster.width()));
+    assert!((176.0..=224.0).contains(&cover.width()));
+    assert!((poster.height() - poster.width() * 1.5).abs() <= 1.0);
     assert_eq!(cover.width(), cover.height());
 
     for (harness, query) in [(&mut movies, "Quiet"), (&mut books, "Coast")] {
@@ -1411,20 +1570,10 @@ fn library_snapshots() {
             });
             app.servers[0].items = app.page.as_ref().unwrap().items.clone();
             app.servers[0].artwork = app.covers.clone();
-            let session = session::Session {
-                kind: ServerKind::Plex,
-                server: "http://second.example.test".into(),
-                token: "synthetic".into(),
-                client_id: "ui-test".into(),
-            };
-            let mut second = Server::new(
-                session.clone(),
-                fixture_source(&session.server),
-                app.sections.clone(),
-                false,
-            );
-            second.prefs.name = "Living Room".into();
-            app.servers.push(second);
+            app.servers.push(living_room_server(&app.sections));
+            if name == "home-minimum" {
+                app.servers.push(book_server());
+            }
             app.overview = true;
         }
         if name == "home-library-menu" {
@@ -1454,7 +1603,7 @@ fn library_snapshots() {
             let second = harness.get_by_label("Open Tide Tables").rect();
             assert!((first.width() - first.height()).abs() <= 1.0);
             assert_eq!(first.top(), second.top());
-            assert!((second.left() - first.right() - 24.0).abs() <= 1.0);
+            assert!((second.left() - first.right() - 16.0).abs() <= 1.0);
             harness.get_by_label("Search library");
         }
         if screen == "book-player-menu" {
@@ -1498,19 +1647,29 @@ fn library_snapshots() {
             };
             let glass = card_header("Glass");
             let other = card_header("Living Room");
-            assert!((glass.width() - 280.0).abs() < 1.0);
             assert!((glass.width() - other.width()).abs() < 1.0);
             assert!(other.right() <= harness.ctx.content_rect().right());
-            let chip = |name| {
-                harness
-                    .get_all_by_label(name)
-                    .map(|node| node.rect())
-                    .find(|r| glass.x_range().contains(r.center().x) && r.top() >= glass.bottom())
-                    .unwrap()
-            };
-            let movies = chip("Movies");
-            for name in ["TV Shows", "Lectures"] {
-                assert!((chip(name).top() - movies.top()).abs() < 1.0);
+            if size[1] <= 740.0 {
+                assert!((163.0..=221.0).contains(&glass.width()));
+                assert_eq!(glass.top(), other.top());
+            } else {
+                assert!((239.0..=281.0).contains(&glass.width()));
+                let chip = |name| {
+                    harness
+                        .get_all_by_label(name)
+                        .map(|node| node.rect())
+                        .find(|r| {
+                            glass.x_range().contains(r.center().x) && r.top() >= glass.bottom()
+                        })
+                        .unwrap()
+                };
+                let movies = chip("Movies");
+                assert!((chip("TV Shows").top() - movies.top()).abs() < 1.0);
+                if let Some(overflow) = harness.query_by_label("Show all libraries on Glass") {
+                    assert!((overflow.rect().center().y - movies.center().y).abs() < 1.0);
+                } else {
+                    assert!((chip("Lectures").top() - movies.top()).abs() < 1.0);
+                }
             }
         }
         let image = harness
@@ -2092,6 +2251,7 @@ fn connected_server_can_be_named_and_finished_from_either_entry_point() {
                         kind: LibraryKind::Movies,
                     }],
                     session,
+                    prefs::LibraryOrder::default(),
                 ),
             ))
             .unwrap();
@@ -2608,6 +2768,7 @@ fn audiobook_home_matches_video_layout_and_pages_recently_added() {
     assert!(listening_offset > 1.0);
     assert_eq!(harness.state().page.as_ref().unwrap().offset, 0);
 
+    scroll_to_library_item(&mut harness, "Open The Winter Marsh");
     let grid_cover = harness.get_by_label("Open The River Mouth").rect();
     let last_cover = harness.get_by_label("Open The Winter Marsh").rect();
     assert_eq!(grid_cover.size(), Vec2::splat(grid_cover.width()));
@@ -2752,31 +2913,6 @@ fn home_pagination_only_changes_recently_added_and_carousels_scroll_with_arrows(
         .click();
     harness.run_steps(20);
     assert!(harness.state().carousel_offsets["released"] > 100.0);
-
-    let mut overview = library([860.0, 900.0], "home");
-    let app = overview.state_mut();
-    app.overview = true;
-    app.servers[0].items = app.page.as_ref().unwrap().items.clone();
-    overview.run_steps(4);
-    let first = overview.get_by_label("Open The Quiet Earth").rect();
-    let mut previous = first;
-    for label in [
-        "Open After Hours",
-        "Open A Place Between the Stars and the Sea",
-        "Open Wild Coast",
-    ] {
-        let row = overview.get_by_label(label).rect();
-        assert!(row.top() > previous.bottom() && (row.left() - first.left()).abs() < 1.0);
-        previous = row;
-    }
-    let next_page = overview.get_by_label("Open Small Hours").rect();
-    assert_eq!(next_page.top(), first.top());
-    assert!(next_page.left() > first.right());
-    overview
-        .get_by_label("Scroll Continue Watching forward")
-        .click();
-    overview.run_steps(20);
-    assert!(overview.state().carousel_offsets["overview_continue"] > 100.0);
 
     // Next page on Home only requests and updates Recently Added.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3002,6 +3138,44 @@ fn removing_a_server_says_whether_its_sign_in_is_revoked() {
             .next()
             .is_none()
     );
+}
+
+#[test]
+fn refreshing_a_populated_home_keeps_the_focused_card_and_its_artwork() {
+    // Hold the loopback response so the assertion always exercises an in-flight refresh.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let source = fixture_source(&format!("http://{}", listener.local_addr().unwrap()));
+    let mut harness = library([860.0, 620.0], "home");
+    let ctx = harness.ctx.clone();
+    let app = harness.state_mut();
+    app.source = Some(source.clone());
+    app.servers[0].source = source;
+    app.home_loaded = true;
+    app.on_deck[2].title = "Retained preview".into();
+    app.released = vec![app.page.as_ref().unwrap().items[4].clone()];
+    let path = app.on_deck[2].art.clone().unwrap();
+    harness.run_steps(4);
+    harness
+        .get_by_label("Scroll Continue Watching forward")
+        .click();
+    harness.run_steps(20);
+    let card = "Open Retained preview";
+    harness.get_by_label(card).focus();
+    harness.run_steps(4);
+    let before = harness.get_by_label(card).rect();
+    let offset = harness.state().carousel_offsets["continue"];
+    assert!(offset > 1.0 && harness.get_by_label(card).is_focused());
+
+    harness.state_mut().load_page(&ctx, PageLoad::Refresh);
+    harness.run_steps(3);
+    let app = harness.state();
+    assert!(app.refreshing && !app.busy);
+    assert_eq!(app.page.as_ref().unwrap().items.len(), 12);
+    assert_eq!(app.released.len(), 1);
+    assert_eq!(app.covers.get(&path).unwrap().1, 1.0);
+    assert_eq!(app.carousel_offsets["continue"], offset);
+    assert!(harness.get_by_label(card).is_focused());
+    assert_eq!(harness.get_by_label(card).rect(), before);
 }
 
 #[test]

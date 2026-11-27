@@ -16,7 +16,7 @@ const UNENCRYPTED: &str = "This address is not encrypted. Your sign-in and media
 
 /// Replies from the add-server flow. They never share the navigation channel.
 pub(super) enum Reply {
-    Connected(Source, Vec<Library>, session::Session),
+    Connected(Source, Vec<Library>, session::Session, prefs::LibraryOrder),
     QuickConnectCode(String),
     Failed(String),
 }
@@ -41,7 +41,7 @@ pub(super) struct SignIn {
 }
 
 impl SignIn {
-    pub(super) fn new(server: String, client_id: String) -> Self {
+    pub(super) fn new(server: String) -> Self {
         let (tx, rx) = mpsc::channel();
         Self {
             server,
@@ -49,7 +49,8 @@ impl SignIn {
             username: String::new(),
             password: String::new(),
             quick_code: None,
-            client_id,
+            // The startup worker restores the installation ID before sign-in is shown.
+            client_id: String::new(),
             form: Form::default(),
             login: None,
             login_url: None,
@@ -375,7 +376,8 @@ impl App {
                 (kind.plugin().authenticate)(&mut session, &request).map_err(String::from)?;
                 let source = session::open(&session)?;
                 let sections = source.libraries().map_err(String::from)?;
-                Ok(Reply::Connected(source, sections, session))
+                let prefs = prefs::load_library_order(&session);
+                Ok(Reply::Connected(source, sections, session, prefs))
             })()
             .unwrap_or_else(Reply::Failed);
             let _ = tx.send((generation, result));
@@ -659,8 +661,8 @@ impl App {
             }
             match reply {
                 Reply::QuickConnectCode(code) => self.sign_in.quick_code = Some(code),
-                Reply::Connected(source, sections, session) => {
-                    self.connected(ctx, source, sections, session);
+                Reply::Connected(source, sections, session, prefs) => {
+                    self.connected(ctx, source, sections, session, prefs);
                 }
                 Reply::Failed(error) => {
                     self.sign_in.busy = false;
@@ -836,6 +838,7 @@ impl App {
         source: Source,
         sections: Vec<Library>,
         session: session::Session,
+        prefs: prefs::LibraryOrder,
     ) {
         self.sign_in.busy = false;
         let remember = self.sign_in.remember;
@@ -860,6 +863,7 @@ impl App {
                     let _ = session::clear(&previous);
                 });
             }
+            server.reset_previews();
             server.session = session;
             server.source = source;
             server.sections = sections;
@@ -874,6 +878,7 @@ impl App {
             }
         } else {
             let mut server = Server::new(session, source, sections, remember);
+            server.prefs = prefs;
             if server.prefs.name.is_empty() {
                 let origin = session::origin(&server.session.server);
                 let discovered = self.sign_in.form.choices.iter().find(|choice| {

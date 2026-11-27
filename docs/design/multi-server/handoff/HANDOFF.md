@@ -11,9 +11,11 @@ This is the design spec for turning Perfuse into a client for several servers at
 | Path | What it is |
 | --- | --- |
 | `index.html` | Clickable prototype entry (open in any browser, 1440×900 recommended; minimum 860×620 like `MIN_BROWSE_SIZE`) |
+| `preview.html` | Offline interactive shelf preview with simulated artwork loading |
 | `css/app.css` | All tokens (`:root`) and component styles |
 | `js/app.js` | Prototype behaviour: navigation, status aggregation, audiobook player, add-server flow, settings |
 | `js/data.js` | Sample servers, videos, audiobooks with chapters (mirrors the model in §9) |
+| `js/shelves.js` | Responsive shelf sizing, paging and the sample artwork reveal |
 | `js/icons.js` | Every glyph used, existing and new, with `isNew` flags |
 | `handoff/icons/*.svg` | **24 new icons** in the exact `assets/icons` format, ready to drop in |
 | `handoff/icons/preview.html` | Contact sheet for the new icons and where each is used |
@@ -21,6 +23,8 @@ This is the design spec for turning Perfuse into a client for several servers at
 | `fonts/Ubuntu-Light.ttf` | egui's default font, copied from `epaint_default_fonts` so the prototype matches the app |
 
 ### Viewing states in the prototype
+
+Open [the shelf preview](../preview.html) to browse a larger fictional library offline. **Replay loading** on Home deliberately delays the second video, *Beyond the Blue*, while the other visible covers arrive. Resize the window, page away and back, or open a title and return to the same shelf position.
 
 | Keys | State |
 | --- | --- |
@@ -61,7 +65,7 @@ Existing constants are unchanged. Add only the ones marked **NEW**.
 
 Type uses the egui default (Ubuntu Light). Sizes: caption 12, small 13, body 15 (`TextStyle::Body`), lead 16, h3 18, h2 22, h1 30, display 36.
 Spacing is on a 4 px grid: 4 / 8 / 12 / 16 / 20 / 24 / 28 / 32 / 40 / 48.
-Radii: cards 8, sidebar items 8, controls 14, panels 18, pills 22, onboarding card 26.
+Browse cards, navigation, controls, popovers and panels have square corners. Keep the existing Windows-style pin, minimize, maximize and close buttons in the top-right title bar. Status dots and circular control indicators retain their geometry.
 
 ---
 
@@ -88,7 +92,7 @@ First run (no servers) → landing           ← redesigned
 
 ```
  ┌──────────────────────────────┐
- │ [⌂] Home                     │  nav item 42h, r8, icon 18, text inset 40 (SIDEBAR_TEXT_INSET)
+ │ [⌂] Home                     │  nav item 42h, icon 18, text inset 40 (SIDEBAR_TEXT_INSET)
  │                              │
  │ [▶] BASEMENT        [≡] [⌄]  │  server group header 32h: kind icon 16 + NAME (12 px, UPPER, +0.06em, MUTED)
  │   [▦] Movies                 │  libraries as today
@@ -127,11 +131,11 @@ First run (no servers) → landing           ← redesigned
 
 The glyph shape changes along with the colour, so status is never conveyed by colour alone.
 
-### Hover popover (340 px wide, panel fill, r14, 16 padding, opens 8 px above the button)
+### Hover popover (340 px wide, panel fill, 16 padding, opens 8 px above the button)
 
 - It opens on **hover** after 250 ms and on **keyboard focus**. Clicking pins it open. It closes on mouse-leave (unless pinned), Escape or an outside click.
 - Header: the title (`All servers connected` / `1 server unreachable` / `No servers reachable`) and a one-line summary.
-- One row per server: a 32 px kind tile, the name, and the state line. The state line reads `Connected · 12 ms` or `Can't reach server · last seen 4 min ago` (in red), and offline rows get a **Retry** pill.
+- One row per server: a 32 px kind tile, the name, and the state line. The state line reads `Connected · 12 ms` or `Can't reach server · last seen 4 min ago` (in red), and offline rows get a **Retry** button.
 - Footer: `Check again` (re-checks unreachable servers, or all of them if all are online) · `Manage servers` (opens Settings).
 - In egui this is an `egui::Area` anchored to the button rect with `Order::Foreground`. Hover uses `response.hovered()` plus a short delay; keep it open while the pointer is over the area itself.
 
@@ -144,15 +148,21 @@ The glyph shape changes along with the colour, so status is never conveyed by co
    - a 48 px kind tile,
    - the name (18 px) and the kind label (12 px MUTED),
    - the state line with its glyph,
-   - library chips (28 h, r14, icon and name).
+   - library chips (28 h, icon and name).
    Clicking a card opens Server Home. An offline card gets a dark-red tint (`#1A1718` fill, `#3A2526` border) and faint chips.
-3. **Continue Watching:** all in-progress video across online servers, as landscape 232×130 cards. Each card adds a **source line**: kind glyph (13 px) and server name.
-4. **Continue Listening:** in-progress audiobooks as 184 px square covers. They show the source line, `author · 2 h 45 min left`, and a `Playing` / `Paused` badge on the current book.
+3. **Continue Watching:** all in-progress video across online servers, as 16∶9 cards. Each card adds a **source line** with the kind glyph (13 px) and server name.
+4. **Continue Listening:** in-progress audiobooks with square covers. They show the source line, `author · 2 h 45 min left`, and a `Playing` / `Paused` badge on the current book.
    Each row appears only when it has items. "Watching" and "Listening" are split by content type.
 5. If a server is unreachable, its items are removed from the rows. A note under the row explains why: `2 items from Media hidden while offline`, with the WARN glyph.
 6. If **no** server is reachable, the rows are replaced by the offline empty state: `Can't reach any of your servers`, with **Try again** and **Server settings** buttons.
 
 Rail arrows sit next to each heading, as in v0.3.1.
+
+Size shelves from the usable content width in logical points. Use a 16-point gap and minimum widths of 240 for video, 176 for books and 160 for posters. Evenly distribute the remaining width up to a comfortable maximum. Every full page uses whole columns. The final page keeps the same card widths. Continue Watching gets one row by default. A tall window can show two when the next populated shelf still fits. Compact server cards on short windows to keep playable items within reach.
+
+Show titles, progress and focus immediately. Reserve the artwork rectangle while its image loads. Newly ready previews fade over 83 ms with a 16 ms stagger between simultaneous arrivals, capped at 48 ms. Each image can finish independently. Previously displayed covers return immediately. Use an instant reveal when Windows animation effects are disabled.
+
+Crossfade the outgoing and incoming content panes over 120 ms when opening another screen or going back. Keep the title bar, sidebar and audiobook dock steady. Scrolling, resizing and same-screen updates keep their existing content visible. Switch screens immediately when animation effects are disabled.
 
 ## 7. Server Home (today's Home, scoped)
 
@@ -168,7 +178,7 @@ Rail arrows sit next to each heading, as in v0.3.1.
 
 ### Audiobook details
 
-- **Hero (panel, r18, 28 padding):**
+- **Hero (panel, 28 padding):**
   - 200 px square cover.
   - Eyebrow `AUDIOBOOK` (ACCENT, 12 px, uppercase).
   - Title (36 px).
@@ -182,7 +192,7 @@ Rail arrows sit next to each heading, as in v0.3.1.
   - Currently playing: `Pause`, plus `Open player`.
   - Next to the actions, a progress line: `Chapter 9 of 16 · 2 h 45 min left`.
 - **Two columns** (stacked below 1180 px):
-  - **Chapters panel:** each row is 52 px min, r10. The leading column shows a ✓ (GREEN) for played chapters, `now-playing` (ACCENT) for the current one, and the number for upcoming ones. Then the title (ellipsis), and on the current row a 3 px in-chapter progress bar. Duration `mm:ss` / `h:mm:ss` (tabular figures). The current row uses the selected fill; played titles are MUTED. Clicking any row plays from that chapter.
+  - **Chapters panel:** each row is 52 px min. The leading column shows a ✓ (GREEN) for played chapters, `now-playing` (ACCENT) for the current one, and the number for upcoming ones. Then the title (ellipsis), and on the current row a 3 px in-chapter progress bar. Duration `mm:ss` / `h:mm:ss` (tabular figures). The current row uses the selected fill; played titles are MUTED. Clicking any row plays from that chapter.
   - **Bookmarks panel:** a bookmark glyph, the note, `5:52:10 · 9. Brackish`, and a delete ✕. Clicking a bookmark jumps to it and plays. Empty state: `No bookmarks yet. Add one while listening to save your place with a note.`
   - **Details panel:** server, library, narrator, release year, length.
 
@@ -215,7 +225,7 @@ It shows on every browse screen while a book is loaded, and is hidden on the ful
   - **chapter scrubber:** a slider over the current chapter only, labelled `elapsed` and `−remaining`,
   - **book track:** a thin 4 px whole-book bar with a 2 px **tick at each chapter boundary** (the current chapter's tick is ACCENT), labelled `Book 5:52:10 of 7:21:00` and `1 h 29 min left`. At speeds other than 1×, the right label reads `1 h 11 min left at 1.25×`,
   - transport: 27.5 px icons in 44 px buttons and a 35 px play/pause icon in a 64 px white button,
-  - tools row (40 h pills): `Speed 1.25×`, `Sleep · 28:41`, `Add bookmark`.
+  - tools row (40 h buttons): `Speed 1.25×`, `Sleep · 28:41`, `Add bookmark`.
 - Right column (360 px, sticky, panel): a segmented tab control, `Chapters (16)` / `Bookmarks (1)`, with the lists described above.
 - **Previous chapter** jumps to the start of the current chapter if more than 3 s have played; otherwise it goes to the previous chapter.
 - **Speed menu:** 0.75, 1 (normal), 1.25, 1.5, 1.75, 2, 2.5, 3×.
@@ -229,7 +239,7 @@ Playback itself still goes through `Player` / libmpv. Audio-only needs no video 
 
 ## 9. First run (landing), redesigned
 
-This uses the same centred card language as today's login screen (panel `#1C1C1E`, r26, 44 padding, 720 px max).
+This uses the same centred card language as today's login screen (panel `#1C1C1E`, 44 padding, 720 px max).
 
 1. The Perfuse mark and wordmark (40 px ACCENT).
 2. `Make yourself at home.` / `Your films, shows and audiobooks, in original quality. Connect a server to get started. You can add more later.`
@@ -264,8 +274,8 @@ This uses the same centred card language as today's login screen (panel `#1C1C1E
 
 ## 10. Settings → Servers, redesigned
 
-- **Section head:** `Servers`, the server count, and an **Add server** primary pill. That pill opens the same flow in a modal `<dialog>` (640 px, r22); in egui, a modal `Window`. Close (✕), Escape, and Done all return focus to *Add server*.
-- **One row per server** (panel, r14). The columns are:
+- **Section head:** `Servers`, the server count, and an **Add server** primary button. That button opens the same flow in a modal `<dialog>` (640 px); in egui, a modal `Window`. Close (✕), Escape, and Done all return focus to *Add server*.
+- **One row per server** (panel). The columns are:
   - drag handle (28 px),
   - kind tile (44 px),
   - **name** (16 px) over `Plex · https://192.168.1.20:32400` (12 px MUTED, ellipsis),
@@ -276,7 +286,7 @@ This uses the same centred card language as today's login screen (panel `#1C1C1E
 - **Expanded detail:**
   - Type, Address, Signed in as, Status.
   - **Library visibility switches** (`Libraries shown in the sidebar and on Home`). A hidden library disappears from the sidebar, the rows and Server Home.
-  - `Check connection` and `Sign out and remove` (danger pill).
+  - `Check connection` and `Sign out and remove` (danger button).
 - **Remove** asks for confirmation: `Remove Basement?` / `Perfuse will sign out of this Plex server and forget its saved sign-in. Your progress stays on the server.` with Cancel / Remove (danger). Removing the last server returns to the first-run landing.
 
 ---

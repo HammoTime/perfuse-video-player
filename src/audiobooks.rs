@@ -23,7 +23,6 @@ struct LoadedBook {
     kind: ServerKind,
     server_name: String,
     covers: Artwork,
-    cover_rx: Option<Receiver<egui::ColorImage>>,
 }
 
 #[derive(Clone, Copy)]
@@ -96,6 +95,12 @@ struct PendingBookmark {
 }
 
 impl BookPlayer {
+    pub(super) fn artwork_source(&self) -> Option<(&Artwork, &Source)> {
+        self.loaded
+            .as_ref()
+            .map(|book| (&book.covers, &book.source))
+    }
+
     pub fn is_loaded(&self) -> bool {
         self.loaded.is_some()
     }
@@ -166,36 +171,16 @@ fn book_panel() -> egui::Frame {
 impl App {
     pub fn book_started(&mut self, item: &Item, source: &Source) {
         self.book.completed = false;
-        let mut covers = Artwork::default();
-        let mut cover_rx = None;
         let server = self.servers.iter().find(|s| Arc::ptr_eq(&s.source, source));
-        if let Some(path) = &item.thumb {
-            let texture = self
-                .covers
-                .get(path)
-                .or_else(|| server.and_then(|s| s.artwork.get(path)));
-            if let Some((texture, _)) = texture {
-                covers.insert(path.clone(), texture.clone());
-            } else {
-                // A browse generation can change while its cover request is in flight.
-                // Give the dock its own source-scoped copy for the lifetime of the book.
-                let (tx, rx) = mpsc::channel();
-                let (source, path) = (source.clone(), path.clone());
-                tasks::spawn(move || {
-                    if let Some(image) = source
-                        .cached_artwork(&path)
-                        .or_else(|| source.artwork(&path).ok())
-                    {
-                        let size = [image.width() as usize, image.height() as usize];
-                        let _ = tx.send(egui::ColorImage::from_rgba_unmultiplied(
-                            size,
-                            image.as_raw(),
-                        ));
-                    }
-                });
-                cover_rx = Some(rx);
-            }
-        }
+        let covers = server
+            .map(|s| s.artwork.clone())
+            .or_else(|| {
+                self.source
+                    .as_ref()
+                    .filter(|active| Arc::ptr_eq(active, source))
+                    .map(|_| self.covers.clone())
+            })
+            .unwrap_or_default();
         let kind = server.map_or_else(ServerKind::default, |s| s.session.kind);
         self.book.loaded = Some(LoadedBook {
             item: Arc::new(item.clone()),
@@ -205,7 +190,6 @@ impl App {
                 .map(Server::name)
                 .unwrap_or_else(|| kind.plugin().name.into()),
             covers,
-            cover_rx,
         });
         self.book.full = false;
         self.book.show_bookmarks = false;
@@ -310,21 +294,6 @@ impl App {
     }
 
     pub fn book_tick(&mut self, ctx: &egui::Context) {
-        if let Some(loaded) = self.book.loaded.as_mut()
-            && let Some(rx) = &loaded.cover_rx
-        {
-            match rx.try_recv() {
-                Ok(image) => {
-                    if let Some(path) = &loaded.item.thumb {
-                        let texture = ctx.load_texture(path, image, egui::TextureOptions::LINEAR);
-                        loaded.covers.insert(path.clone(), texture);
-                    }
-                    loaded.cover_rx = None;
-                }
-                Err(mpsc::TryRecvError::Disconnected) => loaded.cover_rx = None,
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-        }
         let expired = self
             .book
             .sleep

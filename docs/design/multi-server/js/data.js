@@ -134,3 +134,31 @@ window.PLEX_DISCOVERED = [
   { name: 'Cabin', address: 'https://cabin.plex.direct:32400', owned: true, libraries: 2 },
   { name: "Alex's Plex", address: 'https://10-0-0-8.alex.plex.direct:32400', owned: false, libraries: 4 },
 ];
+
+window.SHELF_PREVIEW = document.documentElement.hasAttribute('data-preview')
+  || new URLSearchParams(location.search).get('preview') === '1';
+if (window.SHELF_PREVIEW) {
+  const palettes = Object.keys(window.PALETTES);
+  const films = ['Borrowed Light', 'The Crossing Guard', 'Glass Harbour', 'West of Orion',
+    'Saltwater', 'The Night Garden', 'After the Rain', 'Waypoint', 'Before the Tide',
+    'Low Country', 'A Thousand Windows', 'The Other Shore', 'First Frost', 'Paper Moonrise',
+    'Summer Frequency', 'The Cartographer', 'Still Water', 'On the Meridian', 'Far Signal'];
+  films.forEach((title, i) => {
+    const source = window.SEED_VIDEOS[i % 2 === 0 ? 0 : 2];
+    window.SEED_VIDEOS.push({ ...source, id: 'film-' + i, title, year: 2010 + i % 16,
+      minutes: 90 + (i * 13) % 49, progress: (12 + i * 3) / 100,
+      palette: palettes[(i + 3) % palettes.length], recent: 10 + i });
+  });
+  const books = ['A Field Guide to Fog', 'Letters from the Estuary', 'Winter Glass',
+    'The Long Observatory', 'Night Ferries', 'The Clockmaker’s Garden', 'Under a Silver Sky',
+    'A Dictionary of Tides', 'Copper and Ash', 'Where Rivers Turn', 'The Lantern Atlas',
+    'Beyond the Sound', 'Between Two Aprils', 'A History of Rain'];
+  books.forEach((title, i) => {
+    const source = window.SEED_BOOKS[i % 4];
+    window.SEED_BOOKS.push({ ...source, id: 'book-' + i, title,
+      description: '', series: null, seriesIndex: null, chapters: chapters([
+        ['Chapter 1', 2510], ['Chapter 2', 2860], ['Chapter 3', 3200], ['Chapter 4', 2700],
+      ]), bookmarks: [], finished: false, position: 600 + i * 395,
+      palette: palettes[(i + 5) % palettes.length], recent: 10 + i });
+  });
+}

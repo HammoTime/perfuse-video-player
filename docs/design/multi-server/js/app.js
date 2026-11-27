@@ -39,7 +39,7 @@
   const bookById = (id) => state.books.find((b) => b.id === id);
   const videoById = (id) => state.videos.find((v) => v.id === id);
   const libOf = (s, id) => s && s.libraries.find((l) => l.id === id);
-  const isOnline = (s) => s && s.status === 'online';
+  const isOnline = (s) => s && (s.status === 'online' || (s.status === 'checking' && s.wasOnline));
   const itemVisible = (item) => {
     const s = serverById(item.serverId);
     const l = libOf(s, item.libraryId);
@@ -110,7 +110,7 @@
   function art(palette, kind, opts = {}) {
     const [top, bottom] = window.PALETTES[palette] || window.PALETTES.slate;
     const id = `art${++artSeq}`;
-    const [w, h] = { landscape: [232, 130], poster: [168, 252], square: [200, 200] }[kind];
+    const [w, h] = { landscape: [240, 135], poster: [168, 252], square: [200, 200] }[kind];
     const sunR = kind === 'poster' ? 26 : kind === 'square' ? 20 : 12;
     const sunX = kind === 'square' ? w * 0.74 : w * 0.68;
     const sunY = kind === 'square' ? h * 0.5 : h * 0.3;
@@ -254,7 +254,8 @@
   function viewHome() {
     const a = aggregate();
     const refresh = `<button type="button" class="icon-btn lg" data-action="retry-all" data-fk="home-refresh" aria-label="Check all servers" title="Check all servers">${icon('refresh')}</button>`;
-    let h = pageHead({ title: 'Home', sub: 'Pick up where you left off, across all your servers.', action: refresh });
+    const replay = window.SHELF_PREVIEW ? '<button type="button" class="btn btn-secondary sm" data-action="replay-art" title="Replay artwork loading with one slow cover">Replay loading</button>' : '';
+    let h = pageHead({ title: 'Home', sub: 'Pick up where you left off, across all your servers.', action: replay + refresh });
     h += `<section class="section" aria-labelledby="h-servers"><div class="section-head"><h2 id="h-servers">Servers</h2><span class="meta st-${a.level}">${esc(a.text)}</span></div><div class="server-cards">${state.servers.map(serverCard).join('')}</div></section>`;
     if (a.level === 'offline') return h + emptyOffline(null);
 
@@ -289,7 +290,7 @@
     const libs = s.libraries.filter((l) => l.visible);
     const sub = `${esc(k.label)} server · ${libs.length} ${libs.length === 1 ? 'library' : 'libraries'}`;
     let h = pageHead({ title: s.name, sub, pre, action: refresh });
-    if (s.status !== 'online') return h + emptyOffline(s);
+    if (!isOnline(s)) return h + emptyOffline(s);
     if (s.kind === 'audiobookshelf') {
       const books = state.books.filter((b) => b.serverId === s.id && itemVisible(b));
       const cont = books.filter(inProgress);
@@ -310,7 +311,7 @@
     if (!s || !l) return viewHome();
     const pre = crumb([...serverCrumbParts(s)]);
     let h;
-    if (s.status !== 'online') return pageHead({ title: l.name, pre }) + emptyOffline(s);
+    if (!isOnline(s)) return pageHead({ title: l.name, pre }) + emptyOffline(s);
     if (l.type === 'audiobooks') {
       const books = state.books.filter((b) => b.libraryId === l.id && b.serverId === s.id).sort((a, b) => a.title.localeCompare(b.title));
       h = pageHead({ title: l.name, sub: `${books.length} audiobooks`, pre });
@@ -806,8 +807,7 @@
     const ae = document.activeElement;
     const fk = ae && ae.dataset ? ae.dataset.fk : null;
     const content = $('#content');
-    const railScroll = {};
-    $$('.rail', content).forEach((r) => { railScroll[r.id] = r.scrollLeft; });
+    const railPositions = window.shelves.positions();
     const top = content.scrollTop;
 
     if (!state.servers.length) state.onboarding = true;
@@ -838,7 +838,7 @@
       content.innerHTML = html;
       $('#dock-slot').innerHTML = renderDock();
       content.scrollTop = top;
-      $$('.rail', content).forEach((r) => { if (railScroll[r.id]) r.scrollLeft = railScroll[r.id]; });
+      window.shelves.attach(railPositions);
     }
     const b = bookById(state.player.bookId);
     liveChapterIdx = b ? chapterAt(b, b.position) : null;
@@ -875,23 +875,50 @@
   }
 
   // ── navigation ───────────────────────────────────────────
+  let pendingNavigation;
+  function changeScreen(update, destination) {
+    // A second navigation can arrive before the browser has captured the first screen.
+    // Commit it in order so Back remembers the correct view, focus and scroll position.
+    pendingNavigation?.();
+    const changed = !destination || ['name', 'id', 'serverId', 'libraryId'].some(key => state.view[key] !== destination[key]);
+    if (changed && document.startViewTransition && !matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      const commit = () => {
+        if (pendingNavigation !== commit) return;
+        pendingNavigation = null;
+        update();
+      };
+      pendingNavigation = commit;
+      // A newer transition can skip the capture. The browser still runs commit.
+      document.startViewTransition(commit).ready.catch(() => {});
+    } else {
+      update();
+    }
+  }
   function go(view) {
-    state.history.push({ view: state.view, scroll: $('#content').scrollTop });
-    state.view = view;
-    state.menu = null;
-    state.status.open = false;
-    renderAll();
-    $('#content').scrollTop = 0;
-    focusHeading();
+    changeScreen(() => {
+      state.history.push({ view: state.view, scroll: $('#content').scrollTop,
+        rails: window.shelves.positions(), focus: document.activeElement?.dataset.fk });
+      state.view = view;
+      state.menu = null;
+      state.status.open = false;
+      renderAll();
+      $('#content').scrollTop = 0;
+      focusHeading();
+    }, view);
   }
   function back() {
-    const prev = state.history.pop();
-    if (!prev) return;
-    state.view = prev.view;
-    state.menu = null;
-    renderAll();
-    $('#content').scrollTop = prev.scroll;
-    focusHeading();
+    if (!state.history.length && !pendingNavigation) return;
+    changeScreen(() => {
+      const prev = state.history.pop();
+      if (!prev) return;
+      state.view = prev.view;
+      state.menu = null;
+      renderAll();
+      $('#content').scrollTop = prev.scroll;
+      window.shelves.restore(prev.rails);
+      const trigger = prev.focus && $(`[data-fk="${CSS.escape(prev.focus)}"]`);
+      if (trigger) trigger.focus({ preventScroll: true }); else focusHeading();
+    });
   }
   function focusHeading() {
     const h = $('#page-title');
@@ -940,7 +967,7 @@
   function retry(ids) {
     const targets = ids.map(serverById).filter(Boolean);
     if (!targets.length) return;
-    targets.forEach((s) => { s.status = 'checking'; });
+    targets.forEach((s) => { s.wasOnline = isOnline(s); s.status = 'checking'; });
     renderAll();
     announce('Checking servers…');
     setTimeout(() => {
@@ -1031,7 +1058,8 @@
         break;
       case 'retry-server': retry([d.server]); break;
       case 'retry-all': retry(state.servers.filter((s) => s.status !== 'online').map((s) => s.id).concat(state.servers.every(isOnline) ? state.servers.map((s) => s.id) : [])); break;
-      case 'rail': { const r = $(`#rail-${d.rail}`); if (r) r.scrollBy({ left: Number(d.dir) * r.clientWidth * 0.8 }); break; }
+      case 'rail': { const r = $(`#rail-${d.rail}`); if (r) window.shelves.page(r, Number(d.dir)); break; }
+      case 'replay-art': window.shelves.replay(); break;
       case 'video-play': { const v = videoById(d.id); toast(`Starting ${v.title}`); break; }
       case 'book-play': startBook(d.id, false); break;
       case 'book-start': startBook(d.id, true); break;
@@ -1175,7 +1203,7 @@
         break;
       case 'flow-finish':
         if (state.flowCtx === 'dialog') { closeAddDialog(); renderAll(); }
-        else { state.onboarding = false; state.flow = null; state.view = { name: 'home' }; state.history = []; renderAll(); focusHeading(); }
+        else changeScreen(() => { state.onboarding = false; state.flow = null; state.view = { name: 'home' }; state.history = []; renderAll(); focusHeading(); });
         break;
       default: break;
     }

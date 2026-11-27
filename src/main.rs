@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod artwork;
+use artwork::Artwork;
 mod audiobooks;
 mod connection;
 mod icons;
@@ -7,6 +9,7 @@ mod mpv;
 mod player;
 mod prefs;
 mod runtime;
+mod screen_fade;
 mod servers;
 mod session;
 use servers::Server;
@@ -79,10 +82,11 @@ const MINI_PLAYER_WIDTH: f32 = 540.0;
 const MINI_PLAYER_HEIGHT: f32 = 380.0;
 const RESIZE_BORDER: f32 = 6.0;
 const RESIZE_CORNER: f32 = 12.0;
-const HOME_CARD_WIDTH: f32 = 232.0;
-const BOOK_CARD_WIDTH: f32 = 184.0;
-/// Gap between square artwork in grids and shelves.
-const ART_GAP: f32 = 24.0;
+const VIDEO_WIDTH: (f32, f32) = (240.0, 320.0);
+const BOOK_WIDTH: (f32, f32) = (176.0, 224.0);
+const POSTER_WIDTH: (f32, f32) = (160.0, 210.0);
+const ART_GAP: f32 = 16.0;
+const COMPACT_HOME_HEIGHT: f32 = 740.0;
 
 fn main() -> eframe::Result {
     // Before any other thread starts or any library loads.
@@ -138,6 +142,13 @@ struct Location {
     parent: Option<Item>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PageLoad {
+    Navigate,
+    Paginate,
+    Refresh,
+}
+
 /// Replies to navigation requests. Sign-in replies use their own channel.
 enum Reply {
     /// A page plus optional Home Continue Watching and Recently Released rows.
@@ -149,8 +160,6 @@ enum Reply {
         snapshot: Option<metadata::Home>,
     },
     Details(Item),
-    Cover(String, egui::ColorImage),
-    ArtworkDone,
     Failed(SourceError),
 }
 
@@ -259,6 +268,8 @@ struct App {
     released: Vec<Item>,
     carousel_offsets: HashMap<&'static str, f32>,
     covers: Artwork,
+    artwork_scheduler: artwork::Scheduler,
+    screen_fade: screen_fade::ScreenFade,
     detail: Option<Item>,
     version: usize,
     resume: bool,
@@ -279,6 +290,17 @@ struct App {
 }
 
 impl App {
+    fn artwork_frame(&mut self, ctx: &egui::Context) {
+        let sources = self
+            .source
+            .as_ref()
+            .map(|source| (&self.covers, source))
+            .into_iter()
+            .chain(self.servers.iter().map(|s| (&s.artwork, &s.source)))
+            .chain(self.book.artwork_source());
+        self.artwork_scheduler.frame(ctx, sources);
+    }
+
     fn new(ctx: &egui::Context) -> Self {
         icons::install(ctx);
         let mut visuals = egui::Visuals::dark();
@@ -332,8 +354,6 @@ impl App {
             status_popover: servers::HoverPopover::default(),
             sign_in: connection::SignIn::new(
                 std::env::var("PLEX_URL").unwrap_or_else(|_| plex::PLUGIN.default_address.into()),
-                // One stable identity per install, so servers list Perfuse as a single device.
-                prefs::device_id(),
             ),
             source: None,
             sections: vec![],
@@ -347,6 +367,8 @@ impl App {
             released: vec![],
             carousel_offsets: HashMap::new(),
             covers: Artwork::default(),
+            artwork_scheduler: artwork::Scheduler::default(),
+            screen_fade: screen_fade::ScreenFade::default(),
             detail: None,
             version: 0,
             resume: true,
@@ -366,7 +388,7 @@ impl App {
                 playing_seconds: 0.0,
                 playing_duration: 0.0,
                 buffered: 0.0,
-                volume: prefs::Volume::load(),
+                volume: prefs::Volume::default(),
                 seek_position: None,
                 fullscreen: false,
                 always_on_top: false,
@@ -519,39 +541,63 @@ impl App {
         // A snapshot refresh still in flight belongs to the view being left.
         self.refreshing = false;
         self.error = None;
-        // Any earlier artwork worker is cancelled with its generation.
-        self.covers.loading = false;
         self.generation.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    fn load_page(&mut self, ctx: &egui::Context, recently_added_only: bool) {
+    /// Identify the page being drawn, independent of scroll, typing, artwork and refresh.
+    fn browse_screen(&self, video_playing: bool) -> Option<egui::Id> {
+        let source = self.source.as_ref()?;
+        if video_playing || self.adding || self.removing.is_some() {
+            return None;
+        }
+        let server = egui::Id::new(("browse", Arc::as_ptr(source) as *const ()));
+        if self.book.full {
+            return Some(egui::Id::new("book player"));
+        }
+        if self.connection_open {
+            return Some(egui::Id::new(("settings", self.settings_tab)));
+        }
+        if self.overview {
+            return Some(egui::Id::new("all servers home"));
+        }
+        if self.active.is_some_and(|i| !self.servers[i].online) {
+            return None;
+        }
+        if let Some(item) = &self.detail {
+            return Some(server.with(("detail", &item.id)));
+        }
+        Some(server.with((
+            self.selected_library.as_deref(),
+            self.location.as_ref().map(|location| {
+                (
+                    location.parent.as_ref().map(|item| &item.id),
+                    &location.search,
+                    location.offset,
+                )
+            }),
+        )))
+    }
+
+    fn load_page(&mut self, ctx: &egui::Context, mode: PageLoad) {
         let (Some(source), Some(location)) = (self.source.clone(), self.location.clone()) else {
             return;
         };
         let generation = self.begin();
-        self.page = None;
-        self.detail = None;
-        if recently_added_only {
-            let keep: std::collections::HashSet<String> = self
-                .on_deck
-                .iter()
-                .chain(self.released.iter())
-                .flat_map(|item| {
-                    let art = (item.kind == Kind::Movie)
-                        .then(|| item.art.clone())
-                        .flatten();
-                    [item.thumb.clone(), art].into_iter().flatten()
-                })
-                .collect();
-            self.covers.retain(&keep);
+        let recently_added_only = mode == PageLoad::Paginate && self.selected_library.is_none();
+        let keep_page = mode == PageLoad::Refresh && self.page.is_some();
+        if keep_page {
+            self.busy = false;
+            self.refreshing = true;
         } else {
-            self.covers.clear();
+            self.page = None;
+        }
+        self.detail = None;
+        if !keep_page && !recently_added_only {
             self.home_loaded = false;
             self.on_deck.clear();
             self.released.clear();
             self.carousel_offsets.clear();
         }
-        self.covers.loading = true;
         let full_home = matches!(location.browse, Browse::RecentlyAdded)
             && !recently_added_only
             && location.offset == 0
@@ -562,7 +608,10 @@ impl App {
             .filter(|s| full_home && s.remembered)
             .map(|s| s.store.clone());
         // Show the last Home seen for this server while the fresh one loads.
-        if let Some(home) = server.filter(|_| full_home).and_then(|s| s.home.clone()) {
+        if let Some(home) = server
+            .filter(|_| full_home && !keep_page)
+            .and_then(|s| s.home.clone())
+        {
             self.busy = false;
             self.refreshing = true;
             self.home_loaded = true;
@@ -574,15 +623,7 @@ impl App {
             };
             self.on_deck = home.on_deck.into_iter().filter(visible).collect();
             self.released = home.released.into_iter().filter(visible).collect();
-            let art = page_art(&home.page, Some((&self.on_deck, &self.released)), None);
             self.page = Some(home.page);
-            let (source, tx, ctx, current) = (
-                source.clone(),
-                self.tx.clone(),
-                ctx.clone(),
-                self.generation.clone(),
-            );
-            tasks::spawn(move || load_artwork(&source, art, generation, &current, &tx, &ctx));
         }
         let sections = self.sections.clone();
         let continue_heading = self.continue_heading();
@@ -628,13 +669,6 @@ impl App {
                     let notice = (!unavailable.is_empty()).then(|| {
                         format!("{} is unavailable from this server. You can still browse your libraries.", unavailable.join(" and "))
                     });
-                    let art = page_art(
-                        &page,
-                        home_rows
-                            .as_ref()
-                            .map(|(on_deck, released)| (&on_deck[..], &released[..])),
-                        location.parent.as_ref(),
-                    );
                     let snapshot =
                         home_rows
                             .as_ref()
@@ -662,7 +696,6 @@ impl App {
                         return;
                     }
                     ctx.request_repaint();
-                    load_artwork(&source, art, generation, &current, &tx, &ctx);
                 }
                 Err(error) => {
                     let _ = tx.send((generation, Reply::Failed(error)));
@@ -688,7 +721,7 @@ impl App {
             library: true,
             parent: None,
         });
-        self.load_page(ctx, false);
+        self.load_page(ctx, PageLoad::Navigate);
     }
 
     fn open_item(&mut self, item: &Item, ctx: &egui::Context) {
@@ -697,7 +730,6 @@ impl App {
                 return;
             };
             let generation = self.begin();
-            self.covers.loading = true;
             let (tx, ctx, id, current) = (
                 self.tx.clone(),
                 ctx.clone(),
@@ -710,13 +742,7 @@ impl App {
                 }
                 match source.item(&id) {
                     Ok(item) => {
-                        let art: Vec<_> = [item.art.clone(), item.thumb.clone()]
-                            .into_iter()
-                            .flatten()
-                            .collect();
                         let _ = tx.send((generation, Reply::Details(item)));
-                        ctx.request_repaint();
-                        load_artwork(&source, art, generation, &current, &tx, &ctx);
                     }
                     Err(error) => {
                         let _ = tx.send((generation, Reply::Failed(error)));
@@ -740,7 +766,7 @@ impl App {
                 library: false,
                 parent: Some(item.clone()),
             });
-            self.load_page(ctx, false);
+            self.load_page(ctx, PageLoad::Navigate);
         }
     }
 
@@ -820,21 +846,18 @@ impl App {
                     self.version = 0;
                     self.resume = true;
                 }
-                Reply::Cover(path, image) => {
-                    let texture = ctx.load_texture(&path, image, egui::TextureOptions::LINEAR);
-                    self.covers.arrive(path, texture, ctx.input(|i| i.time));
-                }
-                Reply::ArtworkDone => self.covers.loading = false,
                 Reply::Failed(error) => {
                     self.busy = false;
                     self.refreshing = false;
-                    self.covers.loading = false;
                     // Retrying cannot fix a rejected sign-in, so show the way to sign in again.
                     if error.is_unauthorized()
                         && let Some(i) = self.active
                     {
                         self.servers[i].online = false;
                         self.servers[i].expired = true;
+                    } else if self.location.is_none() && self.detail.is_none() {
+                        // An item opened from combined Home has no collection underneath it.
+                        self.overview = true;
                     }
                     self.error = Some(error.into());
                 }
@@ -934,10 +957,14 @@ impl App {
             library: false,
             parent: None,
         });
-        self.load_page(ctx, false);
+        self.load_page(ctx, PageLoad::Navigate);
     }
 
     fn back(&mut self, ctx: &egui::Context) {
+        if self.busy && self.location.is_none() && !self.connection_open && !self.book.full {
+            self.generation.fetch_add(1, Ordering::Relaxed);
+            self.busy = false;
+        }
         if self.book.full {
             self.book.full = false;
         } else if self.connection_open {
@@ -950,7 +977,7 @@ impl App {
         } else if let Some(location) = self.history.pop() {
             self.search = location.search.clone();
             self.location = Some(location);
-            self.load_page(ctx, false);
+            self.load_page(ctx, PageLoad::Navigate);
         } else if self.selected_library.is_some() {
             self.home(ctx);
         } else {
@@ -983,7 +1010,7 @@ impl App {
             location.offset = location.previous_pages.pop().unwrap_or(0);
             location.shown = location.previous_shown.pop().unwrap_or(0);
         }
-        self.load_page(ctx, self.selected_library.is_none());
+        self.load_page(ctx, PageLoad::Paginate);
     }
 
     fn page_next(&mut self, ctx: &egui::Context) {
@@ -995,7 +1022,7 @@ impl App {
             location.offset = next;
             location.shown += page.items.len();
         }
-        self.load_page(ctx, self.selected_library.is_none());
+        self.load_page(ctx, PageLoad::Paginate);
     }
 
     fn titlebar(&mut self, ctx: &egui::Context) {
@@ -1439,7 +1466,7 @@ impl App {
             location.shown = 0;
             location.previous_shown.clear();
         }
-        self.load_page(ctx, false);
+        self.load_page(ctx, PageLoad::Navigate);
     }
 
     fn audiobook_server(&self) -> bool {
@@ -1524,7 +1551,10 @@ impl App {
             egui::Layout::right_to_left(egui::Align::Center),
             |ui| {
                 if ui
-                    .add_enabled(!self.busy, IconButton::new(Icon::Refresh, "Refresh"))
+                    .add_enabled(
+                        !self.busy && !self.refreshing,
+                        IconButton::new(Icon::Refresh, "Refresh"),
+                    )
                     .clicked()
                 {
                     // Also refresh the server's libraries and Continue row now, rather
@@ -1532,7 +1562,7 @@ impl App {
                     if let Some(i) = self.active {
                         self.servers[i].check(ctx);
                     }
-                    self.load_page(ctx, false);
+                    self.load_page(ctx, PageLoad::Refresh);
                 }
                 if self.busy || self.refreshing {
                     ui.spinner();
@@ -1615,26 +1645,23 @@ impl App {
                         let shelf = if audiobook_server {
                             Shelf::Books { count: None }
                         } else {
-                            Shelf::Video(1)
+                            Shelf::Video {
+                                rows: 1,
+                                source: false,
+                            }
                         };
                         home_carousel(
                             ui,
-                            "continue",
-                            continue_heading,
+                            ("continue", continue_heading),
                             self.carousel_offsets.entry("continue").or_default(),
                             &self.on_deck,
                             shelf,
-                            |ui, item| {
+                            |item| egui::Id::new((self.active, &item.id)),
+                            |ui, item, width| {
                                 let clicked = if audiobook_server {
-                                    book_card(
-                                        ui,
-                                        item,
-                                        &self.covers,
-                                        BOOK_CARD_WIDTH,
-                                        book_status(item),
-                                    )
+                                    book_card(ui, item, &self.covers, width, book_status(item))
                                 } else {
-                                    continue_card(ui, item, &self.covers)
+                                    continue_card(ui, item, &self.covers, width)
                                 };
                                 if clicked && !self.busy {
                                     picked = Some(item.clone());
@@ -1646,13 +1673,16 @@ impl App {
                     if !self.released.is_empty() {
                         home_carousel(
                             ui,
-                            "released",
-                            "Recently Released",
+                            ("released", "Recently Released"),
                             self.carousel_offsets.entry("released").or_default(),
                             &self.released,
-                            Shelf::Video(1),
-                            |ui, item| {
-                                if released_card(ui, item, &self.covers) && !self.busy {
+                            Shelf::Video {
+                                rows: 1,
+                                source: false,
+                            },
+                            |item| egui::Id::new((self.active, &item.id)),
+                            |ui, item, width| {
+                                if released_card(ui, item, &self.covers, width) && !self.busy {
                                     picked = Some(item.clone());
                                 }
                             },
@@ -1762,8 +1792,10 @@ impl App {
                     }
                     let episodes =
                         !items.is_empty() && items.iter().all(|i| i.kind == Kind::Episode);
-                    if episodes {
-                        for &item in &items {
+                    let grid_id =
+                        egui::Id::new(("library cards", self.active, &title, page.offset));
+                    library_cards(ui, grid_id, &items, episodes, |ui, item, width| {
+                        if episodes {
                             egui::Frame::new()
                                 .fill(PANEL)
                                 .corner_radius(0)
@@ -1808,33 +1840,17 @@ impl App {
                                         });
                                     });
                                 });
+                        } else {
+                            let clicked = if item.kind == Kind::Audiobook {
+                                book_card(ui, item, &self.covers, width, book_status(item))
+                            } else {
+                                poster(ui, item, &self.covers, width)
+                            };
+                            if clicked && !self.busy {
+                                picked = Some(item.clone());
+                            }
                         }
-                    } else {
-                        let columns = ((ui.available_width() + ART_GAP) / (158.0 + ART_GAP))
-                            .floor()
-                            .max(1.0) as usize;
-                        let width = ((ui.available_width() - ART_GAP * (columns - 1) as f32)
-                            / columns as f32)
-                            .min(210.0);
-                        egui::Grid::new("posters")
-                            .num_columns(columns)
-                            .spacing([ART_GAP, 28.0])
-                            .show(ui, |ui| {
-                                for (index, item) in items.into_iter().enumerate() {
-                                    let clicked = if item.kind == Kind::Audiobook {
-                                        book_card(ui, item, &self.covers, width, book_status(item))
-                                    } else {
-                                        poster(ui, item, &self.covers, width)
-                                    };
-                                    if clicked && !self.busy {
-                                        picked = Some(item.clone());
-                                    }
-                                    if (index + 1) % columns == 0 {
-                                        ui.end_row();
-                                    }
-                                }
-                            });
-                    }
+                    });
                     ui.add_space(38.0);
                 } else if self.busy {
                     if show_home_rows {
@@ -2096,6 +2112,7 @@ impl App {
     }
 
     fn settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let shown = self.settings_tab;
         ui.set_max_width(ui.available_width().min(980.0));
         ui.label(RichText::new("Settings").size(34.0).strong());
         ui.horizontal(|ui| {
@@ -2105,7 +2122,7 @@ impl App {
                 (SettingsTab::Playback, Icon::Play, "Playback"),
                 (SettingsTab::Updates, Icon::Refresh, "Updates & about"),
             ] {
-                let active = self.settings_tab == tab;
+                let active = shown == tab;
                 let color = if active { TEXT } else { MUTED };
                 let button = egui::Button::image_and_text(
                     icon.image(16.0, if active { ACCENT } else { MUTED }),
@@ -2133,20 +2150,21 @@ impl App {
                 }
                 if response.clicked() {
                     self.settings_tab = tab;
+                    ctx.request_repaint();
                 }
             }
         });
         ui.separator();
         ui.add_space(6.0);
         egui::ScrollArea::vertical()
-            .id_salt(("settings", self.settings_tab))
+            .id_salt(("settings", shown))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                if self.settings_tab == SettingsTab::Servers {
+                if shown == SettingsTab::Servers {
                     self.server_settings(ui, ctx);
                     return;
                 }
-                if self.settings_tab == SettingsTab::Playback {
+                if shown == SettingsTab::Playback {
                     ui.label(RichText::new("Playback configuration").size(23.0).strong());
                     egui::Frame::new()
                         .fill(PANEL)
@@ -2969,6 +2987,7 @@ impl eframe::App for App {
                 std::mem::forget(surface);
             }
         }
+        prefs::flush();
     }
 
     fn clear_color(&self, _: &egui::Visuals) -> [f32; 4] {
@@ -2981,11 +3000,7 @@ impl eframe::App for App {
         self.poll(ctx);
         self.book_tick(ctx);
         self.poll_updates(ctx);
-        self.covers.now = ctx.input(|i| i.time);
         let video_playing = self.playback.player.is_some() && !self.book.is_loaded();
-        if !video_playing && self.covers.animating() {
-            ctx.request_repaint();
-        }
         if self.playback.player.is_some()
             || self.busy
             || self.sign_in.busy
@@ -3077,6 +3092,11 @@ impl eframe::App for App {
             self.playback_controls(ctx, mini);
         }
         let mut play = false;
+        let pane = ctx.available_rect();
+        let screen = self.browse_screen(video_playing);
+        if screen.is_none() {
+            self.screen_fade = Default::default();
+        }
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
@@ -3103,12 +3123,34 @@ impl eframe::App for App {
                             ..egui::Margin::same(padding)
                         }
                     } else if self.source.is_some() {
-                        egui::Margin::symmetric(48, 38)
+                        let mut margin = egui::Margin::symmetric(48, 38);
+                        if self.overview
+                            && !self.connection_open
+                            && ctx.content_rect().height() <= COMPACT_HOME_HEIGHT
+                        {
+                            margin.top = 24;
+                        }
+                        margin
                     } else {
                         egui::Margin::same(20)
                     }),
             )
             .show(ctx, |ui| {
+                let waiting = self.busy
+                    && self.page.is_none()
+                    && self.detail.is_none()
+                    && !self.overview
+                    && !self.connection_open
+                    && !self.book.full;
+                if waiting && screen.is_some() {
+                    if self.screen_fade.hold(ui, pane) {
+                        return;
+                    }
+                    self.screen_fade = Default::default();
+                }
+                let capture = screen
+                    .filter(|_| !waiting)
+                    .map(|key| (key, screen_fade::ScreenFade::first_shape(ui)));
                 if video_playing {
                     let rect = ui.available_rect_before_wrap();
                     ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
@@ -3135,6 +3177,9 @@ impl eframe::App for App {
                         }
                     });
                 }
+                if let Some((key, first)) = capture {
+                    self.screen_fade.present(ui, pane, key, first);
+                }
             });
         if play {
             self.start_playback(ctx, frame);
@@ -3148,150 +3193,8 @@ impl eframe::App for App {
             self.runtime_dialog(ctx);
         }
         self.handle_window_resize(ctx, egui::ViewportId::ROOT, true);
+        self.artwork_frame(ctx);
     }
-}
-
-/// Artwork a page shows: posters, then Home row posters and movie backdrops, then the
-/// parent's hero art. Each path appears once.
-fn page_art(
-    page: &Page,
-    home_rows: Option<(&[Item], &[Item])>,
-    parent: Option<&Item>,
-) -> Vec<String> {
-    let mut art: Vec<_> = page
-        .items
-        .iter()
-        .filter_map(|item| item.thumb.clone())
-        .collect();
-    if let Some((on_deck, released)) = home_rows {
-        let rows = || on_deck.iter().chain(released.iter());
-        art.extend(rows().filter_map(|item| item.thumb.clone()));
-        // Landscape Home cards prefer movie backdrops.
-        art.extend(
-            rows()
-                .filter(|item| item.kind == Kind::Movie)
-                .filter_map(|item| item.art.clone()),
-        );
-    }
-    if let Some(parent) = parent {
-        art.extend(
-            [parent.thumb.clone(), parent.art.clone()]
-                .into_iter()
-                .flatten(),
-        );
-    }
-    let mut seen = std::collections::HashSet::new();
-    art.retain(|path| seen.insert(path.clone()));
-    art
-}
-
-/// Sends cached artwork straight away, then fetches the rest from the server.
-/// The worker stops as soon as navigation starts a newer generation.
-fn load_artwork(
-    source: &Source,
-    paths: Vec<String>,
-    generation: u64,
-    current: &AtomicU64,
-    tx: &Sender<(u64, Reply)>,
-    ctx: &egui::Context,
-) {
-    let send = |path: String, image: image::RgbaImage| {
-        let size = [image.width() as usize, image.height() as usize];
-        let pixels = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
-        ctx.request_repaint();
-        tx.send((generation, Reply::Cover(path, pixels))).is_ok()
-    };
-    let mut missing = vec![];
-    for path in paths {
-        if current.load(Ordering::Relaxed) != generation {
-            return;
-        }
-        match source.cached_artwork(&path) {
-            Some(image) => {
-                if !send(path, image) {
-                    return;
-                }
-            }
-            None => missing.push(path),
-        }
-    }
-    for path in missing {
-        if current.load(Ordering::Relaxed) != generation {
-            return;
-        }
-        if let Ok(image) = source.artwork(&path)
-            && !send(path, image)
-        {
-            return;
-        }
-    }
-    let _ = tx.send((generation, Reply::ArtworkDone));
-    ctx.request_repaint();
-}
-
-const ART_FADE_SECONDS: f64 = 1.0;
-
-/// Artwork textures for the current view, with when each arrived so new art
-/// fades in, and whether more is still loading so its slot shows a placeholder.
-#[derive(Default, Clone)]
-struct Artwork {
-    textures: HashMap<String, (egui::TextureHandle, f64)>,
-    loading: bool,
-    now: f64,
-}
-
-impl Artwork {
-    /// Adds art that is shown immediately, without fading in.
-    fn insert(&mut self, path: String, texture: egui::TextureHandle) {
-        self.textures.insert(path, (texture, f64::NEG_INFINITY));
-    }
-
-    fn arrive(&mut self, path: String, texture: egui::TextureHandle, now: f64) {
-        self.textures.insert(path, (texture, now));
-    }
-
-    fn clear(&mut self) {
-        self.textures.clear();
-    }
-
-    fn retain(&mut self, keep: &std::collections::HashSet<String>) {
-        self.textures.retain(|path, _| keep.contains(path));
-    }
-
-    fn contains(&self, path: &str) -> bool {
-        self.textures.contains_key(path)
-    }
-
-    /// The texture and its current fade-in opacity.
-    fn get(&self, path: &str) -> Option<(&egui::TextureHandle, f32)> {
-        self.textures.get(path).map(|(texture, arrived)| {
-            let t = ((self.now - arrived) / ART_FADE_SECONDS).clamp(0.0, 1.0) as f32;
-            (texture, 1.0 - (1.0 - t).powi(3))
-        })
-    }
-
-    fn pending(&self, path: Option<&String>) -> bool {
-        self.loading && path.is_some_and(|path| !self.contains(path))
-    }
-
-    fn animating(&self) -> bool {
-        self.loading
-            || self
-                .textures
-                .values()
-                .any(|(_, arrived)| self.now - arrived < ART_FADE_SECONDS)
-    }
-}
-
-/// A softly pulsing slot shown while artwork loads.
-fn placeholder(ui: &egui::Ui, rect: egui::Rect, radius: f32) {
-    let pulse = (ui.input(|i| i.time) * 2.4).sin() as f32 * 0.5 + 0.5;
-    let base = Color32::from_rgb(34, 36, 40);
-    ui.painter().rect_filled(
-        rect,
-        radius,
-        base.lerp_to_gamma(Color32::from_rgb(52, 55, 61), pulse),
-    );
 }
 
 fn nav(ui: &mut egui::Ui, icon: Icon, title: &str, selected: bool) -> egui::Response {
@@ -3937,20 +3840,25 @@ fn cover_view_rounded(
     interactive: bool,
     radius: u8,
 ) -> egui::Response {
-    let path = if size.x > size.y && item.kind == Kind::Movie {
-        item.art
-            .as_ref()
-            .filter(|path| covers.contains(path))
-            .or(item.thumb.as_ref())
-    } else {
-        item.thumb.as_ref()
-    };
     let sense = if interactive {
         egui::Sense::click()
     } else {
         egui::Sense::hover()
     };
     let (rect, response) = ui.allocate_exact_size(size, sense);
+    let thumb = item.thumb.as_deref();
+    let backdrop = (item.kind == Kind::Movie)
+        .then_some(item.art.as_deref())
+        .flatten();
+    let (preferred, alternate) = if size.x > size.y {
+        (backdrop.or(thumb), thumb)
+    } else {
+        (thumb.or(backdrop), backdrop)
+    };
+    let alternate = alternate.filter(|path| Some(*path) != preferred);
+    if let Some(path) = preferred {
+        covers.observe(ui, rect, path);
+    }
     response.widget_info(|| {
         egui::WidgetInfo::labeled(
             if interactive {
@@ -3966,11 +3874,7 @@ fn cover_view_rounded(
             },
         )
     });
-    if let Some((texture, opacity)) = path.and_then(|path| covers.get(path)) {
-        if opacity < 1.0 {
-            ui.painter()
-                .rect_filled(rect, radius, Color32::from_rgb(34, 36, 40));
-        }
+    let paint = |texture: &egui::TextureHandle, opacity: f32| {
         let ratio = size.x / size.y / texture.aspect_ratio();
         let uv_size = Vec2::new(ratio.min(1.0), (1.0 / ratio).min(1.0));
         egui::Image::new(texture)
@@ -3978,18 +3882,37 @@ fn cover_view_rounded(
             .corner_radius(radius)
             .tint(Color32::WHITE.gamma_multiply(opacity))
             .paint_at(ui, rect);
-    } else if covers.pending(path) {
-        placeholder(ui, rect, radius as f32);
-    } else {
+    };
+    let primary = preferred.and_then(|path| covers.get(path));
+    let failed = preferred.is_none_or(|path| covers.failed(path));
+    if primary.as_ref().is_none_or(|(_, opacity)| *opacity < 1.0) {
         ui.painter()
             .rect_filled(rect, radius, Color32::from_rgb(34, 36, 40));
-        ui.painter().text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            item.title.chars().next().unwrap_or('P'),
-            egui::FontId::proportional(42.0),
-            ACCENT,
-        );
+        let mut show_initial = failed;
+        if let Some(path) = alternate {
+            let warm = covers.get(path);
+            if warm.is_some() || failed {
+                // Protect a resident alternate during the dissolve. A cold
+                // alternate gets a request only if the preferred image failed.
+                covers.observe(ui, rect, path);
+            }
+            if let Some((texture, opacity)) = warm {
+                paint(&texture, if failed { opacity } else { 1.0 });
+            }
+            show_initial &= covers.failed(path);
+        }
+        if show_initial {
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                item.title.chars().next().unwrap_or('P'),
+                egui::FontId::proportional(42.0),
+                ACCENT,
+            );
+        }
+    }
+    if let Some((texture, opacity)) = primary {
+        paint(&texture, opacity);
     }
     if interactive && (response.hovered() || response.has_focus()) {
         ui.painter().rect_stroke(
@@ -4007,18 +3930,184 @@ fn cover_view_rounded(
 }
 
 enum Shelf {
-    Video(usize),
+    Video { rows: usize, source: bool },
     Books { count: Option<usize> },
+}
+
+impl Shelf {
+    fn card_height(&self, width: f32) -> f32 {
+        // Captions, progress and source information keep their space as artwork arrives.
+        match self {
+            Self::Video { source, .. } => width * 9.0 / 16.0 + if *source { 76.0 } else { 52.0 },
+            Self::Books { count } => width + if count.is_some() { 76.0 } else { 54.0 },
+        }
+    }
+}
+
+fn card_columns(available: f32, widths: (f32, f32)) -> (usize, f32) {
+    fitted_columns(available, widths, ART_GAP)
+}
+
+fn fitted_columns(available: f32, (minimum, maximum): (f32, f32), gap: f32) -> (usize, f32) {
+    let columns = ((available + gap) / (minimum + gap)).floor().max(1.0) as usize;
+    let width = ((available + gap) / columns as f32 - gap).clamp(1.0, maximum);
+    (columns, width)
+}
+
+#[derive(Clone, Copy)]
+struct CardAnchor {
+    columns: usize,
+    rows: usize,
+    width: f32,
+    item: egui::Id,
+    scroll: f32,
+    backward: bool,
+}
+
+fn scrolling_back(previous: Option<CardAnchor>, position: f32) -> bool {
+    previous.is_some_and(|anchor| {
+        let delta = position - anchor.scroll;
+        if delta.abs() < 0.5 {
+            anchor.backward
+        } else {
+            delta < 0.0
+        }
+    })
+}
+
+/// Clip the layout, keeping one neighbour ready on either edge.
+fn nearby_cells(start: f32, end: f32, pitch: f32, count: usize) -> std::ops::Range<usize> {
+    let first = ((start / pitch).floor() as usize)
+        .saturating_sub(1)
+        .min(count);
+    let last = ((end / pitch).ceil() as usize).saturating_add(1).min(count);
+    first..last
+}
+
+fn card_cell(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    rect: egui::Rect,
+    behind: bool,
+    add: impl FnOnce(&mut egui::Ui),
+) -> bool {
+    // A global, shelf-scoped identity keeps the card's interactive children stable across reflow.
+    let mut builder = egui::UiBuilder::new()
+        .id(id)
+        .max_rect(rect)
+        .layout(egui::Layout::top_down(egui::Align::Min));
+    if behind {
+        builder = builder.ui_stack_info(egui::UiStackInfo::default().with_tag("prefetch-behind"));
+    }
+    let mut cell = ui.new_child(builder);
+    add(&mut cell);
+    ui.memory(|memory| memory.focused())
+        .and_then(|focused| ui.ctx().read_response(focused))
+        .is_some_and(|response| {
+            let here = rect.contains(response.rect.center());
+            if here && response.gained_focus() {
+                response.scroll_to_me(None);
+            }
+            here
+        })
+}
+
+fn library_cards(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    items: &[&Item],
+    episodes: bool,
+    mut add: impl FnMut(&mut egui::Ui, &Item, f32),
+) {
+    if items.is_empty() {
+        return;
+    }
+    let available = ui.available_width();
+    let (columns, width, height) = if episodes {
+        (1, available, 112.0)
+    } else if items.iter().all(|item| item.kind == Kind::Audiobook) {
+        let (columns, width) = card_columns(available, BOOK_WIDTH);
+        (columns, width, width + 54.0)
+    } else {
+        let (columns, width) = card_columns(available, POSTER_WIDTH);
+        (columns, width, width * 1.5 + 52.0)
+    };
+    let pitch = height + ART_GAP;
+    let rows = items.len().div_ceil(columns);
+    let (_, grid) = ui.allocate_space(Vec2::new(available, rows as f32 * pitch - ART_GAP));
+    let clip = ui.clip_rect();
+    let near = nearby_cells(
+        clip.top() - grid.top(),
+        clip.bottom() - grid.top(),
+        pitch,
+        rows,
+    );
+    let old = ui.data(|data| data.get_temp::<CardAnchor>(id));
+    let scroll = clip.top() - grid.top();
+    let backward = scrolling_back(old, scroll);
+    let anchor_row = old.and_then(|anchor| {
+        if anchor.columns == columns && (anchor.width - width).abs() < 0.25 {
+            return None;
+        }
+        items
+            .iter()
+            .position(|item| id.with(&item.id) == anchor.item)
+            .map(|index| index / columns)
+    });
+    let mut focus = None;
+    for row in near
+        .clone()
+        .chain(anchor_row.filter(|row| !near.contains(row)))
+    {
+        let y = grid.top() + row as f32 * pitch;
+        for (column, item) in items[row * columns..].iter().take(columns).enumerate() {
+            let key = id.with(&item.id);
+            let left = grid.left() + column as f32 * (width + ART_GAP);
+            let rect = egui::Rect::from_min_size(egui::pos2(left, y), Vec2::new(width, height));
+            let behind = if backward {
+                rect.top() >= clip.bottom()
+            } else {
+                rect.bottom() <= clip.top()
+            };
+            if card_cell(ui, key, rect, behind, |ui| add(ui, item, width)) {
+                focus = Some(key);
+            }
+            if anchor_row == Some(row) && old.is_some_and(|anchor| anchor.item == key) {
+                ui.scroll_to_rect_animation(rect, None, egui::style::ScrollAnimation::none());
+            }
+        }
+    }
+    let top_row = ((clip.top() - grid.top()) / pitch).floor().max(0.0) as usize;
+    if let Some(item) = focus.or_else(|| {
+        (grid.intersects(clip) && grid.top() < clip.top())
+            .then(|| id.with(&items[top_row.min(rows - 1) * columns].id))
+    }) {
+        ui.data_mut(|data| {
+            data.insert_temp(
+                id,
+                CardAnchor {
+                    columns,
+                    rows,
+                    width,
+                    item,
+                    scroll,
+                    backward,
+                },
+            )
+        });
+    } else if old.is_some() {
+        ui.data_mut(|data| data.remove::<CardAnchor>(id));
+    }
 }
 
 fn home_carousel<T>(
     ui: &mut egui::Ui,
-    id: &'static str,
-    heading: &str,
+    (id, heading): (&'static str, &str),
     offset_x: &mut f32,
     items: &[T],
     shelf: Shelf,
-    mut card: impl FnMut(&mut egui::Ui, &T),
+    item_key: impl Fn(&T) -> egui::Id,
+    mut card: impl FnMut(&mut egui::Ui, &T, f32),
 ) {
     let viewport = ui.available_width();
     let show_count = if let Shelf::Books { count } = shelf {
@@ -4026,17 +4115,37 @@ fn home_carousel<T>(
     } else {
         None
     };
-    let (rows, card_width, spacing) = match shelf {
-        Shelf::Video(rows) => (rows, HOME_CARD_WIDTH, ART_GAP),
-        Shelf::Books { .. } => (1, BOOK_CARD_WIDTH, ART_GAP),
+    let (rows, width_range) = match shelf {
+        Shelf::Video { rows, .. } => (rows, VIDEO_WIDTH),
+        Shelf::Books { .. } => (1, BOOK_WIDTH),
     };
-    let pitch = card_width + spacing;
-    let visible_columns = ((viewport + spacing) / pitch).floor().max(1.0) as usize;
+    let (visible_columns, card_width) = card_columns(viewport, width_range);
+    let pitch = card_width + ART_GAP;
+    let row_height = shelf.card_height(card_width);
     let page_size = visible_columns * rows;
-    let columns =
-        items.len() / page_size * visible_columns + (items.len() % page_size).min(visible_columns);
-    let max_offset = (columns as f32 * pitch - spacing - viewport).max(0.0);
-    let mut scroll_delta = 0.0_f32;
+    let page_count = items.len().div_ceil(page_size).max(1);
+    let page_pitch = viewport + ART_GAP;
+    let column_at = |x: f32| {
+        let x = x.max(0.0);
+        let page = (x / page_pitch).floor() as usize;
+        let column = ((x % page_pitch) / pitch).floor() as usize;
+        page * visible_columns + column.min(visible_columns - 1)
+    };
+    let max_offset = page_count.saturating_sub(1) as f32 * page_pitch;
+    let shelf_id = egui::Id::new(("home shelf", id));
+    let old = ui.data(|data| data.get_temp::<CardAnchor>(shelf_id));
+    let mut target = old.and_then(|anchor| {
+        if anchor.columns == visible_columns
+            && anchor.rows == rows
+            && (anchor.width - viewport).abs() < 0.25
+        {
+            return None;
+        }
+        let index = items
+            .iter()
+            .position(|item| item_key(item) == anchor.item)?;
+        Some((index / page_size) as f32 * page_pitch)
+    });
     control_row(ui, 32.0, |ui| {
         if let Some(count) = show_count {
             ui.spacing_mut().item_spacing.x = 12.0;
@@ -4047,7 +4156,6 @@ fn home_carousel<T>(
             ui.label(RichText::new(heading).size(22.0).strong());
         }
         if show_count.is_some() || max_offset > 1.0 {
-            let step = visible_columns as f32 * pitch;
             let size = if show_count.is_some() { 28.0 } else { 32.0 };
             if ui
                 .add_enabled(
@@ -4057,7 +4165,8 @@ fn home_carousel<T>(
                 )
                 .clicked()
             {
-                scroll_delta = step.min(offset_x.max(0.0));
+                target =
+                    Some(((*offset_x / page_pitch - 0.001).ceil() - 1.0).max(0.0) * page_pitch);
             }
             if ui
                 .add_enabled(
@@ -4067,33 +4176,73 @@ fn home_carousel<T>(
                 )
                 .clicked()
             {
-                scroll_delta = -step.min((max_offset - *offset_x).max(0.0));
+                target = Some(((*offset_x / page_pitch + 0.001).floor() + 1.0) * page_pitch);
             }
         }
     });
-    let output = egui::ScrollArea::horizontal()
+    let mut scroll = egui::ScrollArea::horizontal()
         .id_salt(id)
-        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-        .show(ui, |ui| {
-            ui.spacing_mut().item_spacing.x = spacing;
-            if scroll_delta != 0.0 {
-                ui.scroll_with_delta(Vec2::new(scroll_delta, 0.0));
-            }
-            ui.horizontal_top(|ui| {
-                for page in items.chunks(page_size) {
-                    ui.vertical(|ui| {
-                        for row in page.chunks(visible_columns) {
-                            ui.horizontal_top(|ui| {
-                                for item in row {
-                                    card(ui, item);
-                                }
-                            });
-                        }
-                    });
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
+    if let Some(offset) = target {
+        scroll = scroll.horizontal_scroll_offset(offset.clamp(0.0, max_offset));
+    }
+    let mut focused = None;
+    let mut painted_offset = *offset_x;
+    let output = scroll.show_viewport(ui, |ui, view| {
+        painted_offset = view.left();
+        let backward = scrolling_back(old, painted_offset);
+        let origin = ui.max_rect().min;
+        let height = rows as f32 * (row_height + ART_GAP) - ART_GAP;
+        ui.set_min_size(Vec2::new(max_offset + viewport, height));
+        let near = ui.clip_rect().expand2(Vec2::new(0.0, row_height + ART_GAP));
+        if origin.y + height < near.top() || origin.y > near.bottom() {
+            return;
+        }
+        let columns = column_at(view.left()).saturating_sub(1)
+            ..(column_at(view.right()) + 2).min(page_count * visible_columns);
+        for row in 0..rows {
+            for column in columns.clone() {
+                let index = (column / visible_columns) * page_size
+                    + row * visible_columns
+                    + column % visible_columns;
+                if let Some(item) = items.get(index) {
+                    let key = item_key(item);
+                    let x = (column / visible_columns) as f32 * page_pitch
+                        + (column % visible_columns) as f32 * pitch;
+                    let start = origin + Vec2::new(x, row as f32 * (row_height + ART_GAP));
+                    let rect = egui::Rect::from_min_size(start, Vec2::new(card_width, row_height));
+                    let behind = if backward {
+                        x >= view.right()
+                    } else {
+                        x + card_width <= view.left()
+                    };
+                    if card_cell(ui, shelf_id.with(key), rect, behind, |ui| {
+                        card(ui, item, card_width)
+                    }) {
+                        focused = Some(key);
+                    }
                 }
-            });
-        });
+            }
+        }
+    });
     *offset_x = output.state.offset.x;
+    let column = column_at(*offset_x);
+    let index = column / visible_columns * page_size + column % visible_columns;
+    if let Some(item) = focused.or_else(|| items.get(index).map(&item_key)) {
+        ui.data_mut(|data| {
+            data.insert_temp(
+                shelf_id,
+                CardAnchor {
+                    columns: visible_columns,
+                    rows,
+                    width: viewport,
+                    item,
+                    scroll: painted_offset,
+                    backward: scrolling_back(old, painted_offset),
+                },
+            )
+        });
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -4214,8 +4363,8 @@ fn book_card(
     clicked
 }
 
-fn continue_card(ui: &mut egui::Ui, item: &Item, covers: &Artwork) -> bool {
-    let size = Vec2::new(HOME_CARD_WIDTH, 130.0);
+fn continue_card(ui: &mut egui::Ui, item: &Item, covers: &Artwork, width: f32) -> bool {
+    let size = Vec2::new(width, width * 9.0 / 16.0);
     let mut clicked = false;
     ui.vertical(|ui| {
         ui.set_width(size.x);
@@ -4271,12 +4420,12 @@ fn continue_card(ui: &mut egui::Ui, item: &Item, covers: &Artwork) -> bool {
     clicked
 }
 
-fn released_card(ui: &mut egui::Ui, item: &Item, covers: &Artwork) -> bool {
+fn released_card(ui: &mut egui::Ui, item: &Item, covers: &Artwork, width: f32) -> bool {
     let mut clicked = false;
     ui.vertical(|ui| {
-        ui.set_width(232.0);
+        ui.set_width(width);
         ui.spacing_mut().item_spacing.y = 6.0;
-        clicked |= cover(ui, item, covers, Vec2::new(232.0, 130.0))
+        clicked |= cover(ui, item, covers, Vec2::new(width, width * 9.0 / 16.0))
             .on_hover_text(&item.title)
             .clicked();
         clicked |= ui
@@ -4379,11 +4528,10 @@ fn poster(ui: &mut egui::Ui, item: &Item, covers: &Artwork, width: f32) -> bool 
 fn hero(ui: &mut egui::Ui, item: &Item, covers: &Artwork, eyebrow: &str) {
     let (rect, _) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 228.0), egui::Sense::hover());
-    if covers.pending(item.art.as_ref()) {
-        placeholder(ui, rect, 0.0);
-    } else {
-        ui.painter().rect_filled(rect, 0.0, PANEL);
+    if let Some(path) = &item.art {
+        covers.observe(ui, rect, path);
     }
+    ui.painter().rect_filled(rect, 0.0, PANEL);
     if let Some((texture, opacity)) = item.art.as_ref().and_then(|path| covers.get(path)) {
         // Crop to fill rather than stretching the server's backdrop.
         let ratio = rect.aspect_ratio() / texture.aspect_ratio();
@@ -4399,7 +4547,7 @@ fn hero(ui: &mut egui::Ui, item: &Item, covers: &Artwork, eyebrow: &str) {
                 egui::pos2((1.0 + ratio) / 2.0, 1.0),
             )
         };
-        egui::Image::new(texture)
+        egui::Image::new(&texture)
             .uv(uv)
             .corner_radius(0)
             .tint(Color32::WHITE.gamma_multiply(opacity))

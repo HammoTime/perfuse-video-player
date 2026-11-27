@@ -75,7 +75,7 @@ pub(super) const REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 enum Check {
     Libraries(Vec<Library>, Duration),
-    Continue(Vec<Item>, Artwork),
+    Continue(Vec<Item>),
     Offline(String),
     Expired,
 }
@@ -113,7 +113,7 @@ impl Server {
         remembered: bool,
     ) -> Self {
         Self {
-            prefs: prefs::load_library_order(&session),
+            prefs: prefs::LibraryOrder::default(),
             store: metadata::Store::new(session.kind.plugin().id, &session.server),
             session,
             source,
@@ -137,15 +137,12 @@ impl Server {
     }
 
     /// A remembered server shown from its last snapshot until its first refresh.
-    pub fn restored(restored: Restored, ctx: &egui::Context) -> Self {
+    pub fn restored(restored: Restored) -> Self {
         let mut server = Self::new(restored.session, restored.source, vec![], true);
+        server.prefs = restored.prefs;
         if let Some(overview) = restored.overview {
             server.sections = overview.libraries;
             server.items = overview.continue_items;
-        }
-        for (path, image) in restored.art {
-            let texture = ctx.load_texture(&path, image, egui::TextureOptions::LINEAR);
-            server.artwork.insert(path, texture);
         }
         server.home = restored.home;
         server
@@ -171,6 +168,14 @@ impl Server {
 
     pub fn persist(&self) {
         prefs::save_library_order(&self.session, &self.prefs);
+    }
+
+    /// A new sign-in may have access to different items at the same origin.
+    pub(super) fn reset_previews(&mut self) {
+        self.pending = None;
+        self.items.clear();
+        self.home = None;
+        self.artwork = Artwork::default();
     }
     pub fn icon(&self) -> Icon {
         connection::source_icon(self.session.kind)
@@ -297,7 +302,6 @@ impl Server {
         self.pending = Some(rx);
         self.checking = true;
         let (source, ctx) = (self.source.clone(), ctx.clone());
-        let mut previous_art = self.artwork.clone();
         let store = self.remembered.then(|| self.store.clone());
         tasks::spawn(move || {
             let start = Instant::now();
@@ -321,44 +325,17 @@ impl Server {
             }
             ctx.request_repaint();
             if let Ok(page) = source.browse(&Browse::ContinueWatching, "", 0) {
-                if let Some(store) = &store {
-                    store.save_overview(&metadata::Overview {
-                        libraries,
-                        continue_items: page.items.clone(),
-                    });
+                let snapshot = store.as_ref().map(|_| metadata::Overview {
+                    libraries,
+                    continue_items: page.items.clone(),
+                });
+                if tx.send(Check::Continue(page.items)).is_err() {
+                    return;
                 }
-                let mut artwork = Artwork::default();
-                for item in &page.items {
-                    let Some(path) = item
-                        .art
-                        .as_ref()
-                        .filter(|_| item.kind == Kind::Movie)
-                        .or(item.thumb.as_ref())
-                    else {
-                        continue;
-                    };
-                    if artwork.contains(path) {
-                        continue;
-                    }
-                    if let Some(texture) = previous_art.textures.remove(path) {
-                        artwork.textures.insert(path.clone(), texture);
-                        continue;
-                    }
-                    if let Some(img) = source
-                        .cached_artwork(path)
-                        .or_else(|| source.artwork(path).ok())
-                    {
-                        let image = egui::ColorImage::from_rgba_unmultiplied(
-                            [img.width() as usize, img.height() as usize],
-                            img.as_raw(),
-                        );
-                        artwork.insert(
-                            path.clone(),
-                            ctx.load_texture(path, image, egui::TextureOptions::LINEAR),
-                        );
-                    }
+                ctx.request_repaint();
+                if let (Some(store), Some(snapshot)) = (store, snapshot) {
+                    store.save_overview(&snapshot);
                 }
-                let _ = tx.send(Check::Continue(page.items, artwork));
             }
             drop(tx);
             ctx.request_repaint();
@@ -464,7 +441,7 @@ impl App {
         self.selected_library = None;
         self.search.clear();
         self.page = None;
-        self.covers.clear();
+        self.covers = server.artwork.clone();
         self.home_loaded = false;
         self.on_deck.clear();
         self.released.clear();
@@ -498,10 +475,7 @@ impl App {
                             self.sections = s.libraries();
                         }
                     }
-                    Ok(Check::Continue(items, art)) => {
-                        s.items = items;
-                        s.artwork = art;
-                    }
+                    Ok(Check::Continue(items)) => s.items = items,
                     Ok(Check::Offline(reason)) => {
                         s.checking = false;
                         s.online = false;
@@ -752,9 +726,14 @@ impl App {
         let mut open = None;
         let mut library = None;
         let mut item = None;
+        let viewport_height = ui.available_height();
+        let compact = ctx.content_rect().height() <= COMPACT_HOME_HEIGHT;
         egui::ScrollArea::vertical()
             .id_salt("all_servers")
             .show(ui, |ui| {
+                if compact {
+                    ui.spacing_mut().item_spacing.y = 8.0;
+                }
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Home").size(30.0).strong());
                     if ui
@@ -770,20 +749,22 @@ impl App {
                     MUTED,
                     "Pick up where you left off, across all your servers.",
                 );
-                ui.add_space(20.0);
+                ui.add_space(8.0);
                 ui.heading("Servers");
-                let gap = 16.0;
-                let card_width = 280.0;
-                let cols = ((ui.available_width() + gap) / (card_width + gap))
-                    .floor()
-                    .max(1.0) as usize;
+                let (gap, minimum, maximum) = if compact {
+                    (8.0, 164.0, 220.0)
+                } else {
+                    (ART_GAP, 240.0, 280.0)
+                };
+                let (cols, card_width) =
+                    fitted_columns(ui.available_width(), (minimum, maximum), gap);
                 let card_frame = egui::Frame::new()
                     .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(42, 42, 46)))
-                    .inner_margin(16)
+                    .inner_margin(if compact { 8 } else { 10 })
                     .corner_radius(0);
                 for (row_index, row) in self.servers.chunks_mut(cols).enumerate() {
                     ui.horizontal_top(|ui| {
-                        ui.spacing_mut().item_spacing = Vec2::splat(gap);
+                        ui.spacing_mut().item_spacing = Vec2::new(gap, 4.0);
                         for (column, s) in row.iter_mut().enumerate() {
                             let i = row_index * cols + column;
                             let card = card_frame
@@ -797,13 +778,48 @@ impl App {
                                         ui.set_width(
                                             card_width - card_frame.total_margin().sum().x,
                                         );
-                                        control_row(ui, 48.0, |ui| {
+                                        if compact {
+                                            ui.horizontal(|ui| {
+                                                ui.spacing_mut().item_spacing.x = 8.0;
+                                                let (icon, _) = ui.allocate_exact_size(
+                                                    Vec2::splat(28.0),
+                                                    egui::Sense::hover(),
+                                                );
+                                                ui.painter().rect_filled(icon, 0, CONTROL);
+                                                s.icon().paint(ui, icon.center(), 17.0, TEXT);
+                                                ui.vertical(|ui| {
+                                                    ui.set_width(ui.available_width());
+                                                    ui.spacing_mut().item_spacing.y = 2.0;
+                                                    ui.add(
+                                                        egui::Label::new(
+                                                            RichText::new(s.name())
+                                                                .size(15.0)
+                                                                .strong(),
+                                                        )
+                                                        .truncate(),
+                                                    );
+                                                    let (symbol, color, status) = s.status();
+                                                    ui.horizontal(|ui| {
+                                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                                        ui.add(symbol.image(12.0, color));
+                                                        ui.add(
+                                                            egui::Label::new(
+                                                                RichText::new(status).size(12.0),
+                                                            )
+                                                            .truncate(),
+                                                        );
+                                                    });
+                                                });
+                                            });
+                                            return;
+                                        }
+                                        control_row(ui, 36.0, |ui| {
                                             let (rect, _) = ui.allocate_exact_size(
-                                                Vec2::splat(48.0),
+                                                Vec2::splat(36.0),
                                                 egui::Sense::hover(),
                                             );
                                             ui.painter().rect_filled(rect, 0, CONTROL);
-                                            s.icon().paint(ui, rect.center(), 26.0, TEXT);
+                                            s.icon().paint(ui, rect.center(), 22.0, TEXT);
                                             ui.vertical(|ui| {
                                                 ui.spacing_mut().item_spacing.y = 2.0;
                                                 let text_height = ui.fonts_mut(|fonts| {
@@ -813,7 +829,7 @@ impl App {
                                                         &egui::FontId::proportional(12.0),
                                                     )
                                                 }) + 2.0;
-                                                ui.add_space(((48.0 - text_height) / 2.0).max(0.0));
+                                                ui.add_space(((36.0 - text_height) / 2.0).max(0.0));
                                                 ui.add(
                                                     egui::Label::new(
                                                         RichText::new(s.name()).size(18.0).strong(),
@@ -839,10 +855,10 @@ impl App {
                                     });
                                 });
                             // Register behind the chips, which have their own library destinations.
-                            let header = egui::Rect::from_min_size(
-                                card.response.rect.min,
-                                Vec2::new(card.response.rect.width(), 76.0),
-                            );
+                            let mut header = card.response.rect;
+                            if !compact {
+                                header.set_height(56.0);
+                            }
                             let button = ui.interact(
                                 header,
                                 ui.id().with(("server_card", i)),
@@ -881,19 +897,10 @@ impl App {
                             .map(move |entry| (i, s, entry))
                     })
                     .partition(|(_, _, entry)| entry.kind != Kind::Audiobook);
-                for (id, heading, width, mut entries) in [
-                    (
-                        "overview_continue",
-                        "Continue Watching",
-                        HOME_CARD_WIDTH,
-                        watching,
-                    ),
-                    (
-                        "overview_listening",
-                        "Continue Listening",
-                        BOOK_CARD_WIDTH,
-                        listening,
-                    ),
+                let listening_count = listening.len();
+                for (id, heading, mut entries) in [
+                    ("overview_continue", "Continue Watching", watching),
+                    ("overview_listening", "Continue Listening", listening),
                 ] {
                     if entries.is_empty() {
                         continue;
@@ -905,51 +912,77 @@ impl App {
                             count: Some(entries.len()),
                         }
                     } else {
-                        Shelf::Video(4)
+                        // Use the section's position in the document, independent of scroll.
+                        let remaining =
+                            viewport_height - (ui.next_widget_position().y - ui.max_rect().top());
+                        let (cols, video_width) = card_columns(ui.available_width(), VIDEO_WIDTH);
+                        let next_section = if listening_count > 0 {
+                            let (_, book_width) = card_columns(ui.available_width(), BOOK_WIDTH);
+                            64.0 + Shelf::Books {
+                                count: Some(listening_count),
+                            }
+                            .card_height(book_width)
+                        } else {
+                            0.0
+                        };
+                        let row_height = Shelf::Video {
+                            rows: 1,
+                            source: true,
+                        }
+                        .card_height(video_width);
+                        let fits = remaining >= 48.0 + row_height * 2.0 + ART_GAP + next_section;
+                        Shelf::Video {
+                            rows: if fits && entries.len() > cols { 2 } else { 1 },
+                            source: true,
+                        }
                     };
                     home_carousel(
                         ui,
-                        id,
-                        heading,
+                        (id, heading),
                         self.carousel_offsets.entry(id).or_default(),
                         &entries,
                         shelf,
-                        |ui, &(i, server, entry)| {
-                            ui.push_id((i, &entry.id), |ui| {
-                                ui.vertical(|ui| {
-                                    ui.set_width(width);
-                                    let clicked = if entry.kind == Kind::Audiobook {
-                                        ui.spacing_mut().item_spacing.y = 2.0;
-                                        let playing = self
-                                            .book
-                                            .is_current(&server.source, &entry.id)
-                                            .then_some(BookCardPlayback {
-                                                paused: self.playback.paused,
-                                                elapsed_ms: (self.playback.playing_seconds * 1000.0)
-                                                    as u64,
-                                                finished: self.book.completed,
-                                            });
-                                        book_card(ui, entry, &server.artwork, width, playing)
-                                    } else {
-                                        continue_card(ui, entry, &server.artwork)
-                                    };
-                                    if clicked {
-                                        item = Some((i, entry.clone()));
+                        |&(_, server, entry)| {
+                            egui::Id::new((
+                                server.session.kind.plugin().id,
+                                &server.session.server,
+                                &entry.id,
+                            ))
+                        },
+                        |ui, &(i, server, entry), width| {
+                            ui.vertical(|ui| {
+                                ui.set_width(width);
+                                let clicked = if entry.kind == Kind::Audiobook {
+                                    ui.spacing_mut().item_spacing.y = 2.0;
+                                    let playing = self
+                                        .book
+                                        .is_current(&server.source, &entry.id)
+                                        .then_some(BookCardPlayback {
+                                            paused: self.playback.paused,
+                                            elapsed_ms: (self.playback.playing_seconds * 1000.0)
+                                                as u64,
+                                            finished: self.book.completed,
+                                        });
+                                    book_card(ui, entry, &server.artwork, width, playing)
+                                } else {
+                                    continue_card(ui, entry, &server.artwork, width)
+                                };
+                                if clicked {
+                                    item = Some((i, entry.clone()));
+                                }
+                                ui.horizontal(|ui| {
+                                    if entry.kind == Kind::Audiobook {
+                                        ui.spacing_mut().item_spacing.x = 6.0;
                                     }
-                                    ui.horizontal(|ui| {
-                                        if entry.kind == Kind::Audiobook {
-                                            ui.spacing_mut().item_spacing.x = 6.0;
-                                        }
-                                        ui.add(server.icon().image(13.0, MUTED));
-                                        ui.add(
-                                            egui::Label::new(if entry.kind == Kind::Audiobook {
-                                                RichText::new(server.name()).size(12.0).color(MUTED)
-                                            } else {
-                                                RichText::new(server.name()).small()
-                                            })
-                                            .truncate(),
-                                        );
-                                    });
+                                    ui.add(server.icon().image(13.0, MUTED));
+                                    ui.add(
+                                        egui::Label::new(if entry.kind == Kind::Audiobook {
+                                            RichText::new(server.name()).size(12.0).color(MUTED)
+                                        } else {
+                                            RichText::new(server.name()).small()
+                                        })
+                                        .truncate(),
+                                    );
                                 });
                             });
                         },
@@ -1435,7 +1468,7 @@ impl App {
                     self.generation.fetch_add(1, Ordering::Relaxed);
                     self.busy = false;
                     self.connection_open = false;
-                    self.covers.clear();
+                    self.covers = Artwork::default();
                     self.detail = None;
                     self.notice = None;
                     self.error = None;
@@ -1453,16 +1486,18 @@ impl App {
 }
 
 /// A remembered server, opened with its last snapshot on a worker, so startup never waits
-/// on Credential Manager, networking setup or image decoding.
+/// on Credential Manager or networking setup. Artwork is requested as cards appear.
 pub(super) struct Restored {
     session: session::Session,
+    prefs: prefs::LibraryOrder,
     source: Source,
     overview: Option<metadata::Overview>,
     home: Option<metadata::Home>,
-    art: Vec<(String, egui::ColorImage)>,
 }
 
 pub(super) struct Startup {
+    client_id: String,
+    volume: prefs::Volume,
     servers: Vec<Restored>,
     unreadable: Vec<session::Unreadable>,
     error: Option<String>,
@@ -1479,14 +1514,6 @@ pub(super) enum Background {
         wanted: bool,
         result: Result<(), String>,
     },
-}
-
-/// The artwork a server's Continue row shows for `item`.
-fn continue_art(item: &Item) -> Option<&String> {
-    item.art
-        .as_ref()
-        .filter(|_| item.kind == Kind::Movie)
-        .or(item.thumb.as_ref())
 }
 
 fn restore_saved(plex_server: String) -> Startup {
@@ -1518,25 +1545,12 @@ fn restore_saved(plex_server: String) -> Startup {
         };
         let store = metadata::Store::new(saved.kind.plugin().id, &saved.server);
         let overview = store.overview().map(|saved| saved.value);
-        let art = overview
-            .iter()
-            .flat_map(|overview| &overview.continue_items)
-            .filter_map(|item| {
-                let path = continue_art(item)?;
-                let image = source.cached_artwork(path)?;
-                let size = [image.width() as usize, image.height() as usize];
-                Some((
-                    path.clone(),
-                    egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw()),
-                ))
-            })
-            .collect();
         servers.push(Restored {
+            prefs: prefs::load_library_order(&saved),
             home: store.home().map(|saved| saved.value),
             session: saved,
             source,
             overview,
-            art,
         });
     }
     let error = saved.error.or_else(|| {
@@ -1548,6 +1562,8 @@ fn restore_saved(plex_server: String) -> Startup {
         })
     });
     Startup {
+        client_id: prefs::device_id(),
+        volume: prefs::Volume::load(),
         servers,
         unreadable: saved.unreadable,
         error,
@@ -1575,19 +1591,23 @@ impl App {
             Ok(startup) => startup,
             Err(mpsc::TryRecvError::Empty) => return,
             Err(mpsc::TryRecvError::Disconnected) => Startup {
+                client_id: prefs::fallback_device_id(),
+                volume: prefs::Volume::default(),
                 servers: vec![],
                 unreadable: vec![],
                 error: Some("Perfuse could not load your saved servers.".into()),
             },
         };
         self.restoring = None;
+        self.sign_in.client_id = startup.client_id;
+        self.playback.volume = startup.volume;
         self.unreadable = startup.unreadable;
         if let Some(error) = startup.error {
             self.error = Some(error);
         }
         let first = self.servers.len();
         for restored in startup.servers {
-            self.servers.push(Server::restored(restored, ctx));
+            self.servers.push(Server::restored(restored));
         }
         self.servers[first..].sort_by_key(|s| s.prefs.position);
         // The snapshot is on screen. Refreshing each server is the later step.
@@ -1646,6 +1666,7 @@ impl App {
     /// and snapshots. Runs in the background and reports only what could not be done.
     fn forget_removed(&self, removed: Server, book: Option<player::Retired>) {
         let tx = self.background_tx.clone();
+        let finish_removal = prefs::begin_removal(&removed.session);
         let name = removed.name();
         let Server {
             session,
@@ -1668,12 +1689,13 @@ impl App {
                     "Perfuse could not sign out of {name} on the server."
                 ));
             }
-            match remembered.then(|| session::clear(&session)) {
+            let cleared = remembered.then(|| session::clear(&session));
+            finish_removal(!matches!(cleared, Some(Err(_))));
+            match cleared {
                 Some(Err(_)) => problems.push(format!(
                     "Windows could not delete the saved sign-in for {name}, so it will reappear next time. Remove it again in Settings."
                 )),
                 _ => {
-                    prefs::forget_server(&session);
                     store.forget();
                 }
             }
