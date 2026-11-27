@@ -70,6 +70,9 @@ const FULLSCREEN_CONTROLS_SECONDS: f64 = 2.0;
 const FULLSCREEN_REVEAL_SECONDS: f64 = 1.0;
 // Allow for the native video's 200ms pointer sampling cadence.
 const FULLSCREEN_MOTION_GAP_SECONDS: f64 = 0.35;
+// 70% black behind the playback controls, eased out toward the picture.
+const SCRIM: Color32 = Color32::from_black_alpha(179);
+const SCRIM_FEATHER: f32 = 48.0;
 const MIN_BROWSE_SIZE: Vec2 = Vec2::new(860.0, 620.0);
 const MIN_PLAYBACK_SIZE: Vec2 = Vec2::new(240.0, 135.0);
 const MINI_PLAYER_WIDTH: f32 = 540.0;
@@ -2604,7 +2607,9 @@ impl App {
                 .show(ctx, |ui| {
                     ui.set_width(bounds.width());
                     ui.set_opacity(opacity);
-                    egui::Frame::new()
+                    // The scrim is this layer's first shape: above the video, below the controls.
+                    let scrim = ui.painter().add(egui::Shape::Noop);
+                    let header = egui::Frame::new()
                         .inner_margin(egui::Margin::symmetric(56, 28))
                         .show(ui, |ui| {
                             // Reserve the fullscreen button before the title takes the remaining width.
@@ -2649,7 +2654,19 @@ impl App {
                                     );
                                 },
                             );
-                        });
+                        })
+                        .response
+                        .rect;
+                    ui.painter().set(
+                        scrim,
+                        controls_scrim(
+                            egui::Rect::from_x_y_ranges(
+                                bounds.x_range(),
+                                bounds.top()..=header.bottom(),
+                            ),
+                            header.bottom() + SCRIM_FEATHER,
+                        ),
+                    );
                 });
             egui::Area::new(egui::Id::new("transport"))
                 .order(egui::Order::Foreground)
@@ -2659,7 +2676,8 @@ impl App {
                 .show(ctx, |ui| {
                     ui.set_width(bounds.width());
                     ui.set_opacity(opacity);
-                    egui::Frame::new()
+                    let scrim = ui.painter().add(egui::Shape::Noop);
+                    let transport = egui::Frame::new()
                         .inner_margin(egui::Margin::symmetric(56, 32))
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
@@ -2848,7 +2866,19 @@ impl App {
                                     },
                                 );
                             });
-                        });
+                        })
+                        .response
+                        .rect;
+                    ui.painter().set(
+                        scrim,
+                        controls_scrim(
+                            egui::Rect::from_x_y_ranges(
+                                bounds.x_range(),
+                                transport.top()..=bounds.bottom(),
+                            ),
+                            transport.top() - SCRIM_FEATHER,
+                        ),
+                    );
                 });
         }
     }
@@ -4420,6 +4450,33 @@ fn control_row<R>(ui: &mut egui::Ui, height: f32, add: impl FnOnce(&mut egui::Ui
         add,
     )
     .inner
+}
+
+/// Fills `band` with the scrim, then fades it out between the band's inner edge and `clear_at`.
+fn controls_scrim(band: egui::Rect, clear_at: f32) -> egui::Shape {
+    const STEPS: u32 = 8;
+    let edge = if clear_at > band.bottom() {
+        band.bottom()
+    } else {
+        band.top()
+    };
+    let mut mesh = egui::Mesh::default();
+    mesh.add_colored_rect(band, SCRIM);
+    for step in 0..=STEPS {
+        // Smoothstep leaves no visible line where the solid band ends.
+        let t = step as f32 / STEPS as f32;
+        let alpha = f32::from(SCRIM.a()) * (1.0 - t * t * (3.0 - 2.0 * t));
+        let color = Color32::from_black_alpha(alpha.round() as u8);
+        let y = egui::lerp(edge..=clear_at, t);
+        mesh.colored_vertex(egui::pos2(band.left(), y), color);
+        mesh.colored_vertex(egui::pos2(band.right(), y), color);
+        if step > 0 {
+            let last = mesh.vertices.len() as u32 - 4;
+            mesh.add_triangle(last, last + 1, last + 2);
+            mesh.add_triangle(last + 1, last + 2, last + 3);
+        }
+    }
+    mesh.into()
 }
 
 fn seekbar(
