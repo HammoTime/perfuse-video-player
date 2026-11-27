@@ -229,14 +229,23 @@ fn sidebar_actions_clear_the_scrollbar_when_libraries_overflow() {
     let right = harness.get_by_label("Servers & settings").rect().right();
     assert_eq!(expand.size(), Vec2::splat(24.0));
     assert_eq!(sort.size(), expand.size());
-    assert!((sort.left() - expand.right() - 4.0).abs() < 1.0);
+    assert!((expand.left() - sort.right() - 4.0).abs() < 1.0);
     // The group actions share the right edge of every sidebar row, and that edge
     // stays clear of the floating scroll bar at the panel's 16-point margin.
-    assert!((right - sort.right()).abs() < 1.0);
-    assert!(244.0 - 16.0 - sort.right() >= harness.ctx.style().spacing.scroll.bar_width + 4.0);
+    assert!((right - expand.right()).abs() < 1.0);
+    assert!(244.0 - 16.0 - expand.right() >= harness.ctx.style().spacing.scroll.bar_width + 4.0);
     harness.get_by_label("Sort libraries").click();
     harness.run_steps(3);
-    harness.get_by_label("Server order");
+    harness.get_by_label("Server order").click();
+
+    harness.state_mut().servers[0].sections.truncate(1);
+    harness.run_steps(4);
+    assert!(harness.query_by_label("Sort libraries").is_none());
+    let collapse = harness.get_by_label("Collapse libraries");
+    assert!((right - collapse.rect().right()).abs() < 1.0);
+    collapse.click();
+    harness.run_steps(3);
+    assert!((right - harness.get_by_label("Expand libraries").rect().right()).abs() < 1.0);
 }
 
 #[test]

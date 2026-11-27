@@ -534,15 +534,9 @@ impl App {
         ctx: &egui::Context,
         show_sort: bool,
     ) {
-        let s = &mut self.servers[i];
+        let s = &self.servers[i];
         let name = s.name();
-        let collapsed = s.prefs.collapsed;
         ui.spacing_mut().item_spacing.x = 4.0;
-        let label = if collapsed {
-            "Expand libraries"
-        } else {
-            "Collapse libraries"
-        };
         let kind = s.session.kind.plugin().name;
         // Put the server mark on the sidebar icon column and its name on the text column.
         let (mark, _) = ui.allocate_exact_size(
@@ -590,15 +584,6 @@ impl App {
             .on_hover_text(format!("{kind} – {name}"))
             .on_hover_cursor(egui::CursorIcon::PointingHand)
             .clicked();
-        let icon = if collapsed {
-            Icon::PageNext
-        } else {
-            Icon::ChevronDown
-        };
-        if ui.add(IconButton::new(icon, label).size(24.0)).clicked() {
-            s.prefs.collapsed = !collapsed;
-            s.persist();
-        }
         if !s.online {
             ui.add(Icon::StatusOffline.image(14.0, ERROR_TEXT));
         }

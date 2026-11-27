@@ -1226,6 +1226,16 @@ impl App {
                         );
                     });
             }
+            let server = &mut self.servers[i];
+            let (icon, label) = if server.prefs.collapsed {
+                (Icon::PageNext, "Expand libraries")
+            } else {
+                (Icon::ChevronDown, "Collapse libraries")
+            };
+            if ui.add(IconButton::new(icon, label).size(24.0)).clicked() {
+                server.prefs.collapsed = !server.prefs.collapsed;
+                server.persist();
+            }
         });
         let mut pending_move: Option<(usize, usize)> = None;
         let mut open_section: Option<Library> = None;
