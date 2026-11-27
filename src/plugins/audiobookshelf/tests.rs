@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     http_fixture::{fixture, ok},
-    plugins::Credentials,
+    plugins::{Credentials, OpenOptions},
 };
 use serde_json::{Value, json};
 use std::io::Cursor;
@@ -16,7 +16,7 @@ pub(super) fn credentials(server: &str) -> Credentials {
 }
 
 fn source(server: &str) -> Source {
-    (PLUGIN.open)(&credentials(server), false).unwrap()
+    (PLUGIN.open)(&credentials(server), OpenOptions::default()).unwrap()
 }
 
 fn entry(id: &str, tracks: usize) -> Value {
@@ -67,7 +67,7 @@ fn paginates_audio_books_across_mixed_library_pages() {
     let source = source(&server);
     let libraries = source.libraries().unwrap();
     assert_eq!(libraries.len(), 1);
-    assert_eq!(libraries[0].kind, Kind::Audiobook);
+    assert_eq!(libraries[0].kind, LibraryKind::Audiobooks);
     let page = source
         .browse(&Browse::Library(libraries[0].clone()), "", 0)
         .unwrap();
@@ -99,28 +99,25 @@ fn recent_pages_keep_server_order_for_books_added_together() {
         .rev()
         .map(|i| entry(&format!("book-{i:02}"), 1))
         .collect();
-    let mut replies = Vec::new();
-    for _ in 0..2 {
-        replies.extend([
-            ok(
-                "GET /api/libraries",
-                json!({"libraries":[
-                    {"id":"books","name":"Books","mediaType":"book"},
-                    {"id":"second","name":"More","mediaType":"book"}
-                ]}),
-            ),
-            ok(
-                "GET /api/libraries/books/items",
-                json!({"offset":0,"total":tied.len(),"results":tied}),
-            ),
-            ok(
-                "GET /api/libraries/second/items",
-                json!({"offset":0,"total":1,"results":[newer]}),
-            ),
-            ok("GET /api/me", json!({"mediaProgress":[]})),
-        ]);
-    }
-    let (server, worker) = fixture(replies);
+    let books = json!({"offset":0,"total":tied.len(),"results":tied});
+    let (server, worker) = fixture(vec![
+        ok(
+            "GET /api/libraries",
+            json!({"libraries":[
+                {"id":"books","name":"Books","mediaType":"book"},
+                {"id":"second","name":"More","mediaType":"book"}
+            ]}),
+        ),
+        ok("GET /api/libraries/books/items", books.clone()),
+        ok(
+            "GET /api/libraries/second/items",
+            json!({"offset":0,"total":1,"results":[newer]}),
+        ),
+        ok("GET /api/me", json!({"mediaProgress":[]})),
+        // The next page continues each library where the first page stopped.
+        ok("GET /api/libraries/books/items", books),
+        ok("GET /api/me", json!({"mediaProgress":[]})),
+    ]);
     let source = source(&server);
     let first = source.browse(&Browse::RecentlyAdded, "", 0).unwrap();
     assert!(first.has_next());
@@ -135,6 +132,7 @@ fn recent_pages_keep_server_order_for_books_added_together() {
         ["book-01", "book-00"]
     );
     let requests = worker.join().unwrap();
+    assert_eq!(requests.len(), 6);
     assert_eq!(requests[1].query("sort").as_deref(), Some("addedAt"));
     assert_eq!(requests[1].query("desc").as_deref(), Some("1"));
 }
@@ -153,7 +151,7 @@ fn searches_book_matches_with_encoded_input_and_a_user_page_offset() {
     let library = Library {
         id: "books".into(),
         title: "Library".into(),
-        kind: Kind::Audiobook,
+        kind: LibraryKind::Audiobooks,
     };
     let page = source
         .browse(&Browse::Library(library), "River & Bay", PAGE_SIZE)
@@ -234,7 +232,7 @@ fn book_detail_maps_chapters_tracks_progress_and_cover_on_its_own_origin() {
     assert_eq!(item.resume_ms, Some(112_500));
     assert_eq!(item.duration_ms, Some(200_500));
     assert_eq!(item.last_viewed_at, Some(1_710_000_000));
-    let book = item.book.unwrap();
+    let book = item.book;
     assert_eq!(book.author, "Ada Birch");
     assert_eq!(book.narrator, "Jo West");
     assert_eq!(book.series, "Rivers");

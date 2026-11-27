@@ -20,6 +20,7 @@ pub(crate) struct BookPlayer {
 struct LoadedBook {
     item: Arc<Item>,
     source: Source,
+    kind: ServerKind,
     server_name: String,
     covers: Artwork,
     cover_rx: Option<Receiver<egui::ColorImage>>,
@@ -85,7 +86,7 @@ fn minute_timer_counts_listening_time_across_a_pause() {
 
 enum BookmarkEdit {
     Add(Bookmark),
-    Remove(f64),
+    Remove(Bookmark),
 }
 
 struct PendingBookmark {
@@ -141,10 +142,10 @@ pub(super) fn book_duration(seconds: f64) -> String {
 }
 
 /// Contents of the shared inline breadcrumb on book details and the full player.
-pub(super) fn book_crumb(ui: &mut egui::Ui, server: &str, library: Option<&str>) {
+pub(super) fn book_crumb(ui: &mut egui::Ui, kind: ServerKind, server: &str, library: Option<&str>) {
     ui.spacing_mut().item_spacing.x = 8.0;
-    ui.add(Icon::ServerAudiobookshelf.image(16.0, MUTED));
-    ui.label(RichText::new("Audiobookshelf").size(13.0).color(MUTED));
+    ui.add(connection::source_icon(kind).image(16.0, MUTED));
+    ui.label(RichText::new(kind.plugin().name).size(13.0).color(MUTED));
     for part in [Some(server), library].into_iter().flatten() {
         ui.label(
             RichText::new("/")
@@ -180,7 +181,7 @@ impl App {
                 // Give the dock its own source-scoped copy for the lifetime of the book.
                 let (tx, rx) = mpsc::channel();
                 let (source, path) = (source.clone(), path.clone());
-                thread::spawn(move || {
+                tasks::spawn(move || {
                     if let Some(image) = source
                         .cached_artwork(&path)
                         .or_else(|| source.artwork(&path).ok())
@@ -195,12 +196,14 @@ impl App {
                 cover_rx = Some(rx);
             }
         }
+        let kind = server.map_or_else(ServerKind::default, |s| s.session.kind);
         self.book.loaded = Some(LoadedBook {
             item: Arc::new(item.clone()),
             source: source.clone(),
+            kind,
             server_name: server
                 .map(Server::name)
-                .unwrap_or_else(|| "Audiobookshelf".into()),
+                .unwrap_or_else(|| kind.plugin().name.into()),
             covers,
             cover_rx,
         });
@@ -214,16 +217,16 @@ impl App {
         self.book.completed = true;
         self.book.sleep = None;
         self.book.scrub_range = None;
-        self.playing_seconds = 0.0;
-        self.seek_position = None;
-        self.buffered = 0.0;
-        self.paused = true;
-        self.book_toast(ctx, format!("Finished {}", self.playing_title));
+        self.playback.playing_seconds = 0.0;
+        self.playback.seek_position = None;
+        self.playback.buffered = 0.0;
+        self.playback.paused = true;
+        self.book_toast(ctx, format!("Finished {}", self.playback.playing_title));
     }
 
     pub fn book_chapter_sleep_expired(&mut self, ctx: &egui::Context, position: f64) {
-        self.paused = true;
-        self.playing_seconds = position;
+        self.playback.paused = true;
+        self.playback.playing_seconds = position;
         if matches!(self.book.sleep, Some(Sleep::Chapter)) {
             self.book.sleep = None;
             self.book_toast(ctx, "Paused at the end of the chapter.");
@@ -326,8 +329,8 @@ impl App {
             .book
             .sleep
             .as_mut()
-            .is_some_and(|sleep| sleep.expired(Instant::now(), self.paused));
-        if expired && let Some(player) = &self.player {
+            .is_some_and(|sleep| sleep.expired(Instant::now(), self.playback.paused));
+        if expired && let Some(player) = &self.playback.player {
             player.set_paused(true);
             self.book_toast(ctx, "Sleep timer ended. Playback paused.");
             self.book.sleep = None;
@@ -342,22 +345,20 @@ impl App {
                 return;
             }
             Err(mpsc::TryRecvError::Disconnected) => {
-                Err("Audiobookshelf could not confirm the bookmark change.".into())
+                Err("The server could not confirm the bookmark change.".into())
             }
         };
         match result {
             Ok(edit) => {
                 let apply = |item: &mut Item| {
-                    if let Some(book) = item.book.as_mut() {
-                        let time = match &edit {
-                            BookmarkEdit::Add(mark) => mark.time,
-                            BookmarkEdit::Remove(time) => *time,
-                        };
-                        book.bookmarks.retain(|m| m.time != time);
-                        if let BookmarkEdit::Add(mark) = &edit {
-                            book.bookmarks.push(mark.clone());
-                            book.bookmarks.sort_by(|a, b| a.time.total_cmp(&b.time));
-                        }
+                    let book = &mut item.book;
+                    let id = match &edit {
+                        BookmarkEdit::Add(mark) | BookmarkEdit::Remove(mark) => &mark.id,
+                    };
+                    book.bookmarks.retain(|m| &m.id != id);
+                    if let BookmarkEdit::Add(mark) = &edit {
+                        book.bookmarks.push(mark.clone());
+                        book.bookmarks.sort_by_key(|m| m.position_ms);
                     }
                 };
                 if let Some(loaded) = &mut self.book.loaded
@@ -379,7 +380,10 @@ impl App {
                     ctx,
                     match edit {
                         BookmarkEdit::Add(mark) => {
-                            format!("Bookmark added at {}", transport::short_clock(mark.time))
+                            format!(
+                                "Bookmark added at {}",
+                                transport::short_clock(mark.position_ms as f64 / 1000.0)
+                            )
                         }
                         BookmarkEdit::Remove(_) => "Bookmark deleted".into(),
                     },
@@ -401,23 +405,25 @@ impl App {
             id: id.clone(),
             reply,
         });
-        thread::spawn(move || {
+        tasks::spawn(move || {
             let result = match edit {
-                BookmarkEdit::Add(mark) => source.add_bookmark(&id, &mark).map(BookmarkEdit::Add),
-                BookmarkEdit::Remove(time) => source
-                    .remove_bookmark(&id, time)
-                    .map(|()| BookmarkEdit::Remove(time)),
-            };
+                BookmarkEdit::Add(mark) => source
+                    .add_bookmark(&id, &mark.title, mark.position_ms)
+                    .map(BookmarkEdit::Add),
+                BookmarkEdit::Remove(mark) => source
+                    .remove_bookmark(&id, &mark)
+                    .map(|()| BookmarkEdit::Remove(mark)),
+            }
+            .map_err(String::from);
             let _ = tx.send(result);
         });
     }
 
     fn book_add_mark(&mut self, item: &Item, source: &Source) {
-        let time = self.playing_seconds.floor().max(0.0);
-        let title = item
-            .book
-            .as_ref()
-            .and_then(|book| chapter_index(&book.chapters, time).map(|i| &book.chapters[i]))
+        let time = self.playback.playing_seconds.floor().max(0.0);
+        let chapters = &item.book.chapters;
+        let title = chapter_index(chapters, time)
+            .map(|i| &chapters[i])
             .map_or_else(
                 || format!("{} · {}", item.title, transport::short_clock(time)),
                 |c| {
@@ -428,11 +434,16 @@ impl App {
                     )
                 },
             );
-        self.book_edit_mark(item, source, BookmarkEdit::Add(Bookmark { title, time }));
+        let mark = Bookmark {
+            title,
+            position_ms: (time * 1000.0) as u64,
+            ..Bookmark::default()
+        };
+        self.book_edit_mark(item, source, BookmarkEdit::Add(mark));
     }
 
     fn book_jump(&mut self, seconds: f64) {
-        if let Some(player) = &self.player {
+        if let Some(player) = &self.playback.player {
             player.seek(seconds);
             player.set_paused(false);
         }
@@ -442,14 +453,15 @@ impl App {
         let Some(source) = self.source.clone() else {
             return false;
         };
-        let Some(book) = &item.book else {
+        if !item.is_book() {
             ui.heading(&item.title);
             ui.label("No audiobook details are available.");
             return false;
-        };
+        }
+        let book = &item.book;
         let current = self.book.is_current(&source, &item.id);
         let position = if current {
-            self.playing_seconds
+            self.playback.playing_seconds
         } else {
             item.resume_ms.unwrap_or(0) as f64 / 1000.0
         };
@@ -464,7 +476,7 @@ impl App {
             .servers
             .iter()
             .find(|s| Arc::ptr_eq(&s.source, &source));
-        let server_name = server.map(Server::name);
+        let server_name = server.map(|s| (s.session.kind, s.name()));
         let library = server
             .and_then(|s| {
                 s.sections
@@ -480,8 +492,8 @@ impl App {
             .show(ui, |ui| {
                 let viewport = ui.ctx().content_rect().width();
                 ui.spacing_mut().item_spacing.y = 0.0;
-                if let Some(server_name) = &server_name {
-                    ui.horizontal(|ui| book_crumb(ui, server_name, library.as_deref()));
+                if let Some((kind, server_name)) = &server_name {
+                    ui.horizontal(|ui| book_crumb(ui, *kind, server_name, library.as_deref()));
                     ui.add_space(24.0);
                 }
                 book_panel().inner_margin(28).show(ui, |ui| {
@@ -544,7 +556,7 @@ impl App {
                         ui.colored_label(MUTED, "No audio file is available for this book.");
                         return;
                     }
-                    let (icon, label) = if current && !self.paused {
+                    let (icon, label) = if current && !self.playback.paused {
                         (Icon::Pause, "Pause")
                     } else if in_progress {
                         (Icon::Resume, "Resume")
@@ -558,7 +570,7 @@ impl App {
                         ui.add(pill.min_width(width))
                     };
                     if action(ui, Pill::primary(icon, label)).clicked() {
-                        if current && let Some(player) = &self.player {
+                        if current && let Some(player) = &self.playback.player {
                             player.pause();
                         } else {
                             self.book.start_at_ms = None;
@@ -704,7 +716,8 @@ impl App {
                     if let Some(server) =
                         self.servers.iter().find(|s| Arc::ptr_eq(&s.source, source))
                     {
-                        row(ui, "Server", &format!("Audiobookshelf · {}", server.name()));
+                        let kind = server.session.kind.plugin().name;
+                        row(ui, "Server", &format!("{kind} · {}", server.name()));
                         if let Some(library) = server
                             .sections
                             .iter()
@@ -713,10 +726,8 @@ impl App {
                             row(ui, "Library", &library.title);
                         }
                     }
-                    if let Some(book) = &item.book
-                        && !book.narrator.is_empty()
-                    {
-                        row(ui, "Narrator", &book.narrator);
+                    if !item.book.narrator.is_empty() {
+                        row(ui, "Narrator", &item.book.narrator);
                     }
                     if let Some(year) = item.year {
                         row(ui, "Released", &year.to_string());
@@ -741,7 +752,10 @@ impl App {
         current: bool,
         bookmarks: bool,
     ) -> Option<f64> {
-        let book = item.book.as_ref()?;
+        if !item.is_book() {
+            return None;
+        }
+        let book = &item.book;
         let mut jump = None;
         ui.spacing_mut().item_spacing.y = 0.0;
         if bookmarks {
@@ -754,7 +768,8 @@ impl App {
                     });
             }
             for (index, mark) in book.bookmarks.iter().enumerate() {
-                ui.push_id(mark.time.to_bits(), |ui| {
+                let seconds = mark.position_ms as f64 / 1000.0;
+                ui.push_id(&mark.id, |ui| {
                     if index > 0 {
                         let (line, _) = ui.allocate_exact_size(
                             Vec2::new(ui.available_width(), 1.0),
@@ -769,8 +784,8 @@ impl App {
                         let (icon, _) =
                             ui.allocate_exact_size(Vec2::new(20.0, 42.5), egui::Sense::hover());
                         Icon::Bookmark.paint(ui, icon.center(), 18.0, ACCENT);
-                        let mut caption = transport::short_clock(mark.time);
-                        if let Some(i) = chapter_index(&book.chapters, mark.time) {
+                        let mut caption = transport::short_clock(seconds);
+                        if let Some(i) = chapter_index(&book.chapters, seconds) {
                             caption.push_str(" · ");
                             caption.push_str(&book.chapters[i].title);
                         }
@@ -816,7 +831,7 @@ impl App {
                             })
                             .inner;
                         if jump_button.clicked() {
-                            jump = Some(mark.time);
+                            jump = Some(seconds);
                         }
                         let label = format!("Delete bookmark {}", mark.title);
                         ui.spacing_mut().button_padding = Vec2::ZERO;
@@ -835,7 +850,7 @@ impl App {
                             )
                         });
                         if delete.on_hover_text(label).clicked() {
-                            self.book_edit_mark(item, source, BookmarkEdit::Remove(mark.time));
+                            self.book_edit_mark(item, source, BookmarkEdit::Remove(mark.clone()));
                         }
                     });
                     ui.add_space(10.0);
@@ -846,7 +861,7 @@ impl App {
                 ui.colored_label(MUTED, "No chapters available.");
             }
             let position = if current {
-                self.playing_seconds
+                self.playback.playing_seconds
             } else {
                 item.resume_ms.unwrap_or(0) as f64 / 1000.0
             };

@@ -16,7 +16,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(windows)]
 const REPOSITORY: &str = "HammoTime/perfuse-video-player";
 
 #[derive(Clone)]
@@ -24,6 +23,36 @@ pub struct Available {
     pub version: String,
     #[cfg(windows)]
     installer: Asset,
+}
+
+impl Available {
+    /// The GitHub release page for manual downloads when this copy cannot update itself.
+    pub fn release_page(&self) -> String {
+        format!(
+            "https://github.com/{REPOSITORY}/releases/tag/v{}",
+            self.version
+        )
+    }
+}
+
+/// The per-user installation that client updates replace and relaunch.
+#[cfg(windows)]
+fn installed_location() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .map(|local| PathBuf::from(local).join("Programs/Perfuse/perfuse.exe"))
+}
+
+/// True only when this executable is the per-user installation. Development builds and
+/// portable copies would otherwise update and relaunch a different executable.
+pub fn self_install_supported() -> bool {
+    #[cfg(windows)]
+    {
+        let canonical = |path: PathBuf| fs::canonicalize(path).ok();
+        let installed = installed_location().and_then(canonical);
+        installed.is_some() && std::env::current_exe().ok().and_then(canonical) == installed
+    }
+    #[cfg(not(windows))]
+    false
 }
 
 enum Event {
@@ -241,15 +270,18 @@ fn latest() -> Result<Option<Available>, String> {
 
 #[cfg(windows)]
 fn install(available: &Available, report: &dyn Fn(String)) -> Result<(), String> {
+    if !self_install_supported() {
+        return Err("This copy of Perfuse runs outside its installed folder, so it cannot update itself. Download the update from the release page instead.".into());
+    }
+    // The script checks the installer against this digest again just before running it.
+    let digest = available.installer.sha256_hex()?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     let dir = std::env::temp_dir().join(format!("perfuse-update-{}-{now}", std::process::id()));
     let system = std::env::var_os("SystemRoot").ok_or("Could not locate Windows PowerShell.")?;
-    let local =
-        std::env::var_os("LOCALAPPDATA").ok_or("Could not locate your local app data folder.")?;
-    let installed = PathBuf::from(local).join("Programs/Perfuse/perfuse.exe");
+    let installed = installed_location().ok_or("Could not locate your local app data folder.")?;
     let current = std::env::current_exe().map_err(|_| "Could not locate Perfuse.")?;
     fs::create_dir(&dir).map_err(|_| "Could not create a temporary folder for the update.")?;
     let installer = dir.join(&available.installer.name);
@@ -270,6 +302,7 @@ fn install(available: &Available, report: &dyn Fn(String)) -> Result<(), String>
             ])
             .env("PERFUSE_UPDATE_PID", std::process::id().to_string())
             .env("PERFUSE_UPDATE_SETUP", &installer)
+            .env("PERFUSE_UPDATE_SHA256", &digest)
             .env("PERFUSE_UPDATE_APP", &installed)
             .env("PERFUSE_UPDATE_PREVIOUS", &current)
             .creation_flags(0x08000000)

@@ -3,7 +3,7 @@ use super::*;
 
 impl App {
     pub(super) fn book_volume(&mut self, ui: &mut egui::Ui, dock: bool) {
-        let mut gain = self.volume.gain();
+        let mut gain = self.playback.volume.gain();
         let muted = gain == 0.0;
         let icon = if muted {
             Icon::VolumeMuted
@@ -50,16 +50,20 @@ impl App {
                 }
                 let toggle = book_tool(ui, icon, if muted { "Unmute" } else { "Mute" }, muted);
                 if toggle.clicked() {
-                    gain = if muted { self.volume.level() } else { 0.0 };
+                    gain = if muted {
+                        self.playback.volume.level()
+                    } else {
+                        0.0
+                    };
                 }
                 if (slider.changed() || toggle.clicked())
-                    && self.volume.set(gain)
-                    && let Some(player) = &self.player
+                    && self.playback.volume.set(gain)
+                    && let Some(player) = &self.playback.player
                 {
                     player.volume(gain);
                 }
                 if !slider.dragged() {
-                    self.volume.save();
+                    self.playback.volume.save();
                 }
             })
             .is_some();

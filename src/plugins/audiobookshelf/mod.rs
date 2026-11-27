@@ -5,8 +5,9 @@ mod playback;
 #[cfg(test)]
 mod tests;
 
-use super::{Plugin, ServerKind};
-use crate::{cache::Artwork, media::*};
+use super::{OpenOptions, Plugin, ServerKind, SignInMethod};
+use crate::{cache::Artwork, media::*, plugins::credentials::lock};
+use auth::SERVER;
 use serde::Deserialize;
 use std::{
     cmp::Reverse,
@@ -17,34 +18,51 @@ use std::{
 pub static PLUGIN: Plugin = Plugin {
     kind: ServerKind::Audiobookshelf,
     id: "audiobookshelf",
-    name: "Audiobookshelf",
+    name: SERVER,
     default_address: "http://localhost:13378",
-    open: |session, cache| {
+    address_example: "https://abs.example.com",
+    description: "Audiobooks with chapters and bookmarks.",
+    libraries: &[LibraryKind::Audiobooks],
+    sign_in: &[SignInMethod::Password { required: true }],
+    authenticate: auth::authenticate,
+    open: |session, options: OpenOptions| {
         Ok(Arc::new(Audiobookshelf {
             api: auth::Api::new(session)?,
-            artwork: Artwork::new(cache),
-            next_page: Mutex::default(),
+            artwork: Artwork::new(options.cache_artwork),
+            cursors: Mutex::default(),
         }))
     },
 };
 
+// Remembered cursors grow with the pages a user visits. Start over past this many.
+const CURSOR_LIMIT: usize = 1024;
+
+/// The server counts ebooks and podcasts in its page offsets, so a visible book offset
+/// does not map to a server offset. Remember where each visited page continues.
+#[derive(Default)]
+struct Cursors {
+    /// (library, visible offset) to the raw server offset of that page's first book.
+    library: HashMap<(String, usize), usize>,
+    /// Recently Added visible offset to each library's raw offset, or None once exhausted.
+    recent: HashMap<usize, Vec<(String, Option<usize>)>>,
+}
+
+impl Cursors {
+    fn trim(&mut self) {
+        if self.library.len() + self.recent.len() > CURSOR_LIMIT {
+            *self = Self::default();
+        }
+    }
+}
+
 struct Audiobookshelf {
     api: auth::Api,
     artwork: Artwork,
-    // The server counts ebooks in page offsets. Remember the next raw offset for forward browsing.
-    next_page: Mutex<Option<(String, usize, usize)>>,
+    cursors: Mutex<Cursors>,
 }
 
-fn identifier(id: &str) -> Result<&str, String> {
-    if id.is_empty()
-        || id.len() > 128
-        || !id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
-    {
-        return Err("Audiobookshelf returned an invalid identifier.".into());
-    }
-    Ok(id)
+fn identifier(id: &str) -> SourceResult<&str> {
+    super::identifier(id, SERVER)
 }
 
 fn millis(seconds: f64) -> Option<u64> {
@@ -117,14 +135,14 @@ impl Entry {
         self.media_type == "book" && self.media.num_tracks.unwrap_or(self.media.tracks.len()) > 0
     }
 
-    fn in_library(&self, id: &str) -> Result<(), String> {
+    fn in_library(&self, id: &str) -> SourceResult<()> {
         if self.library_id != id {
             return Err("Audiobookshelf returned a book from a different library.".into());
         }
         Ok(())
     }
 
-    fn into_item(self, detail: bool) -> Result<Item, String> {
+    fn into_item(self, detail: bool) -> SourceResult<Item> {
         identifier(&self.id)?;
         identifier(&self.library_id)?;
         let (versions, duration_ms) = if detail {
@@ -174,13 +192,13 @@ impl Entry {
             duration_ms,
             thumb,
             versions,
-            book: Some(Box::new(Book {
+            book: Book {
                 author: meta.author_name.unwrap_or_default(),
                 narrator: meta.narrator_name.unwrap_or_default(),
                 series: meta.series_name.unwrap_or_default(),
                 chapters,
                 bookmarks: Vec::new(),
-            })),
+            },
             year: meta.published_year.and_then(|s| s.parse().ok()),
             release_date: meta.published_date,
             summary: meta
@@ -206,8 +224,11 @@ struct Listing {
     results: Vec<Entry>,
 }
 
+/// Books with their raw server positions, and the raw position of the first unread book.
+type Catalog = (Vec<(usize, Entry)>, Option<usize>);
+
 impl Audiobookshelf {
-    fn progress(&self) -> Result<HashMap<String, UserProgress>, String> {
+    fn progress(&self) -> SourceResult<HashMap<String, UserProgress>> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Me {
@@ -230,7 +251,7 @@ impl Audiobookshelf {
         mut raw: usize,
         mut skip: usize,
         take: usize,
-    ) -> Result<(Vec<Entry>, Option<usize>), String> {
+    ) -> SourceResult<Catalog> {
         const LIMIT: usize = PAGE_SIZE * 2;
         let path = format!("/api/libraries/{}/items", identifier(library)?);
         let mut books = Vec::new();
@@ -263,7 +284,7 @@ impl Audiobookshelf {
                 } else if books.len() == take {
                     return Ok((books, Some(listing.offset + index)));
                 } else {
-                    books.push(entry);
+                    books.push((listing.offset + index, entry));
                 }
             }
             raw = listing.offset.saturating_add(count);
@@ -273,14 +294,15 @@ impl Audiobookshelf {
         }
     }
 
-    fn library_page(&self, id: &str, offset: usize) -> Result<(Vec<Entry>, Option<usize>), String> {
-        let cursor = self
-            .next_page
-            .lock()
-            .unwrap()
-            .as_ref()
-            .filter(|(library, next, _)| library == id && *next == offset)
-            .map(|(_, _, raw)| *raw);
+    fn library_page(&self, id: &str, offset: usize) -> SourceResult<(Vec<Entry>, Option<usize>)> {
+        let cursor = if offset == 0 {
+            Some(0)
+        } else {
+            lock(&self.cursors)
+                .library
+                .get(&(id.to_owned(), offset))
+                .copied()
+        };
         let (entries, next) = self.catalog(
             id,
             "media.metadata.title",
@@ -288,19 +310,84 @@ impl Audiobookshelf {
             if cursor.is_some() { 0 } else { offset },
             PAGE_SIZE,
         )?;
-        *self.next_page.lock().unwrap() =
-            next.map(|raw| (id.to_owned(), offset + entries.len(), raw));
-        let total = next.is_none().then_some(offset + entries.len());
-        Ok((entries, total))
+        let end = offset + entries.len();
+        if let Some(raw) = next {
+            let mut cursors = lock(&self.cursors);
+            cursors.trim();
+            cursors.library.insert((id.to_owned(), end), raw);
+        }
+        let total = next.is_none().then_some(end);
+        Ok((entries.into_iter().map(|(_, entry)| entry).collect(), total))
     }
 
-    fn recently_added(&self, offset: usize) -> Result<(Vec<Entry>, Option<usize>), String> {
+    /// Merges each library's newest books. Visited pages continue from remembered
+    /// per-library positions, so later pages cost one request per library.
+    fn recently_added(&self, offset: usize) -> SourceResult<(Vec<Entry>, Option<usize>)> {
+        let start = lock(&self.cursors).recent.get(&offset).cloned();
+        let start = match start {
+            Some(start) => start,
+            None if offset == 0 => self
+                .libraries()?
+                .into_iter()
+                .map(|library| (library.id, Some(0)))
+                .collect(),
+            None => return self.recently_added_prefix(offset),
+        };
+        let mut candidates = Vec::new();
+        let mut fetched_to = Vec::with_capacity(start.len());
+        for (index, (library, raw)) in start.iter().enumerate() {
+            let Some(raw) = *raw else {
+                fetched_to.push(None);
+                continue;
+            };
+            let (books, next) = self.catalog(library, "addedAt", raw, 0, PAGE_SIZE)?;
+            candidates.extend(
+                books
+                    .into_iter()
+                    .map(|(position, entry)| (index, position, entry)),
+            );
+            fetched_to.push(next);
+        }
+        // Newest first. Ties keep library order, then each library's server order.
+        candidates
+            .sort_by_key(|(index, position, entry)| (Reverse(entry.added_at), *index, *position));
+        let unused = candidates.split_off(PAGE_SIZE.min(candidates.len()));
+        // Each library continues at its first book left off this page, or after its fetch.
+        let next: Vec<_> = start
+            .into_iter()
+            .zip(fetched_to)
+            .enumerate()
+            .map(|(index, ((library, _), fetched))| {
+                let first_unused = unused
+                    .iter()
+                    .filter(|(from, ..)| *from == index)
+                    .map(|(_, position, _)| *position)
+                    .min();
+                (library, first_unused.or(fetched))
+            })
+            .collect();
+        let end = offset + candidates.len();
+        let more = next.iter().any(|(_, raw)| raw.is_some());
+        if more {
+            let mut cursors = lock(&self.cursors);
+            cursors.trim();
+            cursors.recent.insert(end, next);
+        }
+        let total = (!more).then_some(end);
+        Ok((
+            candidates.into_iter().map(|(_, _, entry)| entry).collect(),
+            total,
+        ))
+    }
+
+    /// Recently Added from an offset no earlier page reached, by merging each library's prefix.
+    fn recently_added_prefix(&self, offset: usize) -> SourceResult<(Vec<Entry>, Option<usize>)> {
         let end = offset.saturating_add(PAGE_SIZE);
         let mut books = Vec::new();
         let mut more = false;
         for library in self.libraries()? {
             let (items, next) = self.catalog(&library.id, "addedAt", 0, 0, end)?;
-            books.extend(items);
+            books.extend(items.into_iter().map(|(_, entry)| entry));
             // Preserve each library's server order for ties, even as the next page widens its prefix.
             books.sort_by_key(|e| Reverse(e.added_at));
             more |= next.is_some() || books.len() > end;
@@ -315,9 +402,9 @@ impl Audiobookshelf {
     fn prefix_page(
         &self,
         offset: usize,
-        mut load: impl FnMut(usize) -> Result<Vec<Entry>, String>,
+        mut load: impl FnMut(usize) -> SourceResult<Vec<Entry>>,
         include: impl Fn(&Entry) -> bool,
-    ) -> Result<(Vec<Entry>, Option<usize>), String> {
+    ) -> SourceResult<(Vec<Entry>, Option<usize>)> {
         let end = offset.saturating_add(PAGE_SIZE);
         let mut limit = end.saturating_add(1);
         loop {
@@ -345,7 +432,7 @@ impl Audiobookshelf {
         library: &str,
         search: &str,
         offset: usize,
-    ) -> Result<(Vec<Entry>, Option<usize>), String> {
+    ) -> SourceResult<(Vec<Entry>, Option<usize>)> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Hit {
@@ -378,7 +465,7 @@ impl Audiobookshelf {
         )
     }
 
-    fn cover_id(path: &str) -> Result<&str, String> {
+    fn cover_id(path: &str) -> SourceResult<&str> {
         let mut parts = path.split('/');
         let (Some("cover"), Some(id), Some(revision), None) =
             (parts.next(), parts.next(), parts.next(), parts.next())
@@ -397,7 +484,16 @@ impl MediaSource for Audiobookshelf {
         self.api.base.as_str()
     }
 
-    fn libraries(&self) -> Result<Vec<Library>, String> {
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            bookmarks: true,
+            // Legacy API tokens cannot be revoked by signing out.
+            sign_out: self.api.token.is_rotating(),
+            ..Capabilities::default()
+        }
+    }
+
+    fn libraries(&self) -> SourceResult<Vec<Library>> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct View {
@@ -419,13 +515,13 @@ impl MediaSource for Audiobookshelf {
                 Ok(Library {
                     id: lib.id,
                     title: lib.name,
-                    kind: Kind::Audiobook,
+                    kind: LibraryKind::Audiobooks,
                 })
             })
             .collect()
     }
 
-    fn browse(&self, scope: &Browse, search: &str, offset: usize) -> Result<Page, String> {
+    fn browse(&self, scope: &Browse, search: &str, offset: usize) -> SourceResult<Page> {
         let mut progress = HashMap::new();
         let (mut entries, total) = match scope {
             Browse::Library(lib) if !search.trim().is_empty() => {
@@ -433,7 +529,11 @@ impl MediaSource for Audiobookshelf {
             }
             Browse::Library(lib) => self.library_page(&lib.id, offset)?,
             Browse::RecentlyAdded => self.recently_added(offset)?,
-            Browse::Children(_) => return Err("Audiobooks do not have child items.".into()),
+            Browse::Children(_) => {
+                return Err(SourceError::Unsupported(
+                    "Audiobooks do not have child items.".into(),
+                ));
+            }
             Browse::ContinueWatching => {
                 #[derive(Deserialize)]
                 #[serde(rename_all = "camelCase")]
@@ -442,11 +542,7 @@ impl MediaSource for Audiobookshelf {
                 }
                 progress = self.progress()?;
                 if progress.is_empty() {
-                    return Ok(Page {
-                        items: vec![],
-                        offset,
-                        total: Some(0),
-                    });
+                    return Ok(Page::new(vec![], offset, Some(0)));
                 }
                 self.prefix_page(
                     offset,
@@ -479,22 +575,17 @@ impl MediaSource for Audiobookshelf {
                 Reverse(e.user_media_progress.as_ref().and_then(|p| p.last_update))
             });
         }
-        Ok(Page {
-            items: entries
+        Ok(Page::new(
+            entries
                 .into_iter()
                 .map(|e| e.into_item(false))
                 .collect::<Result<_, _>>()?,
             offset,
             total,
-        })
+        ))
     }
 
-    fn recently_released(&self, _libraries: &[Library]) -> Result<Vec<Item>, String> {
-        // Audiobook Home shows Continue Listening and Recently Added.
-        Ok(Vec::new())
-    }
-
-    fn item(&self, id: &str) -> Result<Item, String> {
+    fn item(&self, id: &str) -> SourceResult<Item> {
         let entry: Entry = self.api.json(
             self.api
                 .get(&format!("/api/items/{}", identifier(id)?))
@@ -507,9 +598,7 @@ impl MediaSource for Audiobookshelf {
             return Err("This item has no audiobook tracks.".into());
         }
         let mut item = entry.into_item(true)?;
-        if let Some(book) = &mut item.book {
-            book.bookmarks = self.bookmarks(id)?;
-        }
+        item.book.bookmarks = self.bookmarks(id)?;
         Ok(item)
     }
 
@@ -518,7 +607,7 @@ impl MediaSource for Audiobookshelf {
         self.artwork.cached(self.address(), path)
     }
 
-    fn artwork(&self, path: &str) -> Result<image::RgbaImage, String> {
+    fn artwork(&self, path: &str) -> SourceResult<image::RgbaImage> {
         let id = Self::cover_id(path)?;
         let request = self
             .api
@@ -528,19 +617,22 @@ impl MediaSource for Audiobookshelf {
         self.artwork.store_response(self.address(), path, response)
     }
 
-    fn bookmarks(&self, id: &str) -> Result<Vec<Bookmark>, String> {
+    fn bookmarks(&self, id: &str) -> SourceResult<Vec<Bookmark>> {
         bookmarks::list(&self.api, id)
     }
-    fn add_bookmark(&self, id: &str, bookmark: &Bookmark) -> Result<Bookmark, String> {
-        bookmarks::add(&self.api, id, bookmark)
+    fn add_bookmark(&self, id: &str, title: &str, position_ms: u64) -> SourceResult<Bookmark> {
+        bookmarks::add(&self.api, id, title, position_ms)
     }
-    fn remove_bookmark(&self, id: &str, time: f64) -> Result<(), String> {
-        bookmarks::remove(&self.api, id, time)
+    fn remove_bookmark(&self, id: &str, bookmark: &Bookmark) -> SourceResult<()> {
+        bookmarks::remove(&self.api, id, bookmark)
     }
-    fn playback(&self, item: &Item, version: &Version) -> Result<Playback, String> {
-        self.book_playback(item, version)
+    fn playback(&self, item: &Item, version: &Version, track: usize) -> SourceResult<Playback> {
+        self.book_playback(item, version, track)
     }
-    fn report(&self, item: &Item, version: &Version, progress: Progress) -> Result<(), String> {
+    fn report(&self, item: &Item, version: &Version, progress: Progress) -> SourceResult<()> {
         self.book_report(item, version, progress)
+    }
+    fn sign_out(&self) -> SourceResult<()> {
+        self.api.sign_out()
     }
 }

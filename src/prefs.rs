@@ -1,27 +1,31 @@
-//! Non-sensitive UI preferences (such as sidebar library ordering).
-//! Never stores tokens, credentials, or raw server URLs.
+//! Non-sensitive UI preferences (such as sidebar library ordering) and the random
+//! per-install client identifier. Never stores tokens, credentials, or raw server URLs.
 
 use perfuse::{
-    media::{Kind, Library},
+    media::{Library, LibraryKind},
     plugins::{Credentials, ServerKind},
 };
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fs,
-    io::Write,
+    io::{ErrorKind, Write},
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LibrarySort {
-    #[default]
-    Server,
     NameAsc,
     NameDesc,
     TypeThenName,
     Custom,
+    /// Also used for sorts added by a newer Perfuse, so its preferences still load.
+    /// Serde requires this fallback to be the last variant.
+    #[default]
+    #[serde(other)]
+    Server,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,12 +44,18 @@ pub struct LibraryOrder {
     pub custom_keys: Vec<String>,
 }
 
+// Unknown fields are ignored when loading, so a newer build's file still loads here.
 #[derive(Default, Serialize, Deserialize)]
 struct Store {
     #[serde(default)]
     libraries: HashMap<String, LibraryOrder>,
     #[serde(default)]
     volume: Volume,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device_id: Option<String>,
+    /// Top-level sections from a newer Perfuse, kept when this build saves.
+    #[serde(flatten)]
+    newer: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -136,11 +146,70 @@ fn server_key(server: &str) -> String {
     format!("{hash:016x}")
 }
 
+/// Reads the store for display. A damaged file reads as defaults and stays in place until
+/// the next locked update sets it aside.
 fn read_store(path: &Path) -> Store {
     fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default()
+}
+
+/// Reads the store under the update lock. A damaged file is moved to a timestamped `.bad`
+/// sibling rather than overwritten. `None` means the file could not be read or set aside,
+/// so the update must leave it alone.
+fn read_for_update(path: &Path) -> Option<Store> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Some(Store::default()),
+        Err(_) => return None,
+    };
+    if let Ok(store) = serde_json::from_slice(&bytes) {
+        return Some(store);
+    }
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let name = path.file_name()?.to_string_lossy();
+    fs::rename(path, path.with_file_name(format!("{name}.{stamp}.bad")))
+        .ok()
+        .map(|()| Store::default())
+}
+
+// An exclusive Windows handle serializes read-modify-write across app instances. The lock
+// file is empty and Windows releases the handle on exit.
+#[cfg(windows)]
+fn lock_store(path: &Path) -> Option<fs::File> {
+    use std::{
+        os::windows::fs::OpenOptionsExt,
+        time::{Duration, Instant},
+    };
+    use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+    let started = Instant::now();
+    loop {
+        match fs::File::options()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .share_mode(0)
+            .open(path)
+        {
+            Ok(file) => return Some(file),
+            Err(error)
+                if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32)
+                    && started.elapsed() < Duration::from_secs(3) =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn lock_store(_path: &Path) -> Option<()> {
+    Some(())
 }
 
 fn load_from(path: &Path, server: &str) -> LibraryOrder {
@@ -158,22 +227,85 @@ fn save_to(path: &Path, server: &str, order: &LibraryOrder) {
 }
 
 fn update_store(path: &Path, update: impl FnOnce(&mut Store)) {
-    let mut store = read_store(path);
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let Some(_lock) = lock_store(&path.with_extension("lock")) else {
+        return;
+    };
+    let Some(mut store) = read_for_update(path) else {
+        return;
+    };
     update(&mut store);
     let Ok(bytes) = serde_json::to_vec_pretty(&store) else {
         return;
     };
-    let Some(dir) = path.parent() else {
-        return;
-    };
     let partial = path.with_extension(format!("{}.part", std::process::id()));
-    let written = fs::create_dir_all(dir)
-        .and_then(|()| fs::File::create(&partial))
-        .and_then(|mut out| out.write_all(&bytes))
+    // Flush the new contents to disk before the rename replaces the previous file.
+    let written = fs::File::create(&partial)
+        .and_then(|mut out| out.write_all(&bytes).and_then(|()| out.sync_all()))
         .and_then(|()| fs::rename(&partial, path));
     if written.is_err() {
         let _ = fs::remove_file(&partial);
     }
+}
+
+/// A persistent random client identifier for this installation: `perfuse-` and 32 hex
+/// digits, created once and kept in the preferences file.
+pub fn device_id() -> String {
+    match file() {
+        Some(path) => device_id_in(&path),
+        None => new_device_id().unwrap_or_else(fallback_device_id),
+    }
+}
+
+fn device_id_in(path: &Path) -> String {
+    let saved = |store: &Store| store.device_id.clone().filter(|id| valid_device_id(id));
+    if let Some(id) = saved(&read_store(path)) {
+        return id;
+    }
+    let Some(mut id) = new_device_id() else {
+        return fallback_device_id();
+    };
+    update_store(path, |store| match saved(store) {
+        // Another instance created the identifier first.
+        Some(existing) => id = existing,
+        None => store.device_id = Some(id.clone()),
+    });
+    id
+}
+
+fn valid_device_id(id: &str) -> bool {
+    // Sent in request headers, so only short visible ASCII tokens are accepted.
+    (1..=200).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+}
+
+fn new_device_id() -> Option<String> {
+    let mut bytes = [0u8; 16];
+    #[cfg(windows)]
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut bytes).ok()?;
+    #[cfg(not(windows))]
+    std::io::Read::read_exact(&mut fs::File::open("/dev/urandom").ok()?, &mut bytes).ok()?;
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    Some(format!("perfuse-{hex}"))
+}
+
+/// Used only if the system random generator fails; it is not saved.
+fn fallback_device_id() -> String {
+    format!(
+        "perfuse-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    )
 }
 
 fn preference_scope(session: &Credentials) -> String {
@@ -193,6 +325,22 @@ pub fn load_library_order(session: &Credentials) -> LibraryOrder {
 pub fn save_library_order(session: &Credentials, order: &LibraryOrder) {
     if let Some(path) = file() {
         save_to(&path, &preference_scope(session), order);
+    }
+}
+
+/// Removes a server's saved library order, sidebar name and hidden libraries.
+pub fn forget_server(session: &Credentials) {
+    if let Some(path) = file() {
+        forget_in(&path, &preference_scope(session));
+    }
+}
+
+fn forget_in(path: &Path, server: &str) {
+    let key = server_key(server);
+    if read_store(path).libraries.contains_key(&key) {
+        update_store(path, |store| {
+            store.libraries.remove(&key);
+        });
     }
 }
 
@@ -223,11 +371,10 @@ pub fn apply_library_order(server_sections: &[Library], order: &LibraryOrder) ->
         }
         LibrarySort::TypeThenName => {
             result.sort_by(|a, b| {
-                let rank = |kind: Kind| match kind {
-                    Kind::Movie => 0,
-                    Kind::Series => 1,
-                    Kind::Audiobook => 2,
-                    _ => 3,
+                let rank = |kind: LibraryKind| match kind {
+                    LibraryKind::Movies => 0,
+                    LibraryKind::Shows => 1,
+                    LibraryKind::Audiobooks => 2,
                 };
                 rank(a.kind)
                     .cmp(&rank(b.kind))
@@ -269,22 +416,22 @@ mod tests {
             Library {
                 id: "3".into(),
                 title: "TV Shows".into(),
-                kind: Kind::Series,
+                kind: LibraryKind::Shows,
             },
             Library {
                 id: "1".into(),
                 title: "Movies".into(),
-                kind: Kind::Movie,
+                kind: LibraryKind::Movies,
             },
             Library {
                 id: "2".into(),
                 title: "anime".into(),
-                kind: Kind::Series,
+                kind: LibraryKind::Shows,
             },
             Library {
                 id: "4".into(),
                 title: "Documentaries".into(),
-                kind: Kind::Movie,
+                kind: LibraryKind::Movies,
             },
         ]
     }
@@ -410,6 +557,90 @@ mod tests {
         );
         let raw = fs::read_to_string(&path).unwrap();
         assert!(!raw.contains("server-a"));
+        forget_in(&path, "http://Server-A:32400");
+        assert_eq!(
+            load_from(&path, "http://server-a:32400"),
+            LibraryOrder::default()
+        );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn backups(dir: &Path) -> Vec<PathBuf> {
+        fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "bad"))
+            .collect()
+    }
+
+    #[test]
+    fn damaged_preferences_are_set_aside_once_instead_of_overwritten() {
+        let dir = std::env::temp_dir().join(format!("perfuse-prefs-bad-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("preferences.json");
+        let damaged = br#"{"libraries":{"#;
+        fs::write(&path, damaged).unwrap();
+        assert_eq!(read_store(&path).volume.gain(), 100.0);
+        assert_eq!(fs::read(&path).unwrap(), damaged);
+        let order = LibraryOrder {
+            collapsed: true,
+            ..Default::default()
+        };
+        save_to(&path, "test", &order);
+        let saved = backups(&dir);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(fs::read(&saved[0]).unwrap(), damaged);
+        assert_eq!(load_from(&path, "test"), order);
+        save_to(&path, "other", &order);
+        assert_eq!(backups(&dir), saved);
+        assert_eq!(load_from(&path, "test"), order);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn preferences_from_a_newer_build_load_and_keep_unknown_sections() {
+        let dir = std::env::temp_dir().join(format!("perfuse-prefs-newer-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("preferences.json");
+        let key = server_key("test");
+        fs::write(
+            &path,
+            format!(
+                r#"{{"libraries":{{"{key}":{{"sort":"recently_added","collapsed":true,"pinned":["1"]}}}},
+                "volume":{{"level":40.0,"boost":2}},"subtitles":{{"size":3}}}}"#
+            ),
+        )
+        .unwrap();
+        let order = load_from(&path, "test");
+        assert_eq!(order.sort, LibrarySort::Server);
+        assert!(order.collapsed);
+        assert_eq!(read_store(&path).volume.gain(), 40.0);
+        save_to(&path, "other", &LibraryOrder::default());
+        assert!(backups(&dir).is_empty());
+        let raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(raw["subtitles"]["size"], 3);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn device_id_is_random_header_safe_and_stable() {
+        let dir = std::env::temp_dir().join(format!("perfuse-device-id-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("preferences.json");
+        fs::write(&path, r#"{"volume":{"level":40.0}}"#).unwrap();
+        let id = device_id_in(&path);
+        let hex = id.strip_prefix("perfuse-").unwrap();
+        assert!(hex.len() == 32 && hex.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(valid_device_id(&id));
+        assert_eq!(device_id_in(&path), id);
+        assert_eq!(read_store(&path).volume.gain(), 40.0);
+        let mut volume = read_store(&path).volume;
+        assert!(volume.set(20.0));
+        volume.save_to(&path);
+        assert_eq!(device_id_in(&path), id);
+        assert_ne!(device_id_in(&dir.join("other.json")), id);
+        let _ = fs::remove_dir_all(dir);
     }
 }

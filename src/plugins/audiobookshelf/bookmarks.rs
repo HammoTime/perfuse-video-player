@@ -1,5 +1,8 @@
-use super::{auth::Api, identifier};
-use crate::{http, media::Bookmark};
+use super::{SERVER, auth::Api, identifier, millis};
+use crate::{
+    http,
+    media::{Bookmark, SourceResult},
+};
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::json;
@@ -17,32 +20,37 @@ struct BookmarkList {
     bookmarks: Vec<SavedBookmark>,
 }
 
-fn valid_time(time: f64) -> Result<(), String> {
-    if time.is_finite() && time >= 0.0 {
-        Ok(())
-    } else {
-        Err("The bookmark position is invalid.".into())
-    }
-}
-
 impl SavedBookmark {
-    fn into_bookmark(self) -> Result<Bookmark, String> {
-        valid_time(self.time)?;
+    // Audiobookshelf identifies a bookmark by its exact time in seconds. Rust prints the
+    // shortest text that parses back to the same number, which the delete path expects.
+    fn into_bookmark(self) -> SourceResult<Bookmark> {
+        let position_ms = millis(self.time).ok_or("The bookmark position is invalid.")?;
         Ok(Bookmark {
-            time: self.time,
+            id: self.time.to_string(),
             title: self.title,
+            position_ms,
         })
     }
 }
 
-pub(super) fn list(api: &Api, id: &str) -> Result<Vec<Bookmark>, String> {
+/// The server time behind a bookmark ID, rejecting anything that is not a plain number.
+fn server_time(id: &str) -> SourceResult<f64> {
+    id.parse::<f64>()
+        .ok()
+        .filter(|time| {
+            time.is_finite() && *time >= 0.0 && id.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        })
+        .ok_or_else(|| "The bookmark position is invalid.".into())
+}
+
+pub(super) fn list(api: &Api, id: &str) -> SourceResult<Vec<Bookmark>> {
     let id = identifier(id)?;
     let response = api.send(api.get(&format!("/api/me/bookmarks/{id}")))?;
     // Before v2.36 bookmarks were available only in the current user's profile.
     let list: BookmarkList = if response.status() == StatusCode::NOT_FOUND {
         api.json(api.get("/api/me"))?
     } else {
-        http::json(response, "Audiobookshelf")?
+        http::json(response, SERVER)?
     };
     let mut bookmarks = list
         .bookmarks
@@ -50,32 +58,32 @@ pub(super) fn list(api: &Api, id: &str) -> Result<Vec<Bookmark>, String> {
         .filter(|bookmark| bookmark.library_item_id == id)
         .map(SavedBookmark::into_bookmark)
         .collect::<Result<Vec<_>, _>>()?;
-    bookmarks.sort_by(|a, b| a.time.total_cmp(&b.time));
+    bookmarks.sort_by_key(|bookmark| bookmark.position_ms);
     Ok(bookmarks)
 }
 
-pub(super) fn add(api: &Api, id: &str, bookmark: &Bookmark) -> Result<Bookmark, String> {
+pub(super) fn add(api: &Api, id: &str, title: &str, position_ms: u64) -> SourceResult<Bookmark> {
     let id = identifier(id)?;
-    valid_time(bookmark.time)?;
-    let title = bookmark.title.trim();
+    let title = title.trim();
     if title.is_empty() {
         return Err("Enter a bookmark title.".into());
     }
+    let time = position_ms as f64 / 1000.0;
     let saved: SavedBookmark = api.json(
         api.post(&format!("/api/me/item/{id}/bookmark"))
-            .json(&json!({ "time": bookmark.time, "title": title })),
+            .json(&json!({ "time": time, "title": title })),
     )?;
-    if saved.library_item_id != id || saved.time != bookmark.time {
+    if saved.library_item_id != id || saved.time != time {
         return Err("Audiobookshelf returned a different bookmark.".into());
     }
     saved.into_bookmark()
 }
 
-pub(super) fn remove(api: &Api, id: &str, time: f64) -> Result<(), String> {
+pub(super) fn remove(api: &Api, id: &str, bookmark: &Bookmark) -> SourceResult<()> {
     let id = identifier(id)?;
-    valid_time(time)?;
+    let time = server_time(&bookmark.id)?;
     let response = api.send(api.delete(&format!("/api/me/item/{id}/bookmark/{time}")))?;
-    http::check_status(response.status(), "Audiobookshelf")
+    http::check_status(response.status(), SERVER)
 }
 
 #[cfg(test)]
@@ -98,11 +106,17 @@ mod tests {
         ]);
         let api = Api::new(&credentials(&origin)).unwrap();
         assert!(list(&api, "../other").is_err());
-        assert!(remove(&api, "book", f64::NAN).is_err());
+        let unsafe_id = Bookmark {
+            id: "1/../../users".into(),
+            ..Bookmark::default()
+        };
+        assert!(remove(&api, "book", &unsafe_id).is_err());
         let bookmarks = list(&api, "book").unwrap();
         assert_eq!(bookmarks[0].title, "A note");
-        let saved = add(&api, "book", &bookmarks[0]).unwrap();
-        remove(&api, "book", saved.time).unwrap();
+        assert_eq!(bookmarks[0].position_ms, 7125);
+        let saved = add(&api, "book", &bookmarks[0].title, bookmarks[0].position_ms).unwrap();
+        assert_eq!(saved, bookmarks[0]);
+        remove(&api, "book", &saved).unwrap();
         let requests = requests.join().unwrap();
         assert_eq!(requests[1].body, json!({"time":7.125,"title":"A note"}));
     }
@@ -125,9 +139,9 @@ mod tests {
         assert_eq!(
             bookmarks
                 .iter()
-                .map(|b| b.title.as_str())
+                .map(|b| (b.title.as_str(), b.id.as_str()))
                 .collect::<Vec<_>>(),
-            ["Opening", "Later"]
+            [("Opening", "0"), ("Later", "9")]
         );
         requests.join().unwrap();
     }

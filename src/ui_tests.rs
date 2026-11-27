@@ -34,12 +34,12 @@ fn playback_download_waits_for_permission() {
         (false, "Accept and continue"),
     ] {
         let mut harness = login([860.0, 620.0]);
-        harness.state_mut().runtime_prompt = Some(RuntimePrompt::FirstRun {
+        harness.state_mut().runtime.prompt = Some(RuntimePrompt::FirstRun {
             download,
             error: None,
         });
         harness.run_steps(3);
-        assert!(harness.state().runtime_rx.is_none());
+        assert!(harness.state().runtime.rx.is_none());
         assert!(
             harness
                 .query_by_label("Perfuse and playback licences")
@@ -61,12 +61,12 @@ fn playback_download_waits_for_permission() {
                 .iter()
                 .any(|command| matches!(command, egui::ViewportCommand::Close))
         );
-        assert!(harness.state().runtime_rx.is_none());
+        assert!(harness.state().runtime.rx.is_none());
     }
 
     if std::env::var_os("PERFUSE_LIBMPV").is_none() {
         let mut harness = login([860.0, 620.0]);
-        harness.state_mut().runtime_available = Some(runtime::test_available());
+        harness.state_mut().runtime.available = Some(runtime::test_available());
         harness.run_steps(3);
         harness.get_by_label("Update libraries").click();
         harness.run_steps(3);
@@ -75,11 +75,11 @@ fn playback_download_waits_for_permission() {
                 .query_by_label("Update playback libraries?")
                 .is_some()
         );
-        assert!(harness.state().runtime_rx.is_none());
+        assert!(harness.state().runtime.rx.is_none());
         harness.key_press(egui::Key::Escape);
         harness.run_steps(3);
-        assert!(harness.state().runtime_prompt.is_none());
-        assert!(harness.state().runtime_rx.is_none());
+        assert!(harness.state().runtime.prompt.is_none());
+        assert!(harness.state().runtime.rx.is_none());
     }
 }
 
@@ -87,7 +87,7 @@ fn playback_download_waits_for_permission() {
 fn playback_setup_reports_progress_failure_and_completion() {
     let mut harness = login([860.0, 620.0]);
     let (tx, rx) = mpsc::channel();
-    harness.state_mut().runtime_rx = Some(rx);
+    harness.state_mut().runtime.rx = Some(rx);
     tx.send(runtime::Update::Status(
         "Downloading playback libraries (42%)".into(),
     ))
@@ -104,14 +104,14 @@ fn playback_setup_reports_progress_failure_and_completion() {
     .unwrap();
     harness.run_steps(2);
     assert!(harness.query_by_label("Retry playback setup").is_some());
-    assert!(harness.state().runtime_rx.is_none());
-    assert!(harness.state().runtime_failed);
+    assert!(harness.state().runtime.rx.is_none());
+    assert!(harness.state().runtime.failed);
     let (tx, rx) = mpsc::channel();
-    harness.state_mut().runtime_rx = Some(rx);
+    harness.state_mut().runtime.rx = Some(rx);
     tx.send(runtime::Update::Finished(Ok(()))).unwrap();
     harness.run_steps(2);
-    assert!(harness.state().runtime_status.is_none());
-    assert!(!harness.state().runtime_failed);
+    assert!(harness.state().runtime.status.is_none());
+    assert!(!harness.state().runtime.failed);
     assert!(harness.query_by_label("Retry playback setup").is_none());
 }
 
@@ -120,7 +120,7 @@ fn installed_libraries_and_update_availability() {
     let mut harness = library([860.0, 620.0], "home");
     let app = harness.state_mut();
     app.connection_open = true;
-    app.runtime_installed.libraries = runtime_versions_fixture();
+    app.runtime.installed.libraries = runtime_versions_fixture();
     harness.run_steps(3);
     harness.get_by_label("Updates & about").click();
     harness.run_steps(2);
@@ -147,7 +147,7 @@ fn installed_libraries_and_update_availability() {
             .is_disabled()
     );
     let (tx, rx) = mpsc::channel();
-    harness.state_mut().runtime_rx = Some(rx);
+    harness.state_mut().runtime.rx = Some(rx);
     tx.send(runtime::Update::Available(Some(runtime::test_available())))
         .unwrap();
     tx.send(runtime::Update::Finished(Ok(()))).unwrap();
@@ -163,7 +163,7 @@ fn installed_libraries_and_update_availability() {
         !cfg!(windows) || std::env::var_os("PERFUSE_LIBMPV").is_some()
     );
     let (tx, rx) = mpsc::channel();
-    harness.state_mut().runtime_rx = Some(rx);
+    harness.state_mut().runtime.rx = Some(rx);
     harness.run_steps(2);
     assert!(
         harness
@@ -190,17 +190,17 @@ fn installed_libraries_and_update_availability() {
             .is_disabled()
     );
     let (tx, rx) = mpsc::channel();
-    harness.state_mut().runtime_action = RuntimeAction::Check;
-    harness.state_mut().runtime_rx = Some(rx);
+    harness.state_mut().runtime.action = RuntimeAction::Check;
+    harness.state_mut().runtime.rx = Some(rx);
     tx.send(runtime::Update::Finished(Err(
         "Library check failed.".into()
     )))
     .unwrap();
     harness.run_steps(3);
     assert!(
-        matches!(&harness.state().runtime_result, Some(Err(error)) if error == "Library check failed.")
+        matches!(&harness.state().runtime.result, Some(Err(error)) if error == "Library check failed.")
     );
-    assert!(harness.state().runtime_status.is_none());
+    assert!(harness.state().runtime.status.is_none());
 }
 
 #[test]
@@ -221,7 +221,7 @@ fn sidebar_actions_clear_the_scrollbar_when_libraries_overflow() {
     server.sections.extend((3..30).map(|i| Library {
         id: i.to_string(),
         title: format!("Library {i}"),
-        kind: Kind::Movie,
+        kind: LibraryKind::Movies,
     }));
     harness.run_steps(4);
     let expand = harness.get_by_label("Collapse libraries").rect();
@@ -270,7 +270,7 @@ fn home_cards_reserve_the_library_row_and_overflow_opens_all_visible_libraries()
             .map(|(i, name)| Library {
                 id: i.to_string(),
                 title: (*name).into(),
-                kind: Kind::Movie,
+                kind: LibraryKind::Movies,
             })
             .collect::<Vec<_>>()
     };
@@ -439,7 +439,7 @@ fn server_switch_discards_stale_items_and_cancel_keeps_both_servers() {
     );
     harness.get_by_label("Add server").click();
     harness.run_steps(3);
-    assert!(harness.state().adding && harness.state().token.is_empty());
+    assert!(harness.state().adding && harness.state().sign_in.token.is_empty());
     assert!(harness.get_by_label("Plex").is_focused());
     assert!(harness.query_by_label("Server address").is_none());
     harness.get_by_label("Jellyfin").click();
@@ -552,9 +552,9 @@ fn app_harness(size: [f32; 2], frame_seconds: f32) -> Harness<'static, App> {
         .build_eframe(|cc| {
             // Skip restore: tests must never access a user's saved credentials.
             let mut app = App::new(&cc.egui_ctx);
-            app.server = "http://127.0.0.1:32499".into();
-            app.token.clear();
-            app.client_id = "perfuse-ui-test".into();
+            app.sign_in.server = "http://127.0.0.1:32499".into();
+            app.sign_in.token.clear();
+            app.sign_in.client_id = "perfuse-ui-test".into();
             app
         })
 }
@@ -562,10 +562,10 @@ fn app_harness(size: [f32; 2], frame_seconds: f32) -> Harness<'static, App> {
 fn playback(size: [f32; 2]) -> Harness<'static, App> {
     let mut harness = app_harness(size, 1.0 / 60.0);
     let app = harness.state_mut();
-    app.player = Some(player::Player::test_stub());
-    app.playing_title = "A deliberately long movie title ".repeat(12);
-    app.playing_duration = 3000.0;
-    app.playing_seconds = 150.0;
+    app.playback.player = Some(player::Player::test_stub());
+    app.playback.playing_title = "A deliberately long movie title ".repeat(12);
+    app.playback.playing_duration = 3000.0;
+    app.playback.playing_seconds = 150.0;
     harness
 }
 
@@ -612,7 +612,7 @@ fn attach_server(app: &mut App) {
     app.servers.push(Server::new(
         session::Session {
             kind: ServerKind::Plex,
-            server: app.server.clone(),
+            server: app.sign_in.server.clone(),
             token: "synthetic".into(),
             client_id: "ui-test".into(),
         },
@@ -634,7 +634,7 @@ fn book_server() -> Server {
     let library = Library {
         id: "books".into(),
         title: "Audiobooks".into(),
-        kind: Kind::Audiobook,
+        kind: LibraryKind::Audiobooks,
     };
     let mut server = Server::new(session, source, vec![library], false);
     server.prefs.name = "Reading Room".into();
@@ -659,7 +659,7 @@ fn book_item() -> Item {
             }]),
             ..Default::default()
         }],
-        book: Some(Box::new(Book {
+        book: Book {
             author: "Alex Morgan".into(),
             narrator: "Robin Gray".into(),
             series: String::new(),
@@ -676,7 +676,7 @@ fn book_item() -> Item {
                 },
             ],
             bookmarks: vec![],
-        })),
+        },
         ..Default::default()
     }
 }
@@ -740,14 +740,13 @@ fn show_book_collection(app: &mut App, ctx: &egui::Context, home: bool) {
         search: String::new(),
         offset: 0,
         previous_pages: vec![],
+        shown: 0,
+        previous_shown: vec![],
         library: !home,
         parent: None,
     });
-    app.page = Some(Page {
-        total: Some(items.len() + usize::from(home)),
-        items,
-        offset: 0,
-    });
+    let total = Some(items.len() + usize::from(home));
+    app.page = Some(Page::new(items, 0, total));
 }
 
 fn book_library_search(size: [f32; 2]) -> Harness<'static, App> {
@@ -759,16 +758,18 @@ fn book_library_search(size: [f32; 2]) -> Harness<'static, App> {
     app.location.as_mut().unwrap().search = app.search.clone();
     let page = app.page.as_mut().unwrap();
     page.items.truncate(1);
+    // One more result waits on the next page.
     page.total = Some(2);
+    page.next = Some(1);
     harness
 }
 
 fn start_book_fixture(app: &mut App) {
     let item = app.detail.clone().unwrap();
     let source = app.source.clone().unwrap();
-    app.player = Some(player::Player::test_stub());
-    app.playing_seconds = item.resume_ms.unwrap() as f64 / 1000.0;
-    app.playing_duration = item.duration_ms.unwrap() as f64 / 1000.0;
+    app.playback.player = Some(player::Player::test_stub());
+    app.playback.playing_seconds = item.resume_ms.unwrap() as f64 / 1000.0;
+    app.playback.playing_duration = item.duration_ms.unwrap() as f64 / 1000.0;
     app.book_started(&item, &source);
 }
 
@@ -831,7 +832,7 @@ fn audiobook_detail_and_docked_player_open_and_collapse_without_a_video_surface(
     harness.run_steps(4);
     harness.get_by_label("AUDIOBOOK");
     assert!(!harness.state().book.full);
-    assert!(harness.state().surface.is_none());
+    assert!(harness.state().playback.surface.is_none());
     // The same book ID on another source is a separate playback target.
     harness.state_mut().source = Some(book_server().source);
     harness.run_steps(3);
@@ -938,19 +939,19 @@ fn audiobook_volume_is_adjustable_from_the_dock_and_full_player() {
         harness.run_steps(3);
         let slider = harness.get_by_label("Audiobook volume");
         assert!(harness.ctx.content_rect().contains_rect(slider.rect()));
-        let previous = harness.state().volume.gain();
+        let previous = harness.state().playback.volume.gain();
         slider.focus();
         harness.run_steps(2);
         harness.key_press(egui::Key::ArrowLeft);
         harness.run_steps(3);
-        let adjusted = harness.state().volume.gain();
+        let adjusted = harness.state().playback.volume.gain();
         assert!(adjusted > 0.0 && adjusted < previous);
         harness.get_by_label("Mute").click();
         harness.run_steps(3);
-        assert_eq!(harness.state().volume.gain(), 0.0);
+        assert_eq!(harness.state().playback.volume.gain(), 0.0);
         harness.get_by_label("Unmute").click();
         harness.run_steps(3);
-        assert_eq!(harness.state().volume.gain(), adjusted);
+        assert_eq!(harness.state().playback.volume.gain(), adjusted);
         harness.key_press(egui::Key::Escape);
         harness.run_steps(3);
         assert!(harness.query_by_label("Audiobook volume").is_none());
@@ -967,12 +968,12 @@ fn library(size: [f32; 2], screen: &str) -> Harness<'static, App> {
         Library {
             id: "1".into(),
             title: "Movies".into(),
-            kind: Kind::Movie,
+            kind: LibraryKind::Movies,
         },
         Library {
             id: "2".into(),
             title: "TV Shows".into(),
-            kind: Kind::Series,
+            kind: LibraryKind::Shows,
         },
     ];
     attach_server(app);
@@ -1023,15 +1024,13 @@ fn library(size: [f32; 2], screen: &str) -> Harness<'static, App> {
         search: String::new(),
         offset: 0,
         previous_pages: vec![],
+        shown: 0,
+        previous_shown: vec![],
         library: !home,
         parent: None,
     });
     app.on_deck = items[..3].to_vec();
-    app.page = Some(Page {
-        items,
-        offset: 0,
-        total: Some(12),
-    });
+    app.page = Some(Page::new(items, 0, Some(12)));
     match screen {
         "missing-art" => app.covers.clear(),
         "search" => {
@@ -1039,6 +1038,7 @@ fn library(size: [f32; 2], screen: &str) -> Harness<'static, App> {
             app.location.as_mut().unwrap().search = app.search.clone();
             app.page.as_mut().unwrap().items.truncate(1);
             app.page.as_mut().unwrap().total = Some(1);
+            app.page.as_mut().unwrap().next = None;
         }
         "shows" => {
             app.selected_library = Some("2".into());
@@ -1176,7 +1176,9 @@ fn library_search_entry_and_keyboard_navigation() {
 fn parent_libraries_share_search_and_pagination_at_minimum_size() {
     let size = [860.0, 620.0];
     let mut movies = library(size, "search");
-    movies.state_mut().page.as_mut().unwrap().total = Some(2);
+    let page = movies.state_mut().page.as_mut().unwrap();
+    page.total = Some(2);
+    page.next = Some(1);
     let mut books = book_library_search(size);
     movies.run_steps(4);
     books.run_steps(4);
@@ -1364,6 +1366,7 @@ fn library_snapshots() {
             app.location.as_mut().unwrap().title = app.servers[0].name();
             let page = app.page.as_mut().unwrap();
             page.total = Some(page.items.len() + 1);
+            page.next = Some(page.items.len());
         }
         if matches!(screen, "book-dock" | "book-player" | "book-player-menu") {
             let ctx = harness.ctx.clone();
@@ -1372,7 +1375,7 @@ fn library_snapshots() {
                 // Keep the chapter list longer than the viewport so this comparison
                 // catches a menu pushing, clipping or displacing the scrolling pane.
                 let item = app.detail.as_mut().unwrap();
-                let chapters = &mut item.book.as_mut().unwrap().chapters;
+                let chapters = &mut item.book.chapters;
                 for index in 3..=20 {
                     let start = chapters.last().unwrap().end_ms;
                     chapters.push(Chapter {
@@ -1395,7 +1398,7 @@ fn library_snapshots() {
             app.servers[0].sections.push(Library {
                 id: "3".into(),
                 title: "Lectures".into(),
-                kind: Kind::Series,
+                kind: LibraryKind::Shows,
             });
             app.servers[0].items = app.page.as_ref().unwrap().items.clone();
             app.servers[0].artwork = app.covers.clone();
@@ -1420,7 +1423,7 @@ fn library_snapshots() {
             server.sections.push(Library {
                 id: "4".into(),
                 title: "Concert films".into(),
-                kind: Kind::Movie,
+                kind: LibraryKind::Movies,
             });
         }
         harness.set_pixels_per_point(scale);
@@ -1555,7 +1558,7 @@ fn playback_controls_fit_the_window() {
 fn playback_fullscreen_button_and_shortcuts() {
     fn expect_fullscreen(harness: &mut Harness<'_, App>, expected: bool) {
         harness.run_steps(3);
-        assert_eq!(harness.state().fullscreen, expected);
+        assert_eq!(harness.state().playback.fullscreen, expected);
     }
 
     let mut harness = playback([860.0, 620.0]);
@@ -1592,7 +1595,7 @@ fn fullscreen_controls_hide_and_reveal_the_video() {
     harness.key_press(egui::Key::F11);
     harness.run_steps(3);
     harness.get_by_label("Exit fullscreen");
-    let last_active = harness.state().last_playback_interaction;
+    let last_active = harness.state().playback.last_playback_interaction;
     harness.input_mut().time = Some(last_active + 1.9);
     harness.step();
     harness.get_by_label("Pause");
@@ -1600,10 +1603,13 @@ fn fullscreen_controls_hide_and_reveal_the_video() {
     harness.step();
     harness.input_mut().time = None;
     harness.run_steps(3);
-    assert!(harness.state().controls_opacity > 0.0 && harness.state().controls_opacity < 1.0);
+    assert!(
+        harness.state().playback.controls_opacity > 0.0
+            && harness.state().playback.controls_opacity < 1.0
+    );
     assert_eq!(harness.ctx.available_rect(), harness.ctx.content_rect());
     harness.run_steps(30); // The 375ms fade-out.
-    assert_eq!(harness.state().controls_opacity, 0.0);
+    assert_eq!(harness.state().playback.controls_opacity, 0.0);
     assert!(harness.query_by_label("Pause").is_none());
     assert!(harness.query_by_label("Exit fullscreen").is_none());
     assert_eq!(harness.ctx.available_rect(), harness.ctx.content_rect());
@@ -1641,15 +1647,15 @@ fn fullscreen_controls_hide_and_reveal_the_video() {
         if sample < 5 {
             assert!(harness.query_by_label("Pause").is_none());
         }
-        if !saw_fade_in && harness.state().controls_opacity > 0.0 {
-            assert!(harness.state().controls_opacity < 1.0);
+        if !saw_fade_in && harness.state().playback.controls_opacity > 0.0 {
+            assert!(harness.state().playback.controls_opacity < 1.0);
             saw_fade_in = true;
         }
     }
     assert!(saw_fade_in);
     harness.input_mut().time = None;
     harness.run_steps(24); // The 300ms fade-in at the harness frame rate.
-    assert_eq!(harness.state().controls_opacity, 1.0);
+    assert_eq!(harness.state().playback.controls_opacity, 1.0);
     harness.get_by_label("Pause");
     harness.get_by_label("Exit fullscreen");
     // The controls never reserve any video space, even at full opacity.
@@ -1671,7 +1677,7 @@ fn fullscreen_controls_hide_and_reveal_the_video() {
     assert!(harness.query_by_label("Pause").is_none());
     harness.key_press(egui::Key::Escape);
     harness.run_steps(3);
-    assert!(!harness.state().fullscreen);
+    assert!(!harness.state().playback.fullscreen);
     harness.get_by_label("Fullscreen");
     harness.get_by_label("Pause");
 }
@@ -1740,7 +1746,7 @@ fn manual_login_accepts_keyboard_input_and_scrolls_into_view() {
         .get_by_label("Server address")
         .type_text("http://localhost:32499");
     harness.run();
-    assert_eq!(harness.state().server, "http://localhost:32499");
+    assert_eq!(harness.state().sign_in.server, "http://localhost:32499");
     harness.key_press(egui::Key::Tab);
     harness.run();
     assert!(harness.get_by_label("Access token").is_focused());
@@ -1748,7 +1754,7 @@ fn manual_login_accepts_keyboard_input_and_scrolls_into_view() {
         .get_by_label("Access token")
         .type_text("synthetic-ui-token");
     harness.run();
-    assert_eq!(harness.state().token, "synthetic-ui-token");
+    assert_eq!(harness.state().sign_in.token, "synthetic-ui-token");
     assert_eq!(
         harness.get_by_label("Access token").accesskit_node().role(),
         egui::accesskit::Role::PasswordInput
@@ -1808,11 +1814,11 @@ fn add_server_dialog_grows_to_fit_each_form_and_keeps_headings_left_aligned() {
 #[test]
 fn jellyfin_sign_in_isolated_from_plex_and_quick_connect_can_be_cancelled() {
     let mut harness = login([860.0, 620.0]);
-    harness.state_mut().token = "synthetic-plex-token".into();
+    harness.state_mut().sign_in.token = "synthetic-plex-token".into();
     harness.run();
     harness.get_by_label("Jellyfin").click();
     harness.run();
-    assert!(harness.state().server.is_empty() && harness.state().token.is_empty());
+    assert!(harness.state().sign_in.server.is_empty() && harness.state().sign_in.token.is_empty());
     assert!(harness.get_by_label("Server address").is_focused());
     let username = harness.get_by_label("Username").rect();
     let password = harness.get_by_label("Password");
@@ -1828,8 +1834,8 @@ fn jellyfin_sign_in_isolated_from_plex_and_quick_connect_can_be_cancelled() {
     harness.get_by_label("Check the highlighted fields");
     harness.get_by_label("Enter your server address.");
     harness.get_by_label("Enter your Jellyfin username.");
-    assert!(!harness.state().busy);
-    harness.state_mut().server = "http://127.0.0.1:8096".into();
+    assert!(!harness.state().sign_in.busy);
+    harness.state_mut().sign_in.server = "http://127.0.0.1:8096".into();
     harness.get_by_label("Use Quick Connect").scroll_to_me();
     harness.run();
     assert!(
@@ -1839,19 +1845,23 @@ fn jellyfin_sign_in_isolated_from_plex_and_quick_connect_can_be_cancelled() {
             .contains_rect(harness.get_by_label("Use Quick Connect").rect())
     );
     let app = harness.state_mut();
-    let generation = app.begin();
-    app.quick_code = Some("012345".into());
+    let generation = app.sign_in.begin();
+    app.sign_in.quick_code = Some("012345".into());
     harness.run_steps(2);
     harness.get_by_label("012 345");
     harness.get_by_label("Cancel").click();
     harness.run();
     harness
         .state()
+        .sign_in
         .tx
-        .send((generation, Reply::QuickConnectCode("123456".into())))
+        .send((
+            generation,
+            connection::Reply::QuickConnectCode("123456".into()),
+        ))
         .unwrap();
     harness.run_steps(2);
-    assert!(!harness.state().busy && harness.state().quick_code.is_none());
+    assert!(!harness.state().sign_in.busy && harness.state().sign_in.quick_code.is_none());
 }
 
 #[test]
@@ -1873,17 +1883,17 @@ fn audiobookshelf_requires_password_and_clears_it_on_back() {
     ] {
         harness.get_by_label(error);
     }
-    assert!(!harness.state().busy);
+    assert!(!harness.state().sign_in.busy);
     harness.get_by_role_and_label(password, "Password").focus();
     harness.run();
     harness
         .get_by_role_and_label(password, "Password")
         .type_text("synthetic");
     harness.run();
-    assert_eq!(harness.state().password, "synthetic");
+    assert_eq!(harness.state().sign_in.password, "synthetic");
     harness.get_by_label("Back to server types").click();
     harness.run();
-    assert!(harness.state().password.is_empty());
+    assert!(harness.state().sign_in.password.is_empty());
     assert!(harness.get_by_label("Audiobookshelf").is_focused());
 }
 
@@ -1893,7 +1903,7 @@ fn cancelled_and_failed_login_can_be_retried() {
     harness.get_by_label("Plex").click();
     harness.run();
     let (pending, events) = auth::Login::test_channel();
-    harness.state_mut().login = Some(pending);
+    harness.state_mut().sign_in.login = Some(pending);
     events
         .send(auth::Event::Browser(
             "https://app.source.tv/auth#?code=synthetic".into(),
@@ -1904,8 +1914,8 @@ fn cancelled_and_failed_login_can_be_retried() {
     // OpenUrl remains egui output in this harness; no OS browser is launched.
     harness.get_by_label("Cancel").click();
     harness.run();
-    assert!(harness.state().login.is_none());
-    assert!(harness.state().login_url.is_none());
+    assert!(harness.state().sign_in.login.is_none());
+    assert!(harness.state().sign_in.login_url.is_none());
     assert!(
         !harness
             .get_by_label("Sign in with Plex")
@@ -1914,18 +1924,18 @@ fn cancelled_and_failed_login_can_be_retried() {
     );
 
     let (pending, events) = auth::Login::test_channel();
-    harness.state_mut().login = Some(pending);
+    harness.state_mut().sign_in.login = Some(pending);
     events
         .send(auth::Event::Failed(
             "Plex sign-in expired. Please try again.".into(),
         ))
         .unwrap();
     harness.run();
-    assert!(harness.state().login.is_none());
+    assert!(harness.state().sign_in.login.is_none());
     harness.get_by_label("Plex sign-in expired. Please try again.");
     harness.get_by_label("Dismiss").click();
     harness.run();
-    assert!(harness.state().error.is_none());
+    assert!(harness.state().sign_in.error.is_none());
     harness.get_by_label("Sign in with Plex");
 }
 
@@ -2010,9 +2020,9 @@ fn plex_selection_keeps_connected_servers_when_a_later_server_is_offline() {
     choices[1].connections[0].uri = "http://127.0.0.1:0".into();
     let app = harness.state_mut();
     app.choose_source(Some(ServerKind::Plex));
-    app.remember = false;
+    app.sign_in.remember = false;
     let (login, events) = auth::Login::test_channel();
-    app.login = Some(login);
+    app.sign_in.login = Some(login);
     events.send(auth::Event::SignedIn(choices)).unwrap();
     harness.run_steps(3);
     harness.get_by_label("Family Library").click();
@@ -2020,11 +2030,11 @@ fn plex_selection_keeps_connected_servers_when_a_later_server_is_offline() {
     harness.get_by_label("Add 2 servers").click();
     harness.run_steps(2);
     let deadline = Instant::now() + Duration::from_secs(8);
-    while harness.state().busy && Instant::now() < deadline {
+    while harness.state().sign_in.busy && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
         harness.run_steps(1);
     }
-    assert!(harness.state().error.is_some());
+    assert!(harness.state().sign_in.error.is_some());
     assert_eq!(harness.state().servers.len(), 1);
     harness.get_by_label("Already added");
     harness
@@ -2052,7 +2062,7 @@ fn connected_server_can_be_named_and_finished_from_either_entry_point() {
         harness.get_by_label("Jellyfin").click();
         harness.run_steps(3);
         let app = harness.state_mut();
-        app.remember = false;
+        app.sign_in.remember = false;
         let session = session::Session {
             kind: ServerKind::Jellyfin,
             server: "http://127.0.0.1:0".into(),
@@ -2060,16 +2070,17 @@ fn connected_server_can_be_named_and_finished_from_either_entry_point() {
             client_id: "ui-test".into(),
         };
         let source = session::open(&session).unwrap();
-        let generation = app.begin();
-        app.tx
+        let generation = app.sign_in.begin();
+        app.sign_in
+            .tx
             .send((
                 generation,
-                Reply::Connected(
+                connection::Reply::Connected(
                     source,
                     vec![Library {
                         id: "a".into(),
                         title: "Movies".into(),
-                        kind: Kind::Movie,
+                        kind: LibraryKind::Movies,
                     }],
                     session,
                 ),
@@ -2152,13 +2163,13 @@ fn login_snapshots() {
             "login-waiting" => {
                 harness.state_mut().choose_source(Some(ServerKind::Plex));
                 let (pending, _events) = auth::Login::test_channel();
-                harness.state_mut().login = Some(pending);
-                harness.state_mut().login_url =
+                harness.state_mut().sign_in.login = Some(pending);
+                harness.state_mut().sign_in.login_url =
                     Some("https://app.source.tv/auth#?code=synthetic".into());
             }
             "login-expired" => {
                 harness.state_mut().choose_source(Some(ServerKind::Plex));
-                harness.state_mut().error =
+                harness.state_mut().sign_in.error =
                     Some("Plex sign-in expired. Sign in again to continue.".into());
             }
             "login-servers" => {
@@ -2166,7 +2177,7 @@ fn login_snapshots() {
                 harness.state_mut().offer_plex_servers(discovered_servers());
             }
             "login-download-permission" => {
-                harness.state_mut().runtime_prompt = Some(RuntimePrompt::FirstRun {
+                harness.state_mut().runtime.prompt = Some(RuntimePrompt::FirstRun {
                     download: true,
                     error: None,
                 });
@@ -2184,14 +2195,14 @@ fn login_snapshots() {
                 app.sections.push(Library {
                     id: "1".into(),
                     title: "Movies".into(),
-                    kind: Kind::Movie,
+                    kind: LibraryKind::Movies,
                 });
                 attach_server(app);
                 app.servers[0].prefs.name = "Living Room".into();
                 app.servers[0].sections.push(Library {
                     id: "2".into(),
                     title: "TV Shows".into(),
-                    kind: Kind::Series,
+                    kind: LibraryKind::Shows,
                 });
                 if name == "settings-desktop" {
                     let address = "http://archive.example.test:32400";
@@ -2217,7 +2228,7 @@ fn login_snapshots() {
                     SettingsTab::Servers
                 };
                 app.connection_open = true;
-                app.runtime_installed.libraries = runtime_versions_fixture();
+                app.runtime.installed.libraries = runtime_versions_fixture();
             }
             _ => {}
         }
@@ -2364,7 +2375,7 @@ fn window_edges_and_corners_resize_unless_maximized_or_fullscreen() {
     }
 
     // Fullscreen windows must not emit resize commands on edge presses.
-    harness.state_mut().fullscreen = true;
+    harness.state_mut().playback.fullscreen = true;
     let pos = egui::pos2(2.0, 350.0);
     harness
         .input_mut()
@@ -2389,10 +2400,10 @@ fn window_edges_and_corners_resize_unless_maximized_or_fullscreen() {
 fn always_on_top_toggle_and_mini_player_shows_only_play_button() {
     let mut harness = playback([860.0, 620.0]);
     harness.run_steps(3);
-    assert!(!harness.state().always_on_top);
+    assert!(!harness.state().playback.always_on_top);
     harness.get_by_label("Always on top").click();
     harness.step();
-    assert!(harness.state().always_on_top);
+    assert!(harness.state().playback.always_on_top);
     let commands = &harness.output().viewport_output[&egui::ViewportId::ROOT].commands;
     assert!(commands.iter().any(|c| matches!(
         c,
@@ -2401,7 +2412,7 @@ fn always_on_top_toggle_and_mini_player_shows_only_play_button() {
     harness.run_steps(2);
     harness.get_by_label("Disable always on top").click();
     harness.step();
-    assert!(!harness.state().always_on_top);
+    assert!(!harness.state().playback.always_on_top);
     let commands = &harness.output().viewport_output[&egui::ViewportId::ROOT].commands;
     assert!(commands.iter().any(|c| matches!(
         c,
@@ -2434,7 +2445,7 @@ fn always_on_top_toggle_and_mini_player_shows_only_play_button() {
                 "{hidden} should be hidden at {size:?}"
             );
         }
-        harness.state_mut().paused = true;
+        harness.state_mut().playback.paused = true;
         harness.run_steps(2);
         let play = harness.get_by_label("Play").rect();
         assert!(screen.contains_rect(play), "Play is clipped at {size:?}");
@@ -2456,17 +2467,17 @@ fn sidebar_libraries_can_be_sorted_and_reordered() {
         Library {
             id: "3".into(),
             title: "TV Shows".into(),
-            kind: Kind::Series,
+            kind: LibraryKind::Shows,
         },
         Library {
             id: "1".into(),
             title: "Movies".into(),
-            kind: Kind::Movie,
+            kind: LibraryKind::Movies,
         },
         Library {
             id: "2".into(),
             title: "Anime".into(),
-            kind: Kind::Series,
+            kind: LibraryKind::Shows,
         },
     ];
     harness.state_mut().servers[0].sections = sections.clone();
@@ -2632,11 +2643,7 @@ fn audiobook_home_matches_video_layout_and_pages_recently_added() {
     let app = harness.state_mut();
     app.begin();
     app.busy = false;
-    app.page = Some(Page {
-        items: vec![book_item()],
-        offset: 6,
-        total: Some(7),
-    });
+    app.page = Some(Page::new(vec![book_item()], 6, Some(7)));
     harness.run_steps(4);
     assert!(
         harness
@@ -2820,11 +2827,7 @@ fn home_pagination_only_changes_recently_added_and_carousels_scroll_with_arrows(
                 ..Default::default()
             });
         }
-        app.page = Some(Page {
-            items: page_one,
-            offset: 0,
-            total: Some(38),
-        });
+        app.page = Some(Page::new(page_one, 0, Some(38)));
     }
     let deck_art = harness.state().on_deck[0].thumb.clone().unwrap();
     let released_art = harness.state().released[0].thumb.clone().unwrap();
@@ -2912,4 +2915,112 @@ fn home_pagination_only_changes_recently_added_and_carousels_scroll_with_arrows(
     assert!(harness.query_by_label("Page One Film").is_some());
     assert_eq!(requests.load(Ordering::Relaxed), 2);
     server.join().unwrap();
+}
+
+#[test]
+fn an_expired_sign_in_offers_to_sign_in_again_in_place() {
+    let mut harness = library([1280.0, 800.0], "movies");
+    let app = harness.state_mut();
+    app.servers[0].online = false;
+    app.servers[0].expired = true;
+    harness.run_steps(3);
+    assert!(harness.query_by_label("Try again").is_none());
+    harness.get_by_label("Sign in again").click();
+    harness.run_steps(3);
+    let address = harness.state().servers[0].session.server.clone();
+    assert!(harness.state().adding);
+    assert_eq!(harness.state().sign_in.server, address);
+    harness
+        .get_by_label("Connect manually with an address and token")
+        .click();
+    harness.run_steps(2);
+    harness.get_by_label("Connect").click();
+    harness.run_steps(2);
+    // The expired server's own address is not a duplicate while it is being replaced.
+    harness.get_by_label("Enter your Plex access token.");
+    assert!(
+        harness
+            .query_all_by_label_contains("already added")
+            .next()
+            .is_none()
+    );
+}
+
+#[test]
+fn plain_http_outside_the_network_is_flagged_but_allowed() {
+    let mut harness = login([1280.0, 800.0]);
+    harness.get_by_label("Jellyfin").click();
+    harness.run();
+    for (address, flagged) in [
+        ("http://203.0.113.7:8096", true),
+        ("https://203.0.113.7:8096", false),
+        ("http://192.168.1.30:8096", false),
+    ] {
+        harness.state_mut().sign_in.server = address.into();
+        harness.run_steps(2);
+        let warned = harness
+            .query_all_by_label_contains("is not encrypted")
+            .next()
+            .is_some();
+        assert_eq!(warned, flagged, "{address}");
+    }
+    // The warning never blocks the form.
+    harness.state_mut().sign_in.server = "http://203.0.113.7:8096".into();
+    harness.run();
+    assert!(
+        !harness
+            .get_by_label("Connect")
+            .accesskit_node()
+            .is_disabled()
+    );
+}
+
+#[test]
+fn removing_a_server_says_whether_its_sign_in_is_revoked() {
+    let mut harness = library([1280.0, 800.0], "movies");
+    // The Plex fixture cannot revoke its token, so the dialog must not promise to sign out.
+    harness.state_mut().removing = Some((0, egui::Id::new("remove-fixture")));
+    harness.run_steps(3);
+    assert!(
+        harness
+            .query_all_by_label_contains("stays valid until you revoke it")
+            .next()
+            .is_some()
+    );
+    assert!(
+        harness
+            .query_all_by_label_contains("will sign out")
+            .next()
+            .is_none()
+    );
+}
+
+#[test]
+fn a_saved_home_shows_at_once_and_stays_usable_while_it_refreshes() {
+    let mut harness = library([1280.0, 800.0], "movies");
+    let ctx = harness.ctx.clone();
+    let app = harness.state_mut();
+    let saved = Item {
+        id: "saved".into(),
+        title: "Saved Film".into(),
+        kind: Kind::Movie,
+        ..Default::default()
+    };
+    app.servers[0].home = Some(perfuse::metadata::Home {
+        page: Page::new(vec![saved], 0, Some(1)),
+        on_deck: vec![],
+        released: vec![],
+    });
+    app.home(&ctx);
+    // The snapshot is on screen before any request completes, and stays clickable.
+    assert!(app.refreshing && !app.busy);
+    assert_eq!(app.page.as_ref().unwrap().items[0].id, "saved");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while harness.state().refreshing && Instant::now() < deadline {
+        harness.run_steps(1);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // The fixture address has no server, so the refresh fails. The snapshot stays.
+    assert!(!harness.state().refreshing);
+    assert!(harness.state().page.is_some());
 }

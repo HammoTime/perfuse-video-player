@@ -1,6 +1,6 @@
 use super::*;
 use crate::http_fixture::{fixture, ok};
-use crate::plugins::{Credentials, ServerKind, by_id};
+use crate::plugins::{Credentials, OpenOptions, ServerKind, by_id};
 use serde_json::{Value, json};
 use std::io::Cursor;
 
@@ -13,7 +13,7 @@ fn source(server: &str, token: &str) -> Source {
             token: token.into(),
             client_id: "test-device".into(),
         },
-        false,
+        OpenOptions::default(),
     )
     .unwrap()
 }
@@ -96,12 +96,13 @@ fn sign_in_browse_choose_version_and_report_progress() {
     );
     let version = &item.versions[1];
     assert_eq!(version.label(), "1080P · HEVC · AAC · MKV");
-    let playback = source.playback(&item, version).unwrap();
+    let playback = source.playback(&item, version, 0).unwrap();
+    let authorization = playback.header_lines().remove(0);
     assert_eq!(
         playback.url.as_str(),
         format!("{server}/Videos/episode/stream?static=true&mediaSourceId=hd")
     );
-    assert!(playback.headers[0].starts_with("Authorization: MediaBrowser "));
+    assert!(authorization.starts_with("authorization: MediaBrowser "));
     for state in [
         PlaybackState::Started,
         PlaybackState::Paused,
@@ -133,7 +134,7 @@ fn sign_in_browse_choose_version_and_report_progress() {
             request
                 .headers
                 .to_ascii_lowercase()
-                .contains(&playback.headers[0].to_ascii_lowercase())
+                .contains(&authorization.to_ascii_lowercase())
         );
     }
     assert_eq!(requests[2].query("searchTerm").as_deref(), Some("A & B"));
@@ -161,11 +162,10 @@ fn home_keeps_library_membership_and_release_order() {
     let episodes = json!({"Items":[episode()]});
     let (server, worker) = fixture(vec![
         ok("GET /UserViews", views()),
+        // Home reuses the library list instead of fetching it for every row.
         ok("GET /UserItems/Resume", episodes.clone()),
-        ok("GET /UserViews", views()),
         ok("GET /Items", json!({"Items":[{"Id":"episode"}]})),
         ok("GET /Items", json!({"Items":[movie]})),
-        ok("GET /UserViews", views()),
         ok("GET /Items", json!({"Items":[{"Id":"movie"}]})),
         ok("GET /Items", episodes),
         ok("GET /Items", json!({"Items":[movie]})),
@@ -180,12 +180,13 @@ fn home_keeps_library_membership_and_release_order() {
     assert_eq!(released.len(), 2);
     assert_eq!(released[0].id, "movie");
     let requests = worker.join().unwrap();
-    assert_eq!(requests[3].query("ids").as_deref(), Some("episode"));
+    assert_eq!(requests.len(), 7);
+    assert_eq!(requests[2].query("ids").as_deref(), Some("episode"));
     assert_eq!(
-        requests[4].query("sortBy").as_deref(),
+        requests[3].query("sortBy").as_deref(),
         Some("DateCreated,SortName")
     );
-    assert_eq!(requests[7].query("sortBy").as_deref(), Some("PremiereDate"));
+    assert_eq!(requests[5].query("sortBy").as_deref(), Some("PremiereDate"));
 }
 
 #[test]
@@ -226,10 +227,11 @@ fn rejects_redirects_invalid_credentials_and_unsafe_references() {
     assert!(
         auth::password(&server, "device", "user", "")
             .unwrap_err()
+            .message()
             .contains("redirected")
     );
     let source = source(&server, "test-token");
-    assert!(source.libraries().unwrap_err().contains("denied access"));
+    assert!(source.libraries().unwrap_err().is_unauthorized());
     worker.join().unwrap();
     assert!(Api::new("https://user:pw@example.test", "device", None).is_err());
     assert!(Api::new(&server, "device", Some("a\", Device=\"bad")).is_err());
@@ -243,8 +245,8 @@ fn rejects_redirects_invalid_credentials_and_unsafe_references() {
         .into_item(None)
         .unwrap();
     assert!(matches!(item.versions[0].stream, Stream::Multipart));
-    assert!(source.playback(&item, &item.versions[0]).is_err());
+    assert!(source.playback(&item, &item.versions[0], 0).is_err());
     let mut version = item.versions[0].clone();
     version.stream = Stream::Direct("//other.test/file?token=bad".into());
-    assert!(source.playback(&item, &version).is_err());
+    assert!(source.playback(&item, &version, 0).is_err());
 }

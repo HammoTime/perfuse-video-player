@@ -34,7 +34,7 @@ fn native_book_resume_seek_and_finish() {
             token: "test-token".into(),
             client_id: "perfuse-book-test".into(),
         },
-        false,
+        perfuse::plugins::OpenOptions::default(),
     )
     .unwrap();
     let (serving, shutdown) = mpsc::channel::<()>();
@@ -127,7 +127,7 @@ fn native_book_resume_seek_and_finish() {
         kind: Kind::Audiobook,
         duration_ms: Some(8_000),
         resume_ms: Some(5_000),
-        book: Some(Box::new(Book {
+        book: Book {
             chapters: (0..4)
                 .map(|i| Chapter {
                     title: format!("Chapter {}", i + 1),
@@ -136,7 +136,7 @@ fn native_book_resume_seek_and_finish() {
                 })
                 .collect(),
             ..Default::default()
-        })),
+        },
         versions: vec![Version {
             stream: Stream::Audiobook(vec![
                 AudioTrack {

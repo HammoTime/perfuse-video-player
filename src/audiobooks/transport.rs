@@ -58,10 +58,10 @@ impl App {
         }
         let item = loaded.item.clone();
         if self.book.scrub_range.take().is_some() {
-            self.seek_position = None;
+            self.playback.seek_position = None;
         }
-        let Some(book) = &item.book else { return };
-        let current = chapter_index(&book.chapters, self.playing_seconds);
+        let book = &item.book;
+        let current = chapter_index(&book.chapters, self.playback.playing_seconds);
         let chapter = current.map(|i| &book.chapters[i]);
         let viewport = ctx.content_rect().width();
         let show_tools = viewport > 1000.0;
@@ -221,7 +221,7 @@ impl App {
                         self.book.full = true;
                     }
                     if book_icon(&mut tools, Icon::Close, "Stop", 32.0, 16.0).clicked()
-                        && let Some(player) = &self.player
+                        && let Some(player) = &self.playback.player
                     {
                         player.stop();
                     }
@@ -235,7 +235,8 @@ impl App {
         };
         let item = active.item.clone();
         let source = active.source.clone();
-        let Some(book) = &item.book else { return };
+        let kind = active.kind;
+        let book = &item.book;
         let library = self
             .servers
             .iter()
@@ -248,7 +249,7 @@ impl App {
             });
         let server_name = active.server_name.clone();
         let library_name = library.map(|lib| lib.title.clone());
-        let current = chapter_index(&book.chapters, self.playing_seconds);
+        let current = chapter_index(&book.chapters, self.playback.playing_seconds);
         let chapter = current.map(|i| &book.chapters[i]);
         let viewport = ui.ctx().content_rect().size();
         let split = viewport.x > 1180.0;
@@ -265,7 +266,7 @@ impl App {
                 {
                     app.book.full = false;
                 }
-                book_crumb(ui, &server_name, library_name.as_deref());
+                book_crumb(ui, kind, &server_name, library_name.as_deref());
             });
             // Align the bottom of the byline with the cover even when a title wraps.
             let text_width = (ui.available_width() - cover_size - 28.0).max(1.0);
@@ -498,12 +499,14 @@ impl App {
         current: Option<usize>,
         dock: bool,
     ) {
-        let Some(player) = &self.player else { return };
+        let Some(player) = &self.playback.player else {
+            return;
+        };
         let size = if dock { 32.0 } else { 44.0 };
         let play_size = if dock { 40.0 } else { 64.0 };
         let (glyph, play_glyph) = if dock { (20.0, 25.0) } else { (27.5, 35.0) };
         let gap = if dock { 8.0 } else { 20.0 };
-        let position_ms = (self.playing_seconds * 1000.0).round() as u64;
+        let position_ms = (self.playback.playing_seconds * 1000.0).round() as u64;
         let next = chapters.partition_point(|chapter| chapter.start_ms <= position_ms);
         control_row(ui, play_size, |ui| {
             ui.spacing_mut().item_spacing.x = gap;
@@ -527,9 +530,9 @@ impl App {
                 player.seek(chapters[target].start_ms as f64 / 1000.0);
             }
             if book_icon(ui, Icon::Back30, "Back 30 seconds", size, glyph).clicked() {
-                player.seek(self.playing_seconds - 30.0);
+                player.seek(self.playback.playing_seconds - 30.0);
             }
-            let (icon, label) = if self.paused {
+            let (icon, label) = if self.playback.paused {
                 (Icon::Play, "Play")
             } else {
                 (Icon::Pause, "Pause")
@@ -538,7 +541,9 @@ impl App {
                 player.pause();
             }
             if book_icon(ui, Icon::Forward30, "Forward 30 seconds", size, glyph).clicked() {
-                player.seek((self.playing_seconds + 30.0).min(self.playing_duration));
+                player.seek(
+                    (self.playback.playing_seconds + 30.0).min(self.playback.playing_duration),
+                );
             }
             if ui
                 .add_enabled(next < chapters.len(), |ui: &mut egui::Ui| {
@@ -552,7 +557,7 @@ impl App {
     }
 
     fn book_scrubber(&mut self, ui: &mut egui::Ui, chapter: Option<&Chapter>, dock: bool) {
-        let range = chapter.map_or((0.0, self.playing_duration), |chapter| {
+        let range = chapter.map_or((0.0, self.playback.playing_duration), |chapter| {
             (
                 chapter.start_ms as f64 / 1000.0,
                 chapter.end_ms as f64 / 1000.0,
@@ -560,7 +565,10 @@ impl App {
         });
         let (start, end) = self.book.scrub_range.unwrap_or(range);
         let duration = (end - start).max(0.0);
-        let position = self.seek_position.unwrap_or(self.playing_seconds);
+        let position = self
+            .playback
+            .seek_position
+            .unwrap_or(self.playback.playing_seconds);
         let mut elapsed = (position - start).clamp(0.0, duration);
         let left = short_clock(elapsed);
         let right = format!("−{}", short_clock(duration - elapsed));
@@ -600,13 +608,13 @@ impl App {
             let response = seekbar(ui, &mut elapsed, duration, None);
             if response.dragged() {
                 self.book.scrub_range = Some((start, end));
-                self.seek_position = Some(start + elapsed);
+                self.playback.seek_position = Some(start + elapsed);
             }
             if response.drag_stopped() || (response.changed() && !response.dragged()) {
-                if let Some(player) = &self.player {
+                if let Some(player) = &self.playback.player {
                     player.seek(start + elapsed.min(duration));
                 }
-                self.seek_position = None;
+                self.playback.seek_position = None;
                 self.book.scrub_range = None;
             }
             captions(
@@ -623,8 +631,11 @@ impl App {
     }
 
     fn book_track(&self, ui: &mut egui::Ui, chapters: &[Chapter], current: Option<usize>) {
-        let total = self.playing_duration.max(1.0);
-        let seconds = self.seek_position.unwrap_or(self.playing_seconds);
+        let total = self.playback.playing_duration.max(1.0);
+        let seconds = self
+            .playback
+            .seek_position
+            .unwrap_or(self.playback.playing_seconds);
         let (rect, _) =
             ui.allocate_exact_size(Vec2::new(ui.available_width(), 14.0), egui::Sense::hover());
         let ratio = |seconds: f64| (seconds / total).clamp(0.0, 1.0) as f32;
@@ -649,15 +660,21 @@ impl App {
                 (2.0, color),
             );
         }
-        let mut remaining = format!("{} left", book_duration((total - seconds) / self.speed));
-        if self.speed != 1.0 {
-            remaining.push_str(&format!(" at {}×", self.speed));
+        let mut remaining = format!(
+            "{} left",
+            book_duration((total - seconds) / self.playback.speed)
+        );
+        if self.playback.speed != 1.0 {
+            remaining.push_str(&format!(" at {}×", self.playback.speed));
         }
         let mut left = egui::text::LayoutJob::default();
         for (value, color) in [
             ("Book ".into(), MUTED),
             (short_clock(seconds), TEXT),
-            (format!(" of {}", short_clock(self.playing_duration)), MUTED),
+            (
+                format!(" of {}", short_clock(self.playback.playing_duration)),
+                MUTED,
+            ),
         ] {
             left.append(
                 &value,
@@ -683,12 +700,13 @@ impl App {
     fn book_menus_width(&self, ui: &egui::Ui, dock: bool) -> f32 {
         let timer = self.sleep_label();
         if dock {
-            let speed = (text_width(ui, &format!("{}×", self.speed), 13.0) + 20.0).max(52.0);
+            let speed =
+                (text_width(ui, &format!("{}×", self.playback.speed), 13.0) + 20.0).max(52.0);
             let badge = timer.map_or(0.0, |t| 11.0 + 3.0 + text_width(ui, &t, 11.0) + 8.0);
             badge + speed + 8.0 + 32.0
         } else {
             let sleep = timer.map_or_else(|| "Sleep".into(), |t| format!("Sleep · {t}"));
-            book_tool_width(ui, &format!("Speed {}×", self.speed))
+            book_tool_width(ui, &format!("Speed {}×", self.playback.speed))
                 + 12.0
                 + book_tool_width(ui, &sleep)
         }
@@ -720,17 +738,23 @@ impl App {
             // Keep keyboard focus on the same tool when its optional countdown appears.
             ui.skip_ahead_auto_ids(1);
         }
-        let speed = format!("{}×", self.speed);
+        let speed = format!("{}×", self.playback.speed);
         let trigger = if dock {
             let width = (text_width(ui, &speed, 13.0) + 20.0).max(52.0);
-            tool_button(ui, None, &speed, self.speed != 1.0, Vec2::new(width, 32.0))
-                .on_hover_text("Playback speed")
+            tool_button(
+                ui,
+                None,
+                &speed,
+                self.playback.speed != 1.0,
+                Vec2::new(width, 32.0),
+            )
+            .on_hover_text("Playback speed")
         } else {
             book_tool(
                 ui,
                 Icon::Speed,
                 &format!("Speed {speed}"),
-                self.speed != 1.0,
+                self.playback.speed != 1.0,
             )
         };
         if dock {
@@ -739,7 +763,7 @@ impl App {
             });
         }
         const SPEEDS: [f64; 8] = [0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0];
-        let selected = SPEEDS.iter().position(|&s| s == self.speed);
+        let selected = SPEEDS.iter().position(|&s| s == self.playback.speed);
         if let Some(index) = choice_menu(
             &trigger,
             dock,
@@ -757,9 +781,9 @@ impl App {
             selected,
             SPEEDS.len(),
         ) {
-            self.speed = SPEEDS[index];
-            if let Some(player) = &self.player {
-                player.speed(self.speed);
+            self.playback.speed = SPEEDS[index];
+            if let Some(player) = &self.playback.player {
+                player.speed(self.playback.speed);
             }
         }
         let trigger = if dock {
@@ -802,7 +826,7 @@ impl App {
                 5 => Some(Sleep::Chapter),
                 i => Some(Sleep::minutes(MINUTES[i - 1])),
             };
-            if let Some(player) = &self.player {
+            if let Some(player) = &self.playback.player {
                 player.sleep_after_chapter(matches!(self.book.sleep, Some(Sleep::Chapter)));
             }
             self.book_toast(

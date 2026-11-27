@@ -2,6 +2,7 @@
 //! named by a hash of the server origin and artwork path (never the token),
 //! and are trimmed oldest-first when the folder grows past its limit.
 
+use crate::media::SourceResult;
 use reqwest::blocking::RequestBuilder;
 use std::{
     fs,
@@ -36,7 +37,7 @@ impl Artwork {
         server: &str,
         path: &str,
         request: RequestBuilder,
-    ) -> Result<image::RgbaImage, String> {
+    ) -> SourceResult<image::RgbaImage> {
         let response = request
             .send()
             .map_err(|_| "Artwork unavailable.".to_owned())?;
@@ -48,7 +49,7 @@ impl Artwork {
         server: &str,
         path: &str,
         response: reqwest::blocking::Response,
-    ) -> Result<image::RgbaImage, String> {
+    ) -> SourceResult<image::RgbaImage> {
         if !response.status().is_success() {
             return Err("Artwork unavailable.".into());
         }

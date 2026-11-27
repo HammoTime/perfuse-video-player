@@ -42,7 +42,70 @@ pub struct Mpv {
     destroy: unsafe extern "C" fn(Handle),
     _library: Library,
     #[cfg(windows)]
+    _directory: Option<DllDirectory>,
+    #[cfg(windows)]
     _lease: Option<std::fs::File>,
+}
+
+/// Limits later DLL loads in this process to the application folder, System32 and folders
+/// added with AddDllDirectory, so neither the working directory nor PATH supplies a DLL.
+/// Call before other threads start or load libraries.
+pub fn harden_dll_search() {
+    #[cfg(windows)]
+    // SAFETY: a process-wide loader setting with a documented constant flag.
+    unsafe {
+        use windows_sys::Win32::System::LibraryLoader::{
+            LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, SetDefaultDllDirectories,
+        };
+        SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    }
+}
+
+/// Keeps the runtime folder on the process DLL search list while libmpv is loaded, so helpers
+/// it loads by name later (such as the bundled d3dcompiler_43.dll fallback) resolve there.
+#[cfg(windows)]
+struct DllDirectory(*mut c_void);
+
+#[cfg(windows)]
+impl Drop for DllDirectory {
+    fn drop(&mut self) {
+        // SAFETY: the cookie came from AddDllDirectory and is removed exactly once.
+        unsafe {
+            windows_sys::Win32::System::LibraryLoader::RemoveDllDirectory(self.0);
+        }
+    }
+}
+
+/// Loads libmpv so its imports resolve from its own folder and System32, never the working
+/// directory or PATH. A bare file name searches only the application folder and System32.
+#[cfg(windows)]
+unsafe fn load(path: &Path) -> Option<(Library, Option<DllDirectory>)> {
+    use libloading::os::windows::{
+        LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, Library as Native,
+    };
+    use std::os::windows::ffi::OsStrExt;
+    if path.parent().is_none_or(|dir| dir.as_os_str().is_empty()) {
+        // SAFETY: the caller upholds libloading's initialisation requirements.
+        let library = unsafe { Native::load_with_flags(path, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS) };
+        return library.ok().map(|library| (library.into(), None));
+    }
+    // LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR requires a fully qualified path with backslashes.
+    let path = std::path::absolute(path).ok()?;
+    let directory = path.parent().and_then(|dir| {
+        let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
+        // SAFETY: a NUL-terminated absolute folder path; DllDirectory removes the cookie once.
+        let cookie =
+            unsafe { windows_sys::Win32::System::LibraryLoader::AddDllDirectory(wide.as_ptr()) };
+        (!cookie.is_null()).then_some(DllDirectory(cookie))
+    });
+    // SAFETY: the caller upholds libloading's initialisation requirements.
+    let library = unsafe {
+        Native::load_with_flags(
+            &path,
+            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+        )
+    };
+    library.ok().map(|library| (library.into(), directory))
 }
 
 impl Mpv {
@@ -64,6 +127,10 @@ impl Mpv {
         // SAFETY: load the packaged library from an explicit path. Every symbol below follows
         // include/mpv/client.h's C ABI; the Library outlives the handle and function pointers.
         unsafe {
+            #[cfg(windows)]
+            let (library, directory) = load(path)
+                .ok_or_else(|| "Cannot load the playback libraries. Check the runtime DLL and your graphics drivers.".to_owned())?;
+            #[cfg(not(windows))]
             let library = Library::new(path)
                 .map_err(|_| "Cannot load the playback libraries. Check the runtime DLL and your graphics drivers.".to_owned())?;
             let create = *library
@@ -106,6 +173,8 @@ impl Mpv {
                 free,
                 destroy,
                 _library: library,
+                #[cfg(windows)]
+                _directory: directory,
                 #[cfg(windows)]
                 _lease: lease,
             })

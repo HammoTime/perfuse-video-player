@@ -608,6 +608,15 @@ pub(crate) mod windows {
             Ok(bytes)
         }
 
+        /// The validated SHA256 digest as 64 lowercase hex digits, for checks in other processes.
+        pub(crate) fn sha256_hex(&self) -> Result<String, String> {
+            Ok(self
+                .checksum()?
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect())
+        }
+
         pub(crate) fn validate(&self, prefix: &str) -> Result<(), String> {
             let url =
                 Url::parse(&self.browser_download_url).map_err(|_| "Invalid download address.")?;
@@ -730,8 +739,16 @@ pub(crate) mod windows {
         label: &str,
         report: &dyn Fn(String),
     ) -> Result<(), String> {
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
         let expected = asset.checksum()?;
-        let mut file = fs::File::create(path).map_err(|_| "Could not save the download.")?;
+        // Other processes may read the partial download but not write, replace or delete it.
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(path)
+            .map_err(|_| "Could not save the download.")?;
         let mut hash = Context::new(&SHA256);
         let mut total = 0;
         let mut percent = 101;
@@ -762,9 +779,58 @@ pub(crate) mod windows {
         Ok(())
     }
 
-    fn extract(archive: &Path, destination: &Path, member: &str) -> Result<(), String> {
+    /// Reopens a finished download so no process can write, replace or delete it, then checks
+    /// its size and SHA256 again through that handle. Keep the handle open while another
+    /// program reads the file by path; those bytes are then the verified ones.
+    fn verified(asset: &Asset, path: &Path) -> Result<fs::File, String> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        };
+        let expected = asset.checksum()?;
+        let changed = || "The download changed after its SHA256 check. Please retry.".to_owned();
+        // A link is opened (and rejected) itself, so its target cannot be swapped afterwards.
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|_| changed())?;
+        if !file
+            .metadata()
+            .is_ok_and(|meta| meta.is_file() && meta.file_attributes() & 0x400 == 0)
+        {
+            return Err(changed());
+        }
+        let mut hash = Context::new(&SHA256);
+        let mut total = 0;
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer).map_err(|_| changed())?;
+            if count == 0 {
+                break;
+            }
+            total += count as u64;
+            if total > asset.size {
+                return Err(changed());
+            }
+            hash.update(&buffer[..count]);
+        }
+        if total != asset.size || hash.finish().as_ref() != expected {
+            return Err(changed());
+        }
+        Ok(file)
+    }
+
+    fn extract(
+        archive: &Path,
+        asset: &Asset,
+        destination: &Path,
+        member: &str,
+    ) -> Result<(), String> {
         let system =
             std::env::var_os("SystemRoot").ok_or("Could not locate Windows archive tools.")?;
+        // tar.exe reads the archive by path, so the re-verified handle stays open until it exits.
+        let _verified = verified(asset, archive)?;
         // Only the named DLL is extracted; archive paths, scripts and executables are ignored.
         let output = Command::new(Path::new(&system).join("System32/tar.exe"))
             .args(["-xf"]).arg(archive).arg("-C").arg(destination).arg("--").arg(member)
@@ -797,7 +863,7 @@ pub(crate) mod windows {
             let archive = stage.join(&asset.name);
             download(&client, asset, &archive, label, report)?;
             report("Extracting playback libraries…".into());
-            extract(&archive, stage, member)?;
+            extract(&archive, asset, stage, member)?;
         }
         let revision = library
             .name
@@ -983,6 +1049,23 @@ pub(crate) mod windows {
             for bytes in [&b"abd"[..], &b"ab"[..], &b"abcd"[..]] {
                 assert!(save_download(bytes, &asset, &path, "Download", &|_| {}).is_err());
             }
+            fs::remove_file(path).unwrap();
+        }
+
+        #[test]
+        fn verified_download_stays_unchanged_while_held() {
+            let path =
+                std::env::temp_dir().join(format!("perfuse-verified-{}.part", std::process::id()));
+            let asset = asset("test.7z");
+            save_download(&b"abc"[..], &asset, &path, "Download", &|_| {}).unwrap();
+            let held = verified(&asset, &path).unwrap();
+            // Readers such as tar.exe still open the file; writers and deleters cannot.
+            assert!(fs::File::open(&path).is_ok());
+            assert!(fs::OpenOptions::new().write(true).open(&path).is_err());
+            assert!(fs::remove_file(&path).is_err());
+            drop(held);
+            fs::write(&path, b"abd").unwrap();
+            assert!(verified(&asset, &path).is_err());
             fs::remove_file(path).unwrap();
         }
 

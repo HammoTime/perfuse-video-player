@@ -1,6 +1,6 @@
 //! First-run and Settings share the add-server flow in docs/design/multi-server/js/app.js.
 use super::*;
-use perfuse::plugins::{BUILTIN, audiobookshelf, jellyfin};
+use perfuse::plugins::{BUILTIN, SignInMethod, SignInRequest};
 use std::collections::{BTreeMap, VecDeque};
 
 const ADDRESS: &str = "Server address";
@@ -11,13 +11,62 @@ const MANUAL: &str = "Connect manually with an address and token";
 const QUICK: &str = "Use Quick Connect";
 const PLEX_SIGN_IN: &str = "Sign in with Plex";
 const NAME: &str = "Name in Perfuse";
+// Shown, not enforced: whether to connect over plain HTTP is the user's decision.
+const UNENCRYPTED: &str = "This address is not encrypted. Your sign-in and media will cross the internet unprotected. Use an https:// address if the server has one.";
 
-#[derive(Clone, Copy)]
-enum SignIn {
-    PlexToken,
-    JellyfinPassword,
-    AudiobookshelfPassword,
-    QuickConnect,
+/// Replies from the add-server flow. They never share the navigation channel.
+pub(super) enum Reply {
+    Connected(Source, Vec<Library>, session::Session),
+    QuickConnectCode(String),
+    Failed(String),
+}
+
+/// Add-server form state. Navigation cannot cancel or clear a sign-in in progress.
+pub(super) struct SignIn {
+    pub(super) server: String,
+    pub(super) token: String,
+    pub(super) username: String,
+    pub(super) password: String,
+    pub(super) quick_code: Option<String>,
+    pub(super) client_id: String,
+    pub(super) form: Form,
+    pub(super) login: Option<auth::Login>,
+    pub(super) login_url: Option<String>,
+    pub(super) remember: bool,
+    pub(super) busy: bool,
+    pub(super) error: Option<String>,
+    pub(super) generation: Arc<AtomicU64>,
+    pub(super) tx: Sender<(u64, Reply)>,
+    rx: Receiver<(u64, Reply)>,
+}
+
+impl SignIn {
+    pub(super) fn new(server: String, client_id: String) -> Self {
+        let (tx, rx) = mpsc::channel();
+        Self {
+            server,
+            token: String::new(),
+            username: String::new(),
+            password: String::new(),
+            quick_code: None,
+            client_id,
+            form: Form::default(),
+            login: None,
+            login_url: None,
+            remember: cfg!(windows),
+            busy: false,
+            error: None,
+            generation: Arc::new(AtomicU64::new(0)),
+            tx,
+            rx,
+        }
+    }
+
+    pub(super) fn begin(&mut self) -> u64 {
+        self.busy = true;
+        self.error = None;
+        self.generation.fetch_add(1, Ordering::Relaxed) + 1
+    }
 }
 
 struct PlexChoice {
@@ -29,9 +78,8 @@ struct PlexChoice {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Step {
     Types,
-    Plex,
-    Jellyfin,
-    Audiobookshelf,
+    /// The chosen server type's sign-in form.
+    Form(ServerKind),
     Browser,
     QuickConnect,
     PlexChoices,
@@ -48,10 +96,27 @@ pub(super) struct Form {
     pub(super) pending: VecDeque<usize>,
     added: Vec<usize>,
     name: String,
-    credential_error: Option<String>,
+    pub(super) credential_error: Option<String>,
+    /// An expired server being signed in again, by kind and origin.
+    replacing: Option<(ServerKind, Option<String>)>,
 }
 
 impl Form {
+    /// Signs in to an existing server again instead of adding a new one.
+    pub(super) fn replace(&mut self, kind: ServerKind, address: &str) {
+        self.replacing = Some((kind, session::origin(address)));
+    }
+
+    fn replaces(&self, kind: ServerKind, address: &str) -> bool {
+        self.replacing
+            .as_ref()
+            .is_some_and(|(k, origin)| *k == kind && *origin == session::origin(address))
+    }
+
+    pub(super) fn added_any(&self) -> bool {
+        !self.added.is_empty()
+    }
+
     pub(super) fn focus(&mut self, target: &str, response: &egui::Response) {
         if self.next_focus == Some(target) && response.enabled() {
             response.request_focus();
@@ -75,6 +140,7 @@ fn text_field(
     required: bool,
     help: &str,
     error: Option<&str>,
+    warning: Option<&str>,
 ) -> egui::Response {
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing = Vec2::new(4.0, 6.0);
@@ -137,6 +203,8 @@ fn text_field(
             if let Some(error) = error {
                 node.set_invalid(egui::accesskit::Invalid::True);
                 node.set_description(error);
+            } else if let Some(warning) = warning {
+                node.set_description(warning);
             } else if !help.is_empty() {
                 node.set_description(help);
             }
@@ -149,12 +217,32 @@ fn text_field(
                     .color(MUTED),
             );
         }
+        if let Some(warning) = warning {
+            unencrypted_warning(ui, warning);
+        }
         if let Some(error) = error {
             ui.label(RichText::new(error).size(12.0).color(ERROR_TEXT));
         }
         response
     })
     .inner
+}
+
+/// A caution under an address that travels over plain HTTP outside the local network.
+fn unencrypted_warning(ui: &mut egui::Ui, text: &str) {
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.add(Icon::Alert.image(14.0, ERROR_TEXT));
+        ui.add(
+            egui::Label::new(
+                RichText::new(text)
+                    .size(12.0)
+                    .line_height(Some(18.0))
+                    .color(ERROR_TEXT),
+            )
+            .wrap(),
+        );
+    });
 }
 
 fn remember_field(ui: &mut egui::Ui, remember: &mut bool) {
@@ -187,100 +275,106 @@ fn remember_field(ui: &mut egui::Ui, remember: &mut bool) {
 }
 
 impl App {
+    /// The plugin for the server type the form is signing in to.
+    fn sign_in_plugin(&self) -> &'static perfuse::plugins::Plugin {
+        self.sign_in.form.kind.unwrap_or_default().plugin()
+    }
+
     fn validate_field(&mut self, field: &'static str) -> bool {
+        let plugin = self.sign_in_plugin();
         let issue = match field {
-            ADDRESS if self.server.trim().is_empty() => Some("Enter your server address.".into()),
-            ADDRESS => match perfuse::plugins::base_url(&self.server) {
-                Err(message) => Some(message),
-                Ok(url) => self
-                    .servers
-                    .iter()
-                    .find(|s| {
-                        Some(s.session.kind) == self.form.kind
-                            && session::origin(&s.session.server).as_deref()
-                                == Some(&url.origin().ascii_serialization())
-                    })
-                    .map(|s| format!("This server is already added as \"{}\".", s.name())),
-            },
-            USERNAME
-                if self.username.trim().is_empty()
-                    && self.form.kind == Some(ServerKind::Jellyfin) =>
-            {
-                Some("Enter your Jellyfin username.".into())
+            ADDRESS if self.sign_in.server.trim().is_empty() => {
+                Some("Enter your server address.".into())
             }
-            USERNAME if self.username.trim().is_empty() => Some("Enter your username.".into()),
+            ADDRESS => match perfuse::plugins::base_url(&self.sign_in.server) {
+                Err(message) => Some(message),
+                Ok(url) => {
+                    let origin = Some(url.origin().ascii_serialization());
+                    self.servers
+                        .iter()
+                        .find(|s| {
+                            Some(s.session.kind) == self.sign_in.form.kind
+                                && session::origin(&s.session.server) == origin
+                                && !self
+                                    .sign_in
+                                    .form
+                                    .replaces(s.session.kind, &s.session.server)
+                        })
+                        .map(|s| format!("This server is already added as \"{}\".", s.name()))
+                }
+            },
+            // A server that allows an empty password names itself, so the username stands out.
+            USERNAME
+                if self.sign_in.username.trim().is_empty()
+                    && plugin.password_sign_in() == Some(false) =>
+            {
+                Some(format!("Enter your {} username.", plugin.name))
+            }
+            USERNAME if self.sign_in.username.trim().is_empty() => {
+                Some("Enter your username.".into())
+            }
             PASSWORD
-                if self.form.kind == Some(ServerKind::Audiobookshelf)
-                    && self.password.is_empty() =>
+                if plugin.password_sign_in() == Some(true) && self.sign_in.password.is_empty() =>
             {
                 Some("Enter your password.".into())
             }
-            TOKEN if self.token.trim().is_empty() => Some("Enter your Plex access token.".into()),
+            TOKEN if self.sign_in.token.trim().is_empty() => {
+                Some(format!("Enter your {} access token.", plugin.name))
+            }
             _ => None,
         };
         if let Some(issue) = issue {
-            self.form.issues.insert(field, issue);
+            self.sign_in.form.issues.insert(field, issue);
             false
         } else {
-            self.form.issues.remove(field);
+            self.sign_in.form.issues.remove(field);
             true
         }
     }
 
-    fn connect(&mut self, ctx: &egui::Context, method: SignIn) {
-        let kind = match method {
-            SignIn::PlexToken => ServerKind::Plex,
-            SignIn::JellyfinPassword | SignIn::QuickConnect => ServerKind::Jellyfin,
-            SignIn::AudiobookshelfPassword => ServerKind::Audiobookshelf,
+    fn connect(&mut self, ctx: &egui::Context, method: SignInMethod) {
+        let Some(kind) = self.sign_in.form.kind else {
+            return;
         };
         if !self.validate_connection(method) {
             return;
         }
-        let generation = self.begin();
+        let generation = self.sign_in.begin();
         let mut session = session::Session {
             kind,
-            server: self.server.clone(),
-            token: self.token.clone().into(),
-            client_id: self.client_id.clone(),
+            server: self.sign_in.server.clone(),
+            token: self.sign_in.token.clone().into(),
+            client_id: self.sign_in.client_id.clone(),
         };
-        let username = self.username.clone();
-        let password = std::mem::take(&mut self.password);
-        if matches!(method, SignIn::QuickConnect) {
-            self.quick_code = Some(String::new());
-            self.form.next_focus = Some("Cancel");
+        let username = self.sign_in.username.clone();
+        let password = std::mem::take(&mut self.sign_in.password);
+        if method == SignInMethod::QuickConnect {
+            self.sign_in.quick_code = Some(String::new());
+            self.sign_in.form.next_focus = Some("Cancel");
         }
-        let (tx, ctx, current) = (self.tx.clone(), ctx.clone(), self.generation.clone());
+        let (tx, ctx, current) = (
+            self.sign_in.tx.clone(),
+            ctx.clone(),
+            self.sign_in.generation.clone(),
+        );
+        // Its own thread: Quick Connect waits up to ten minutes for approval.
         thread::spawn(move || {
             let result = (|| {
-                match method {
-                    SignIn::PlexToken => {}
-                    SignIn::AudiobookshelfPassword => {
-                        audiobookshelf::auth::password(&mut session, &username, &password)?;
-                    }
-                    SignIn::JellyfinPassword => {
-                        session.token = jellyfin::auth::password(
-                            &session.server,
-                            &session.client_id,
-                            &username,
-                            &password,
-                        )?
-                        .into();
-                    }
-                    SignIn::QuickConnect => {
-                        session.token = jellyfin::auth::quick_connect(
-                            &session.server,
-                            &session.client_id,
-                            |code| {
-                                let _ = tx.send((generation, Reply::QuickConnectCode(code)));
-                                ctx.request_repaint();
-                            },
-                            || current.load(Ordering::Relaxed) != generation,
-                        )?
-                        .into();
-                    }
-                }
+                let show_code = |code| {
+                    let _ = tx.send((generation, Reply::QuickConnectCode(code)));
+                    ctx.request_repaint();
+                };
+                let cancelled = || current.load(Ordering::Relaxed) != generation;
+                let request = SignInRequest {
+                    method,
+                    username: &username,
+                    password: &password,
+                    show_code: &show_code,
+                    cancelled: &cancelled,
+                };
+                (kind.plugin().authenticate)(&mut session, &request).map_err(String::from)?;
                 let source = session::open(&session)?;
-                let sections = source.libraries()?;
+                let sections = source.libraries().map_err(String::from)?;
                 Ok(Reply::Connected(source, sections, session))
             })()
             .unwrap_or_else(Reply::Failed);
@@ -289,23 +383,24 @@ impl App {
         });
     }
 
-    fn validate_connection(&mut self, method: SignIn) -> bool {
-        self.error = None;
-        self.form.issues.clear();
+    fn validate_connection(&mut self, method: SignInMethod) -> bool {
+        self.sign_in.error = None;
+        self.sign_in.form.issues.clear();
         let required: &[&str] = match method {
-            SignIn::PlexToken => &[ADDRESS, TOKEN],
-            SignIn::JellyfinPassword => &[ADDRESS, USERNAME],
-            SignIn::AudiobookshelfPassword => &[ADDRESS, USERNAME, PASSWORD],
-            SignIn::QuickConnect => &[ADDRESS],
+            SignInMethod::Token => &[ADDRESS, TOKEN],
+            SignInMethod::Password { required: false } => &[ADDRESS, USERNAME],
+            SignInMethod::Password { required: true } => &[ADDRESS, USERNAME, PASSWORD],
+            SignInMethod::QuickConnect => &[ADDRESS],
+            SignInMethod::Account => &[],
         };
         for &field in required {
             self.validate_field(field);
         }
-        self.form.next_focus = required
+        self.sign_in.form.next_focus = required
             .iter()
             .copied()
-            .find(|field| self.form.issues.contains_key(field));
-        self.form.issues.is_empty()
+            .find(|field| self.sign_in.form.issues.contains_key(field));
+        self.sign_in.form.issues.is_empty()
     }
 
     fn credential_field(
@@ -314,22 +409,28 @@ impl App {
         label: &'static str,
         help: &str,
     ) -> egui::Response {
+        let password_required = self.sign_in_plugin().password_sign_in() == Some(true);
+        let warning = (label == ADDRESS && perfuse::unencrypted_remote(&self.sign_in.server))
+            .then_some(UNENCRYPTED);
         let value = match label {
-            ADDRESS => &mut self.server,
-            USERNAME => &mut self.username,
-            TOKEN => &mut self.token,
-            _ => &mut self.password,
+            ADDRESS => &mut self.sign_in.server,
+            USERNAME => &mut self.sign_in.username,
+            TOKEN => &mut self.sign_in.token,
+            _ => &mut self.sign_in.password,
         };
         let response = text_field(
             ui,
             label,
             value,
-            label != PASSWORD || self.form.kind == Some(ServerKind::Audiobookshelf),
+            label != PASSWORD || password_required,
             help,
-            self.form.issues.get(label).map(String::as_str),
+            self.sign_in.form.issues.get(label).map(String::as_str),
+            warning,
         );
-        self.form.focus(label, &response);
-        if response.lost_focus() || (response.changed() && self.form.issues.contains_key(label)) {
+        self.sign_in.form.focus(label, &response);
+        if response.lost_focus()
+            || (response.changed() && self.sign_in.form.issues.contains_key(label))
+        {
             self.validate_field(label);
         }
         response
@@ -339,11 +440,11 @@ impl App {
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
-        method: SignIn,
+        method: SignInMethod,
         enter: bool,
     ) {
         ui.add_space(8.0);
-        let clicked = if self.busy {
+        let clicked = if self.sign_in.busy {
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label("Connecting…");
@@ -353,7 +454,7 @@ impl App {
             ui.add(Pill::primary(Icon::Server, "Connect").min_width(126.0))
                 .clicked()
         };
-        if clicked || (enter && !self.busy) {
+        if clicked || (enter && !self.sign_in.busy) {
             self.connect(ctx, method);
         }
     }
@@ -361,20 +462,23 @@ impl App {
     fn plex_form(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.colored_label(
             MUTED,
-            "Sign in securely in your browser, then choose which of your Plex servers to add.",
+            format!(
+                "Sign in securely in your browser, then choose which of your {} servers to add.",
+                self.sign_in_plugin().name
+            ),
         );
-        ui.add_enabled_ui(!self.busy, |ui| {
+        ui.add_enabled_ui(!self.sign_in.busy, |ui| {
             ui.add_space(8.0);
             let sign_in = ui.add(Pill::primary(Icon::SignInBrowser, PLEX_SIGN_IN).min_width(175.0));
-            self.form.focus(PLEX_SIGN_IN, &sign_in);
+            self.sign_in.form.focus(PLEX_SIGN_IN, &sign_in);
             if sign_in.clicked() {
-                self.error = None;
-                self.form.issues.clear();
-                self.form.next_focus = Some("Cancel");
-                self.login = Some(auth::Login::start(self.client_id.clone()));
+                self.sign_in.error = None;
+                self.sign_in.form.issues.clear();
+                self.sign_in.form.next_focus = Some("Cancel");
+                self.sign_in.login = Some(auth::Login::start(self.sign_in.client_id.clone()));
             }
-            remember_field(ui, &mut self.remember);
-            let angle = if self.form.manual {
+            remember_field(ui, &mut self.sign_in.remember);
+            let angle = if self.sign_in.form.manual {
                 0.0
             } else {
                 -std::f32::consts::FRAC_PI_2
@@ -392,18 +496,20 @@ impl App {
                 })
                 .inner;
             if toggle.clicked() {
-                self.form.manual = !self.form.manual;
-                self.form.issues.clear();
+                self.sign_in.form.manual = !self.sign_in.form.manual;
+                self.sign_in.form.issues.clear();
             }
-            ui.ctx()
-                .accesskit_node_builder(toggle.id, |node| node.set_expanded(self.form.manual));
-            if self.form.manual {
-                self.credential_field(ui, ADDRESS, "For example https://192.168.1.20:32400");
+            ui.ctx().accesskit_node_builder(toggle.id, |node| {
+                node.set_expanded(self.sign_in.form.manual)
+            });
+            if self.sign_in.form.manual {
+                let example = format!("For example {}", self.sign_in_plugin().address_example);
+                self.credential_field(ui, ADDRESS, &example);
                 let token = self.credential_field(ui, TOKEN, "");
                 self.submit_button(
                     ui,
                     ctx,
-                    SignIn::PlexToken,
+                    SignInMethod::Token,
                     token.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)),
                 );
             }
@@ -411,39 +517,32 @@ impl App {
     }
 
     fn password_form(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let jellyfin = self.form.kind == Some(ServerKind::Jellyfin);
-        ui.add_enabled_ui(!self.busy, |ui| {
-            let example = if jellyfin {
-                "For example http://192.168.1.30:8096"
-            } else {
-                "For example https://abs.example.com"
-            };
-            self.credential_field(ui, ADDRESS, example);
+        let plugin = self.sign_in_plugin();
+        let required = plugin.password_sign_in().unwrap_or(true);
+        ui.add_enabled_ui(!self.sign_in.busy, |ui| {
+            let example = format!("For example {}", plugin.address_example);
+            self.credential_field(ui, ADDRESS, &example);
             ui.spacing_mut().item_spacing.x = 16.0;
             let password = ui.columns(2, |cols| {
                 self.credential_field(&mut cols[0], USERNAME, "");
                 self.credential_field(
                     &mut cols[1],
                     PASSWORD,
-                    if jellyfin {
+                    if !required {
                         "Leave empty if your account has no password."
                     } else {
                         ""
                     },
                 )
             });
-            remember_field(ui, &mut self.remember);
+            remember_field(ui, &mut self.sign_in.remember);
             self.submit_button(
                 ui,
                 ctx,
-                if jellyfin {
-                    SignIn::JellyfinPassword
-                } else {
-                    SignIn::AudiobookshelfPassword
-                },
+                SignInMethod::Password { required },
                 password.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)),
             );
-            if !jellyfin {
+            if !plugin.offers(SignInMethod::QuickConnect) {
                 return;
             }
             ui.horizontal(|ui| {
@@ -469,9 +568,9 @@ impl App {
                 let mut quick = Pill::secondary(Icon::QuickConnect, QUICK).min_width(193.0);
                 quick.tall = true;
                 let quick = ui.add(quick);
-                self.form.focus(QUICK, &quick);
+                self.sign_in.form.focus(QUICK, &quick);
                 if quick.clicked() {
-                    self.connect(ctx, SignIn::QuickConnect);
+                    self.connect(ctx, SignInMethod::QuickConnect);
                 }
                 ui.label(
                     RichText::new(
@@ -485,9 +584,9 @@ impl App {
     }
 
     fn wait_for_sign_in(&mut self, ui: &mut egui::Ui) {
-        let plex = self.login.is_some();
-        if let Some(code) = self.quick_code.as_ref().filter(|c| !c.is_empty()) {
-            ui.colored_label(MUTED, "On a device that's already signed in to Jellyfin, open your user settings, choose Quick Connect and enter this code.");
+        let plex = self.sign_in.login.is_some();
+        if let Some(code) = self.sign_in.quick_code.as_ref().filter(|c| !c.is_empty()) {
+            ui.colored_label(MUTED, format!("On a device that's already signed in to {}, open your user settings, choose Quick Connect and enter this code.", self.sign_in_plugin().name));
             let display = match (code.get(..3), code.get(3..)) {
                 (Some(first), Some(last)) => format!("{first} {last}"),
                 _ => code.clone(),
@@ -497,11 +596,14 @@ impl App {
         ui.horizontal(|ui| {
             ui.spinner();
             ui.label(if plex {
-                "Waiting for you to sign in to Plex in your browser…"
-            } else if self.quick_code.as_deref() == Some("") {
-                "Requesting a Quick Connect code…"
+                format!(
+                    "Waiting for you to sign in to {} in your browser…",
+                    self.sign_in_plugin().name
+                )
+            } else if self.sign_in.quick_code.as_deref() == Some("") {
+                "Requesting a Quick Connect code…".into()
             } else {
-                "Waiting for approval…"
+                "Waiting for approval…".into()
             });
         });
         if plex {
@@ -509,16 +611,16 @@ impl App {
         }
         ui.horizontal(|ui| {
             let cancel = ui.add(Pill::secondary(Icon::Close, "Cancel"));
-            self.form.focus("Cancel", &cancel);
+            self.sign_in.form.focus("Cancel", &cancel);
             if cancel.clicked() {
-                self.generation.fetch_add(1, Ordering::Relaxed);
-                self.busy = false;
-                self.login = None;
-                self.login_url = None;
-                self.quick_code = None;
-                self.form.next_focus = Some(if plex { PLEX_SIGN_IN } else { QUICK });
+                self.sign_in.generation.fetch_add(1, Ordering::Relaxed);
+                self.sign_in.busy = false;
+                self.sign_in.login = None;
+                self.sign_in.login_url = None;
+                self.sign_in.quick_code = None;
+                self.sign_in.form.next_focus = Some(if plex { PLEX_SIGN_IN } else { QUICK });
             }
-            if let Some(url) = &self.login_url {
+            if let Some(url) = &self.sign_in.login_url {
                 ui.hyperlink_to("Open the sign-in page again", url);
             }
         });
@@ -531,9 +633,17 @@ fn glyph(ui: &egui::Ui, top_left: egui::Pos2, kind: ServerKind, size: f32) {
     source_icon(kind).paint(ui, tile.center(), size * 0.55, TEXT);
 }
 
-fn already_added(servers: &[Server], resource: &auth::Server) -> bool {
+/// Whether a discovered server is already in Perfuse, other than the one being signed in again.
+fn already_added(
+    servers: &[Server],
+    resource: &auth::Server,
+    replacing: &Option<(ServerKind, Option<String>)>,
+) -> bool {
     servers.iter().any(|s| {
         s.session.kind == ServerKind::Plex
+            && replacing.as_ref().is_none_or(|(kind, origin)| {
+                *kind != s.session.kind || *origin != session::origin(&s.session.server)
+            })
             && resource
                 .connections
                 .iter()
@@ -542,11 +652,60 @@ fn already_added(servers: &[Server], resource: &auth::Server) -> bool {
 }
 
 impl App {
+    pub(super) fn poll_sign_in(&mut self, ctx: &egui::Context) {
+        while let Ok((generation, reply)) = self.sign_in.rx.try_recv() {
+            if generation != self.sign_in.generation.load(Ordering::Relaxed) {
+                continue;
+            }
+            match reply {
+                Reply::QuickConnectCode(code) => self.sign_in.quick_code = Some(code),
+                Reply::Connected(source, sections, session) => {
+                    self.connected(ctx, source, sections, session);
+                }
+                Reply::Failed(error) => {
+                    self.sign_in.busy = false;
+                    self.sign_in.quick_code = None;
+                    self.sign_in.form.pending.clear();
+                    self.sign_in.error = Some(error);
+                }
+            }
+        }
+        let auth_events: Vec<_> = self
+            .sign_in
+            .login
+            .as_ref()
+            .map(|login| login.events.try_iter().collect())
+            .unwrap_or_default();
+        for event in auth_events {
+            match event {
+                auth::Event::Browser(url) => {
+                    self.sign_in.login_url = Some(url.clone());
+                    ctx.open_url(egui::OpenUrl::new_tab(url));
+                }
+                auth::Event::Failed(error) => {
+                    self.sign_in.login = None;
+                    self.sign_in.login_url = None;
+                    self.sign_in.error = Some(error);
+                }
+                auth::Event::SignedIn(servers) => {
+                    self.sign_in.login = None;
+                    self.sign_in.login_url = None;
+                    if servers.is_empty() {
+                        self.sign_in.error = Some("Signed in, but Plex returned no compatible movie or TV servers for this account.".into());
+                    } else {
+                        self.offer_plex_servers(servers);
+                    }
+                }
+            }
+        }
+    }
+
     pub(super) fn offer_plex_servers(&mut self, servers: Vec<auth::Server>) {
-        self.form.choices = servers
+        self.sign_in.form.choices = servers
             .into_iter()
             .map(|server| {
-                let checked = server.owned == Some(true) && !already_added(&self.servers, &server);
+                let checked = server.owned == Some(true)
+                    && !already_added(&self.servers, &server, &self.sign_in.form.replacing);
                 PlexChoice {
                     server,
                     checked,
@@ -554,16 +713,17 @@ impl App {
                 }
             })
             .collect();
-        self.form.next_focus = Some("Plex choice");
+        self.sign_in.form.next_focus = Some("Plex choice");
     }
 
     fn plex_choices(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.colored_label(MUTED, "Choose the servers to add to Perfuse.");
         let mut count = 0;
         ui.spacing_mut().item_spacing.y = 12.0;
-        for (index, choice) in self.form.choices.iter_mut().enumerate() {
-            let added = already_added(&self.servers, &choice.server);
-            let can_choose = !added && !self.busy;
+        let replacing = self.sign_in.form.replacing.clone();
+        for (index, choice) in self.sign_in.form.choices.iter_mut().enumerate() {
+            let added = already_added(&self.servers, &choice.server, &replacing);
+            let can_choose = !added && !self.sign_in.busy;
             choice.checked &= !added;
             let frame = egui::Frame::new()
                 .fill(if choice.checked {
@@ -582,9 +742,9 @@ impl App {
                         can_choose,
                         egui::Checkbox::new(&mut choice.checked, &choice.server.name),
                     );
-                    if can_choose && self.form.next_focus == Some("Plex choice") {
+                    if can_choose && self.sign_in.form.next_focus == Some("Plex choice") {
                         check.request_focus();
-                        self.form.next_focus = None;
+                        self.sign_in.form.next_focus = None;
                     }
                     let ownership = match choice.server.owned {
                         Some(true) => "Your server",
@@ -612,20 +772,29 @@ impl App {
                             });
                     });
                 }
+                if !added
+                    && perfuse::unencrypted_remote(&choice.server.connections[choice.address].uri)
+                {
+                    unencrypted_warning(ui, UNENCRYPTED);
+                }
             });
             count += usize::from(choice.checked);
         }
         let label = match count {
-            _ if self.busy => "Adding…".into(),
+            _ if self.sign_in.busy => "Adding…".into(),
             0 => "Choose a server".into(),
             1 => "Add 1 server".into(),
             n => format!("Add {n} servers"),
         };
         if ui
-            .add_enabled(!self.busy && count > 0, Pill::primary(Icon::Add, &label))
+            .add_enabled(
+                !self.sign_in.busy && count > 0,
+                Pill::primary(Icon::Add, &label),
+            )
             .clicked()
         {
-            self.form.pending = self
+            self.sign_in.form.pending = self
+                .sign_in
                 .form
                 .choices
                 .iter()
@@ -634,8 +803,8 @@ impl App {
                 .collect();
             self.connect_next_plex(ctx);
         }
-        if !self.busy
-            && !self.form.added.is_empty()
+        if !self.sign_in.busy
+            && !self.sign_in.form.added.is_empty()
             && ui
                 .add(Pill::secondary(
                     Icon::Check,
@@ -648,14 +817,14 @@ impl App {
     }
 
     fn connect_next_plex(&mut self, ctx: &egui::Context) {
-        while let Some(i) = self.form.pending.pop_front() {
-            let choice = &self.form.choices[i];
-            if already_added(&self.servers, &choice.server) {
+        while let Some(i) = self.sign_in.form.pending.pop_front() {
+            let choice = &self.sign_in.form.choices[i];
+            if already_added(&self.servers, &choice.server, &self.sign_in.form.replacing) {
                 continue;
             }
-            self.server = choice.server.connections[choice.address].uri.clone();
-            self.token = choice.server.access_token.clone().unwrap_or_default();
-            self.connect(ctx, SignIn::PlexToken);
+            self.sign_in.server = choice.server.connections[choice.address].uri.clone();
+            self.sign_in.token = choice.server.access_token.clone().unwrap_or_default();
+            self.connect(ctx, SignInMethod::Token);
             return;
         }
         self.show_connected();
@@ -668,51 +837,74 @@ impl App {
         sections: Vec<Library>,
         session: session::Session,
     ) {
-        self.busy = false;
-        let save_error = if self.remember {
-            session::save(&session).err()
+        self.sign_in.busy = false;
+        let remember = self.sign_in.remember;
+        // Credential Manager can wait on another instance, so the save reports back later.
+        if remember {
+            self.remember_in_background(session.clone());
+        }
+        let replaced = self.servers.iter().position(|s| {
+            self.sign_in
+                .form
+                .replaces(s.session.kind, &s.session.server)
+                && s.session.kind == session.kind
+                && session::origin(&s.session.server) == session::origin(&session.server)
+        });
+        if let Some(index) = replaced {
+            // Signing in again keeps the server's place, name and library choices.
+            let server = &mut self.servers[index];
+            if server.remembered && !remember {
+                // The expired sign-in would otherwise return at the next launch.
+                let previous = server.session.clone();
+                tasks::spawn(move || {
+                    let _ = session::clear(&previous);
+                });
+            }
+            server.session = session;
+            server.source = source;
+            server.sections = sections;
+            server.online = true;
+            server.expired = false;
+            server.remembered = remember;
+            server.check(ctx);
+            self.sign_in.form.replacing = None;
+            self.sign_in.form.added.push(index);
+            if self.active == Some(index) {
+                self.open_server(index, ctx);
+            }
         } else {
-            None
-        };
-        let mut server = Server::new(
-            session,
-            source,
-            sections,
-            self.remember && save_error.is_none(),
-        );
-        if server.prefs.name.is_empty() {
-            let origin = session::origin(&server.session.server);
-            let discovered = self.form.choices.iter().find(|choice| {
-                choice
-                    .server
-                    .connections
-                    .iter()
-                    .any(|connection| session::origin(&connection.uri) == origin)
-            });
-            server.prefs.name = if let Some(choice) = discovered {
-                choice.server.name.clone()
-            } else {
-                let domain = reqwest::Url::parse(server.session.server.trim())
-                    .ok()
-                    .and_then(|url| url.domain()?.split('.').next().map(str::to_owned));
-                let mut name = domain
-                    .unwrap_or_else(|| format!("{} server", server.session.kind.plugin().name));
-                if let Some(initial) = name.get_mut(..1) {
-                    initial.make_ascii_uppercase();
-                }
-                name
-            };
+            let mut server = Server::new(session, source, sections, remember);
+            if server.prefs.name.is_empty() {
+                let origin = session::origin(&server.session.server);
+                let discovered = self.sign_in.form.choices.iter().find(|choice| {
+                    choice
+                        .server
+                        .connections
+                        .iter()
+                        .any(|connection| session::origin(&connection.uri) == origin)
+                });
+                server.prefs.name = if let Some(choice) = discovered {
+                    choice.server.name.clone()
+                } else {
+                    let domain = reqwest::Url::parse(server.session.server.trim())
+                        .ok()
+                        .and_then(|url| url.domain()?.split('.').next().map(str::to_owned));
+                    let mut name = domain
+                        .unwrap_or_else(|| format!("{} server", server.session.kind.plugin().name));
+                    if let Some(initial) = name.get_mut(..1) {
+                        initial.make_ascii_uppercase();
+                    }
+                    name
+                };
+            }
+            let index = self.servers.len();
+            server.prefs.position = index;
+            server.persist();
+            server.check(ctx);
+            self.servers.push(server);
+            self.sign_in.form.added.push(index);
         }
-        let index = self.servers.len();
-        server.prefs.position = index;
-        server.persist();
-        server.check(ctx);
-        self.servers.push(server);
-        self.form.added.push(index);
-        if let Some(message) = save_error {
-            self.form.credential_error = Some(message);
-        }
-        if self.form.pending.is_empty() {
+        if self.sign_in.form.pending.is_empty() {
             self.show_connected();
         } else {
             self.connect_next_plex(ctx);
@@ -721,20 +913,20 @@ impl App {
 
     fn show_connected(&mut self) {
         self.clear_sign_in();
-        self.error = None;
-        self.form.choices.clear();
-        self.form.issues.clear();
-        if let [i] = *self.form.added {
-            self.form.name = self.servers[i].name();
-            self.form.next_focus = Some(NAME);
+        self.sign_in.error = None;
+        self.sign_in.form.choices.clear();
+        self.sign_in.form.issues.clear();
+        if let [i] = *self.sign_in.form.added {
+            self.sign_in.form.name = self.servers[i].name();
+            self.sign_in.form.next_focus = Some(NAME);
         } else {
-            self.form.next_focus = Some("Finish");
+            self.sign_in.form.next_focus = Some("Finish");
         }
     }
 
     fn save_connection_name(&mut self) {
-        if let [i] = *self.form.added {
-            let name = self.form.name.trim();
+        if let [i] = *self.sign_in.form.added {
+            let name = self.sign_in.form.name.trim();
             if !name.is_empty() && self.servers[i].name() != name {
                 self.servers[i].prefs.name = name.to_owned();
                 self.servers[i].persist();
@@ -746,6 +938,7 @@ impl App {
         self.save_connection_name();
         let from_settings = self.adding;
         let last = self
+            .sign_in
             .form
             .added
             .last()
@@ -754,7 +947,7 @@ impl App {
         self.choose_source(None);
         self.adding = false;
         if from_settings {
-            self.form.next_focus = Some("Add server");
+            self.sign_in.form.next_focus = Some("Add server");
         } else if let Some(i) = last {
             self.activate(i);
             self.overview = true;
@@ -762,18 +955,26 @@ impl App {
     }
 
     fn connection_success(&mut self, ui: &mut egui::Ui) {
-        if let [i] = *self.form.added {
+        if let [i] = *self.sign_in.form.added {
             let help = format!(
                 "Shown in the sidebar as {} · name.",
                 self.servers[i].session.kind.plugin().name
             );
-            let field = text_field(ui, NAME, &mut self.form.name, false, &help, None);
-            self.form.focus(NAME, &field);
+            let field = text_field(
+                ui,
+                NAME,
+                &mut self.sign_in.form.name,
+                false,
+                &help,
+                None,
+                None,
+            );
+            self.sign_in.form.focus(NAME, &field);
             if field.lost_focus() {
                 self.save_connection_name();
             }
         }
-        for &i in &self.form.added {
+        for &i in &self.sign_in.form.added {
             let server = &self.servers[i];
             ui.horizontal(|ui| {
                 ui.add(server.icon().image(22.0, TEXT));
@@ -787,10 +988,11 @@ impl App {
                         .map(|lib| lib.title.as_str())
                         .collect::<Vec<_>>()
                         .join(", ");
-                    let text = if n == 0 && server.session.kind == ServerKind::Audiobookshelf {
-                        "Found no audiobook libraries".into()
-                    } else if n == 0 {
-                        "Found no movie or TV libraries".into()
+                    let text = if n == 0 {
+                        format!(
+                            "Found no {} libraries",
+                            server.session.kind.plugin().library_nouns()
+                        )
                     } else {
                         format!(
                             "Found {n} {}: {names}",
@@ -813,7 +1015,7 @@ impl App {
                 Pill::secondary(Icon::Add, "Add another server"),
             );
             let finish = ui.add(finish);
-            self.form.focus("Finish", &finish);
+            self.sign_in.form.focus("Finish", &finish);
             if finish.clicked() {
                 self.finish_connection();
             }
@@ -827,11 +1029,7 @@ impl App {
 
 fn source_tile(ui: &mut egui::Ui, kind: ServerKind, compact: bool) -> egui::Response {
     let title = kind.plugin().name;
-    let description = match kind {
-        ServerKind::Plex => "Movies and TV. Sign in with your Plex account.",
-        ServerKind::Jellyfin => "Movies and TV. Use your server address and Jellyfin account.",
-        ServerKind::Audiobookshelf => "Audiobooks with chapters and bookmarks.",
-    };
+    let description = kind.plugin().description;
     let width = ui.available_width();
     let left = if compact { 76.0 } else { 20.0 };
     let caption = ui.painter().layout(
@@ -882,35 +1080,35 @@ fn source_tile(ui: &mut egui::Ui, kind: ServerKind, compact: bool) -> egui::Resp
 
 impl App {
     fn clear_sign_in(&mut self) {
-        self.login = None; // Dropping Login cancels the Plex worker.
-        self.login_url = None;
-        self.quick_code = None;
-        self.token.clear();
-        self.username.clear();
-        self.password.clear();
-        self.server.clear();
+        self.sign_in.login = None; // Dropping Login cancels the Plex worker.
+        self.sign_in.login_url = None;
+        self.sign_in.quick_code = None;
+        self.sign_in.token.clear();
+        self.sign_in.username.clear();
+        self.sign_in.password.clear();
+        self.sign_in.server.clear();
     }
 
     pub(super) fn choose_source(&mut self, kind: Option<ServerKind>) {
-        let previous = self.form.kind.unwrap_or(ServerKind::Plex);
-        self.generation.fetch_add(1, Ordering::Relaxed);
-        self.busy = false;
+        let previous = self.sign_in.form.kind.unwrap_or(ServerKind::Plex);
+        self.sign_in.generation.fetch_add(1, Ordering::Relaxed);
+        self.sign_in.busy = false;
         self.clear_sign_in();
-        self.error = None;
-        self.remember = cfg!(windows);
-        self.form = Form {
+        self.sign_in.error = None;
+        self.sign_in.remember = cfg!(windows);
+        self.sign_in.form = Form {
             kind,
             next_focus: Some(match kind {
                 None => previous.plugin().name,
-                Some(ServerKind::Jellyfin | ServerKind::Audiobookshelf) => ADDRESS,
-                Some(ServerKind::Plex) => PLEX_SIGN_IN,
+                Some(kind) if kind.plugin().offers(SignInMethod::Account) => PLEX_SIGN_IN,
+                Some(_) => ADDRESS,
             }),
             ..Form::default()
         };
         if !cfg!(test) && kind == Some(ServerKind::Plex) && !self.adding && self.servers.is_empty()
         {
-            self.server = std::env::var("PLEX_URL").unwrap_or_default();
-            self.token = std::env::var("PLEX_TOKEN").unwrap_or_default();
+            self.sign_in.server = std::env::var("PLEX_URL").unwrap_or_default();
+            self.sign_in.token = std::env::var("PLEX_TOKEN").unwrap_or_default();
         }
     }
 
@@ -947,21 +1145,16 @@ impl App {
     }
 
     fn step(&self) -> Step {
-        if !self.form.choices.is_empty() {
+        if !self.sign_in.form.choices.is_empty() {
             Step::PlexChoices
-        } else if !self.form.added.is_empty() {
+        } else if !self.sign_in.form.added.is_empty() {
             Step::Connected
-        } else if self.login.is_some() {
+        } else if self.sign_in.login.is_some() {
             Step::Browser
-        } else if self.quick_code.is_some() {
+        } else if self.sign_in.quick_code.is_some() {
             Step::QuickConnect
         } else {
-            match self.form.kind {
-                Some(ServerKind::Plex) => Step::Plex,
-                Some(ServerKind::Jellyfin) => Step::Jellyfin,
-                Some(ServerKind::Audiobookshelf) => Step::Audiobookshelf,
-                None => Step::Types,
-            }
+            self.sign_in.form.kind.map_or(Step::Types, Step::Form)
         }
     }
     pub(super) fn add_server_dialog(&mut self, ctx: &egui::Context) {
@@ -1004,15 +1197,16 @@ impl App {
             Step::Types if self.adding => "Add a server".into(),
             Step::Types if self.servers.is_empty() => "Make yourself at home.".into(),
             Step::Types => "Add another server".into(),
-            Step::Plex | Step::Browser => "Connect to Plex".into(),
-            Step::Jellyfin => "Connect to Jellyfin".into(),
-            Step::Audiobookshelf => "Connect to Audiobookshelf".into(),
-            Step::QuickConnect => "Jellyfin Quick Connect".into(),
-            Step::PlexChoices => "Choose Plex servers".into(),
-            Step::Connected if self.form.added.len() == 1 => {
-                format!("{} is connected", self.servers[self.form.added[0]].name())
+            Step::Form(_) | Step::Browser => format!("Connect to {}", self.sign_in_plugin().name),
+            Step::QuickConnect => format!("{} Quick Connect", self.sign_in_plugin().name),
+            Step::PlexChoices => format!("Choose {} servers", self.sign_in_plugin().name),
+            Step::Connected if self.sign_in.form.added.len() == 1 => {
+                format!(
+                    "{} is connected",
+                    self.servers[self.sign_in.form.added[0]].name()
+                )
             }
-            Step::Connected => format!("{} servers connected", self.form.added.len()),
+            Step::Connected => format!("{} servers connected", self.sign_in.form.added.len()),
         };
         ui.spacing_mut().item_spacing.y = if step == Step::Types && !self.adding {
             8.0
@@ -1031,7 +1225,7 @@ impl App {
                     ui.painter()
                         .circle_filled(tile.center(), 20.0, Color32::from_rgb(23, 48, 31));
                     Icon::Check.paint(ui, tile.center(), 22.0, GREEN);
-                } else if let Some(kind) = self.form.kind {
+                } else if let Some(kind) = self.sign_in.form.kind {
                     back = ui
                         .add(IconButton::new(Icon::Back, "Back to server types"))
                         .clicked();
@@ -1065,9 +1259,10 @@ impl App {
             return;
         }
         if let Some(error) = self
+            .sign_in
             .error
             .as_ref()
-            .or(self.form.credential_error.as_ref())
+            .or(self.sign_in.form.credential_error.as_ref())
             .cloned()
         {
             egui::Frame::new()
@@ -1079,13 +1274,13 @@ impl App {
                         ui.add(Icon::Alert.image(16.0, ERROR_TEXT));
                         ui.colored_label(ERROR_TEXT, error);
                         if ui.add(IconButton::new(Icon::Dismiss, "Dismiss")).clicked() {
-                            self.error = None;
-                            self.form.credential_error = None;
+                            self.sign_in.error = None;
+                            self.sign_in.form.credential_error = None;
                         }
                     });
                 });
         }
-        if self.form.issues.len() > 1 {
+        if self.sign_in.form.issues.len() > 1 {
             egui::Frame::new()
                 .fill(Color32::from_rgb(44, 26, 26))
                 .inner_margin(12)
@@ -1093,9 +1288,9 @@ impl App {
                 .show(ui, |ui| {
                     ui.label(RichText::new("Check the highlighted fields").color(ERROR_TEXT));
                     ui.horizontal_wrapped(|ui| {
-                        for &field in self.form.issues.keys() {
+                        for &field in self.sign_in.form.issues.keys() {
                             if ui.link(field).clicked() {
-                                self.form.next_focus = Some(field);
+                                self.sign_in.form.next_focus = Some(field);
                             }
                         }
                     });
@@ -1103,8 +1298,10 @@ impl App {
         }
         match step {
             Step::Types => self.source_chooser(ui),
-            Step::Plex => self.plex_form(ui, ctx),
-            Step::Jellyfin | Step::Audiobookshelf => self.password_form(ui, ctx),
+            Step::Form(kind) if kind.plugin().offers(SignInMethod::Account) => {
+                self.plex_form(ui, ctx)
+            }
+            Step::Form(_) => self.password_form(ui, ctx),
             Step::Browser | Step::QuickConnect => self.wait_for_sign_in(ui),
             Step::PlexChoices => self.plex_choices(ui, ctx),
             Step::Connected => self.connection_success(ui),
@@ -1141,7 +1338,7 @@ impl App {
         let compact = ui.ctx().content_rect().width() <= 1000.0;
         let mut tile = |ui: &mut egui::Ui, kind: ServerKind| {
             let button = source_tile(ui, kind, compact);
-            self.form.focus(kind.plugin().name, &button);
+            self.sign_in.form.focus(kind.plugin().name, &button);
             if button.clicked() {
                 self.choose_source(Some(kind));
             }

@@ -10,6 +10,7 @@ mod runtime;
 mod servers;
 mod session;
 use servers::Server;
+mod tasks;
 mod updates;
 mod video;
 
@@ -19,7 +20,8 @@ mod ui_tests;
 use eframe::egui::{self, Color32, RichText, Vec2};
 use icons::Icon;
 use perfuse::{
-    media::{Browse, Item, Kind, Library, Page, Source, Stream},
+    media::{self, Browse, Item, Kind, Library, LibraryKind, Page, Source, SourceError, Stream},
+    metadata,
     plugins::{
         ServerKind,
         plex::{self, auth},
@@ -33,7 +35,7 @@ use std::{
         mpsc::{self, Receiver, Sender},
     },
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 const ACCENT: Color32 = Color32::from_rgb(61, 155, 255);
@@ -80,7 +82,12 @@ const BOOK_CARD_WIDTH: f32 = 184.0;
 const ART_GAP: f32 = 24.0;
 
 fn main() -> eframe::Result {
-    thread::spawn(perfuse::trim_artwork_cache);
+    // Before any other thread starts or any library loads.
+    mpv::harden_dll_search();
+    thread::spawn(|| {
+        perfuse::trim_artwork_cache();
+        player::trim_cache();
+    });
     let mut viewport = egui::ViewportBuilder::default();
     if let Some(icon) = icons::app_icon() {
         viewport = viewport.with_icon(icon);
@@ -104,7 +111,7 @@ fn main() -> eframe::Result {
             if runtime::license_accepted() {
                 app.initialize(&cc.egui_ctx, false);
             } else {
-                app.runtime_prompt = Some(RuntimePrompt::FirstRun {
+                app.runtime.prompt = Some(RuntimePrompt::FirstRun {
                     download: runtime::needed(),
                     error: None,
                 });
@@ -121,23 +128,27 @@ struct Location {
     search: String,
     offset: usize,
     previous_pages: Vec<usize>,
+    /// Visible items on earlier pages. Differs from `offset` when hidden items were skipped.
+    shown: usize,
+    previous_shown: Vec<usize>,
     library: bool,
     parent: Option<Item>,
 }
 
+/// Replies to navigation requests. Sign-in replies use their own channel.
 enum Reply {
-    Connected(Source, Vec<Library>, session::Session),
-    QuickConnectCode(String),
     /// A page plus optional Home Continue Watching and Recently Released rows.
     Page {
         page: Page,
         home_rows: Option<(Vec<Item>, Vec<Item>)>,
         notice: Option<String>,
+        /// A fresh first Home page, kept to show the next time this Home opens.
+        snapshot: Option<metadata::Home>,
     },
     Details(Item),
     Cover(String, egui::ColorImage),
     ArtworkDone,
-    Failed(String),
+    Failed(SourceError),
 }
 
 #[derive(PartialEq)]
@@ -167,47 +178,12 @@ enum SettingsTab {
     Updates,
 }
 
-struct App {
-    settings_tab: SettingsTab,
-    servers: Vec<Server>,
-    active: Option<usize>,
-    overview: bool,
-    adding: bool,
-    removing: Option<(usize, egui::Id)>,
-    next_health_check: Instant,
-    status_popover: servers::HoverPopover,
-    server: String,
-    token: String,
-    form: connection::Form,
-    username: String,
-    password: String,
-    quick_code: Option<String>,
-    client_id: String,
-    source: Option<Source>,
-    sections: Vec<Library>,
-    selected_library: Option<String>,
-    location: Option<Location>,
-    history: Vec<Location>,
-    search: String,
-    page: Option<Page>,
-    home_loaded: bool,
-    on_deck: Vec<Item>,
-    released: Vec<Item>,
-    carousel_offsets: HashMap<&'static str, f32>,
-    covers: Artwork,
-    detail: Option<Item>,
-    version: usize,
-    resume: bool,
-    busy: bool,
-    error: Option<String>,
-    notice: Option<String>,
-    connection_open: bool,
-    generation: Arc<AtomicU64>,
-    tx: Sender<(u64, Reply)>,
-    rx: Receiver<(u64, Reply)>,
+/// Playback engine, video surface and transport state shared by both players.
+struct PlaybackState {
     player: Option<player::Player>,
     surface: Option<video::Surface>,
-    book: audiobooks::BookPlayer,
+    /// Stopped players still saving progress, each with the video surface it renders into.
+    retired: Vec<(player::Retired, Option<video::Surface>)>,
     playing_title: String,
     playing_seconds: f64,
     playing_duration: f64,
@@ -225,21 +201,78 @@ struct App {
     paused: bool,
     playing_format: String,
     speed: f64,
-    login: Option<auth::Login>,
-    login_url: Option<String>,
-    remember: bool,
-    runtime_rx: Option<Receiver<runtime::Update>>,
-    runtime_prompt: Option<RuntimePrompt>,
-    runtime_status: Option<String>,
-    runtime_failed: bool,
-    runtime_action: RuntimeAction,
-    runtime_installed: runtime::Installed,
-    runtime_available: Option<runtime::Available>,
-    runtime_result: Option<Result<String, String>>,
-    client_updates: updates::Updates,
-    next_update_check: Option<Instant>,
-    dismissed_updates: Option<(Option<String>, Option<String>)>,
-    client_after_runtime: Option<updates::Available>,
+}
+
+/// Managed playback runtime setup, inspection and upgrades.
+struct RuntimeState {
+    rx: Option<Receiver<runtime::Update>>,
+    prompt: Option<RuntimePrompt>,
+    status: Option<String>,
+    failed: bool,
+    action: RuntimeAction,
+    installed: runtime::Installed,
+    available: Option<runtime::Available>,
+    result: Option<Result<String, String>>,
+}
+
+/// Perfuse app updates and their schedule.
+#[derive(Default)]
+struct UpdateState {
+    client: updates::Updates,
+    /// Whether this executable is the installed copy that an update replaces.
+    self_install: bool,
+    next_check: Option<Instant>,
+    dismissed: Option<(Option<String>, Option<String>)>,
+    after_runtime: Option<updates::Available>,
+}
+
+/// Servers and navigation. Sign-in, playback and runtime state live in their own groups,
+/// and navigation replies use a channel that sign-in never shares.
+struct App {
+    settings_tab: SettingsTab,
+    servers: Vec<Server>,
+    active: Option<usize>,
+    overview: bool,
+    adding: bool,
+    removing: Option<(usize, egui::Id)>,
+    next_refresh: Instant,
+    /// Saved servers still loading in the background.
+    restoring: Option<Receiver<servers::Startup>>,
+    /// Saved sign-ins that no longer open and can only be forgotten.
+    unreadable: Vec<session::Unreadable>,
+    background_tx: Sender<servers::Background>,
+    background_rx: Receiver<servers::Background>,
+    status_popover: servers::HoverPopover,
+    sign_in: connection::SignIn,
+    source: Option<Source>,
+    sections: Vec<Library>,
+    selected_library: Option<String>,
+    location: Option<Location>,
+    history: Vec<Location>,
+    search: String,
+    page: Option<Page>,
+    home_loaded: bool,
+    on_deck: Vec<Item>,
+    released: Vec<Item>,
+    carousel_offsets: HashMap<&'static str, f32>,
+    covers: Artwork,
+    detail: Option<Item>,
+    version: usize,
+    resume: bool,
+    busy: bool,
+    /// A snapshot is on screen while its fresh replacement loads. Unlike `busy`,
+    /// the user can keep browsing.
+    refreshing: bool,
+    error: Option<String>,
+    notice: Option<String>,
+    connection_open: bool,
+    generation: Arc<AtomicU64>,
+    tx: Sender<(u64, Reply)>,
+    rx: Receiver<(u64, Reply)>,
+    playback: PlaybackState,
+    book: audiobooks::BookPlayer,
+    runtime: RuntimeState,
+    updates: UpdateState,
 }
 
 impl App {
@@ -280,6 +313,7 @@ impl App {
                 .insert(egui::TextStyle::Button, egui::FontId::proportional(15.0));
         });
         let (tx, rx) = mpsc::channel();
+        let (background_tx, background_rx) = mpsc::channel();
         Self {
             settings_tab: SettingsTab::Servers,
             servers: vec![],
@@ -287,22 +321,16 @@ impl App {
             overview: false,
             adding: false,
             removing: None,
-            next_health_check: Instant::now() + Duration::from_secs(60),
+            next_refresh: Instant::now() + servers::REFRESH_INTERVAL,
+            restoring: None,
+            unreadable: Vec::new(),
+            background_tx,
+            background_rx,
             status_popover: servers::HoverPopover::default(),
-            server: std::env::var("PLEX_URL")
-                .unwrap_or_else(|_| plex::PLUGIN.default_address.into()),
-            token: String::new(),
-            form: connection::Form::default(),
-            username: String::new(),
-            password: String::new(),
-            quick_code: None,
-            client_id: format!(
-                "perfuse-{}-{}",
-                std::process::id(),
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
+            sign_in: connection::SignIn::new(
+                std::env::var("PLEX_URL").unwrap_or_else(|_| plex::PLUGIN.default_address.into()),
+                // One stable identity per install, so servers list Perfuse as a single device.
+                prefs::device_id(),
             ),
             source: None,
             sections: vec![],
@@ -320,113 +348,76 @@ impl App {
             version: 0,
             resume: true,
             busy: false,
+            refreshing: false,
             error: None,
             notice: None,
             connection_open: false,
             generation: Arc::new(AtomicU64::new(0)),
             tx,
             rx,
-            player: None,
-            surface: None,
+            playback: PlaybackState {
+                player: None,
+                surface: None,
+                retired: Vec::new(),
+                playing_title: String::new(),
+                playing_seconds: 0.0,
+                playing_duration: 0.0,
+                buffered: 0.0,
+                volume: prefs::Volume::load(),
+                seek_position: None,
+                fullscreen: false,
+                always_on_top: false,
+                overlay_focused: true,
+                overlay_hovered: false,
+                last_playback_interaction: 0.0,
+                video_pointer: None,
+                reveal_motion: None,
+                controls_opacity: 1.0,
+                paused: false,
+                playing_format: String::new(),
+                speed: 1.0,
+            },
             book: Default::default(),
-            playing_title: String::new(),
-            playing_seconds: 0.0,
-            playing_duration: 0.0,
-            buffered: 0.0,
-            volume: prefs::Volume::load(),
-            seek_position: None,
-            fullscreen: false,
-            always_on_top: false,
-            overlay_focused: true,
-            overlay_hovered: false,
-            last_playback_interaction: 0.0,
-            video_pointer: None,
-            reveal_motion: None,
-            controls_opacity: 1.0,
-            paused: false,
-            playing_format: String::new(),
-            speed: 1.0,
-            login: None,
-            login_url: None,
-            remember: cfg!(windows),
-            runtime_rx: None,
-            runtime_prompt: None,
-            runtime_status: None,
-            runtime_failed: false,
-            runtime_action: RuntimeAction::Setup,
-            runtime_installed: runtime::Installed::default(),
-            runtime_available: None,
-            runtime_result: None,
-            client_updates: updates::Updates::default(),
-            next_update_check: None,
-            dismissed_updates: None,
-            client_after_runtime: None,
+            runtime: RuntimeState {
+                rx: None,
+                prompt: None,
+                status: None,
+                failed: false,
+                action: RuntimeAction::Setup,
+                installed: runtime::Installed::default(),
+                available: None,
+                result: None,
+            },
+            updates: UpdateState {
+                self_install: updates::self_install_supported(),
+                ..UpdateState::default()
+            },
         }
     }
 
     fn initialize(&mut self, ctx: &egui::Context, download_approved: bool) {
         if cfg!(all(windows, target_arch = "x86_64")) {
-            self.next_update_check = Some(Instant::now());
+            self.updates.next_check = Some(Instant::now());
         }
         self.restore(ctx);
         if !runtime::needed() {
-            self.runtime_action = RuntimeAction::Inspect;
-            self.runtime_rx = Some(runtime::inspect(ctx.clone()));
+            self.runtime.action = RuntimeAction::Inspect;
+            self.runtime.rx = Some(runtime::inspect(ctx.clone()));
         } else if download_approved {
             self.install_runtime(ctx);
         } else {
-            self.runtime_prompt = Some(RuntimePrompt::Setup);
-        }
-    }
-
-    fn restore(&mut self, ctx: &egui::Context) {
-        let sessions = match session::load() {
-            Ok(sessions) => sessions,
-            Err(error) => {
-                self.error = Some(error);
-                return;
-            }
-        };
-        let single_plex = sessions
-            .iter()
-            .filter(|s| s.kind == ServerKind::Plex)
-            .count()
-            == 1;
-        for mut saved in sessions {
-            if saved.kind == ServerKind::Plex {
-                let matches = session::origin(&saved.server) == session::origin(&self.server);
-                if std::env::var_os("PLEX_URL").is_some() && !matches {
-                    continue;
-                }
-                if let Ok(token) = std::env::var("PLEX_TOKEN") {
-                    if !matches && !single_plex {
-                        continue;
-                    }
-                    saved.token = token.into();
-                }
-            }
-            if let Ok(source) = session::open(&saved) {
-                self.client_id = saved.client_id.clone();
-                let mut server = Server::new(saved, source, vec![], true);
-                server.check(ctx);
-                self.servers.push(server);
-            }
-        }
-        self.servers.sort_by_key(|s| s.prefs.position);
-        if !self.servers.is_empty() {
-            self.activate(0);
-            self.overview = true;
+            self.runtime.prompt = Some(RuntimePrompt::Setup);
         }
     }
 
     fn request_runtime_setup(&mut self) {
-        if self.runtime_rx.is_none() && runtime::needed() {
-            self.runtime_prompt = Some(RuntimePrompt::Setup);
+        if self.runtime.rx.is_none() && runtime::needed() {
+            self.runtime.prompt = Some(RuntimePrompt::Setup);
         }
     }
 
     fn runtime_dialog(&mut self, ctx: &egui::Context) {
-        let Some(prompt) = &self.runtime_prompt else {
+        let Some(prompt) = &self.runtime.prompt else {
             return;
         };
         let first_run = matches!(prompt, RuntimePrompt::FirstRun { .. });
@@ -475,12 +466,12 @@ impl App {
             });
         let (confirm, cancel) = dialog.inner;
         if confirm
-            && self.runtime_rx.is_none()
-            && let Some(prompt) = self.runtime_prompt.take()
+            && self.runtime.rx.is_none()
+            && let Some(prompt) = self.runtime.prompt.take()
         {
             self.confirm_runtime_prompt(ctx, prompt);
         } else if cancel || (!first_run && dialog.should_close()) {
-            self.runtime_prompt = None;
+            self.runtime.prompt = None;
             if first_run {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -492,7 +483,7 @@ impl App {
             RuntimePrompt::FirstRun { download, .. } => match runtime::accept_license() {
                 Ok(()) => self.initialize(ctx, download),
                 Err(error) => {
-                    self.runtime_prompt = Some(RuntimePrompt::FirstRun {
+                    self.runtime.prompt = Some(RuntimePrompt::FirstRun {
                         download,
                         error: Some(error),
                     });
@@ -504,24 +495,26 @@ impl App {
                 }
             }
             RuntimePrompt::Upgrade { libraries, client } => {
-                self.client_after_runtime = client;
-                self.runtime_action = RuntimeAction::Upgrade;
-                self.runtime_failed = false;
-                self.runtime_status = Some("Preparing library update…".into());
-                self.runtime_rx = Some(runtime::upgrade(ctx.clone(), *libraries));
+                self.updates.after_runtime = client;
+                self.runtime.action = RuntimeAction::Upgrade;
+                self.runtime.failed = false;
+                self.runtime.status = Some("Preparing library update…".into());
+                self.runtime.rx = Some(runtime::upgrade(ctx.clone(), *libraries));
             }
         }
     }
 
     fn install_runtime(&mut self, ctx: &egui::Context) {
-        self.runtime_action = RuntimeAction::Setup;
-        self.runtime_failed = false;
-        self.runtime_status = Some("Preparing playback libraries…".into());
-        self.runtime_rx = Some(runtime::start(ctx.clone()));
+        self.runtime.action = RuntimeAction::Setup;
+        self.runtime.failed = false;
+        self.runtime.status = Some("Preparing playback libraries…".into());
+        self.runtime.rx = Some(runtime::start(ctx.clone()));
     }
 
     fn begin(&mut self) -> u64 {
         self.busy = true;
+        // A snapshot refresh still in flight belongs to the view being left.
+        self.refreshing = false;
         self.error = None;
         // Any earlier artwork worker is cancelled with its generation.
         self.covers.loading = false;
@@ -556,11 +549,59 @@ impl App {
             self.carousel_offsets.clear();
         }
         self.covers.loading = true;
+        let full_home = matches!(location.browse, Browse::RecentlyAdded)
+            && !recently_added_only
+            && location.offset == 0
+            && location.search.is_empty();
+        let server = self.active.and_then(|i| self.servers.get(i));
+        let hidden = server.map(|s| s.prefs.hidden.clone()).unwrap_or_default();
+        let store = server
+            .filter(|s| full_home && s.remembered)
+            .map(|s| s.store.clone());
+        // Show the last Home seen for this server while the fresh one loads.
+        if let Some(home) = server.filter(|_| full_home).and_then(|s| s.home.clone()) {
+            self.busy = false;
+            self.refreshing = true;
+            self.home_loaded = true;
+            let visible = |item: &Item| {
+                !item
+                    .library_id
+                    .as_ref()
+                    .is_some_and(|id| hidden.contains(id))
+            };
+            self.on_deck = home.on_deck.into_iter().filter(visible).collect();
+            self.released = home.released.into_iter().filter(visible).collect();
+            let art = page_art(&home.page, Some((&self.on_deck, &self.released)), None);
+            self.page = Some(home.page);
+            let (source, tx, ctx, current) = (
+                source.clone(),
+                self.tx.clone(),
+                ctx.clone(),
+                self.generation.clone(),
+            );
+            tasks::spawn(move || load_artwork(&source, art, generation, &current, &tx, &ctx));
+        }
         let sections = self.sections.clone();
         let continue_heading = self.continue_heading();
         let (tx, ctx, current) = (self.tx.clone(), ctx.clone(), self.generation.clone());
-        thread::spawn(move || {
-            match source.browse(&location.browse, &location.search, location.offset) {
+        tasks::spawn(move || {
+            if current.load(Ordering::Relaxed) != generation {
+                return;
+            }
+            let visible = |item: &Item| {
+                !item
+                    .library_id
+                    .as_ref()
+                    .is_some_and(|id| hidden.contains(id))
+            };
+            let browsed = media::browse_visible(
+                source.as_ref(),
+                &location.browse,
+                &location.search,
+                location.offset,
+                &visible,
+            );
+            match browsed {
                 Ok(page) => {
                     let mut unavailable = vec![];
                     let home_rows = if matches!(location.browse, Browse::RecentlyAdded)
@@ -584,36 +625,25 @@ impl App {
                     let notice = (!unavailable.is_empty()).then(|| {
                         format!("{} is unavailable from this server. You can still browse your libraries.", unavailable.join(" and "))
                     });
-                    let mut art: Vec<_> = page
-                        .items
-                        .iter()
-                        .filter_map(|item| item.thumb.clone())
-                        .collect();
-                    if let Some((on_deck, released)) = &home_rows {
-                        art.extend(
-                            on_deck
-                                .iter()
-                                .chain(released.iter())
-                                .filter_map(|item| item.thumb.clone()),
-                        );
-                        // Landscape Home cards prefer movie backdrops.
-                        art.extend(
-                            on_deck
-                                .iter()
-                                .chain(released.iter())
-                                .filter(|item| item.kind == Kind::Movie)
-                                .filter_map(|item| item.art.clone()),
-                        );
+                    let art = page_art(
+                        &page,
+                        home_rows
+                            .as_ref()
+                            .map(|(on_deck, released)| (&on_deck[..], &released[..])),
+                        location.parent.as_ref(),
+                    );
+                    let snapshot =
+                        home_rows
+                            .as_ref()
+                            .filter(|_| full_home)
+                            .map(|(on_deck, released)| metadata::Home {
+                                page: page.clone(),
+                                on_deck: on_deck.clone(),
+                                released: released.clone(),
+                            });
+                    if let (Some(store), Some(home)) = (&store, &snapshot) {
+                        store.save_home(home);
                     }
-                    if let Some(parent) = &location.parent {
-                        art.extend(
-                            [parent.thumb.clone(), parent.art.clone()]
-                                .into_iter()
-                                .flatten(),
-                        );
-                    }
-                    let mut seen = std::collections::HashSet::new();
-                    art.retain(|path| seen.insert(path.clone()));
                     if tx
                         .send((
                             generation,
@@ -621,6 +651,7 @@ impl App {
                                 page,
                                 home_rows,
                                 notice,
+                                snapshot,
                             },
                         ))
                         .is_err()
@@ -649,6 +680,8 @@ impl App {
             search: String::new(),
             offset: 0,
             previous_pages: vec![],
+            shown: 0,
+            previous_shown: vec![],
             library: true,
             parent: None,
         });
@@ -668,7 +701,10 @@ impl App {
                 item.id.clone(),
                 self.generation.clone(),
             );
-            thread::spawn(move || {
+            tasks::spawn(move || {
+                if current.load(Ordering::Relaxed) != generation {
+                    return;
+                }
                 match source.item(&id) {
                     Ok(item) => {
                         let art: Vec<_> = [item.art.clone(), item.thumb.clone()]
@@ -696,6 +732,8 @@ impl App {
                 search: String::new(),
                 offset: 0,
                 previous_pages: vec![],
+                shown: 0,
+                previous_shown: vec![],
                 library: false,
                 parent: Some(item.clone()),
             });
@@ -706,36 +744,36 @@ impl App {
     fn poll(&mut self, ctx: &egui::Context) {
         self.poll_servers(ctx);
         let mut runtime_finished = None;
-        if let Some(rx) = &self.runtime_rx {
+        if let Some(rx) = &self.runtime.rx {
             while let Ok(update) = rx.try_recv() {
                 match update {
-                    runtime::Update::Status(message) => self.runtime_status = Some(message),
-                    runtime::Update::Libraries(installed) => self.runtime_installed = installed,
+                    runtime::Update::Status(message) => self.runtime.status = Some(message),
+                    runtime::Update::Libraries(installed) => self.runtime.installed = installed,
                     runtime::Update::Available(available) => {
-                        self.runtime_result = Some(Ok(match &available {
+                        self.runtime.result = Some(Ok(match &available {
                             Some(available) => format!("Update available: {}", available.version),
                             None => "Libraries are up to date.".into(),
                         }));
-                        self.runtime_available = available;
+                        self.runtime.available = available;
                     }
                     runtime::Update::Finished(result) => runtime_finished = Some(result),
                 }
             }
         }
         if let Some(result) = runtime_finished {
-            self.runtime_rx = None;
-            self.runtime_failed = result.is_err();
-            self.runtime_status = match result {
-                Err(error) if self.runtime_action == RuntimeAction::Check => {
-                    self.runtime_result = Some(Err(error));
+            self.runtime.rx = None;
+            self.runtime.failed = result.is_err();
+            self.runtime.status = match result {
+                Err(error) if self.runtime.action == RuntimeAction::Check => {
+                    self.runtime.result = Some(Err(error));
                     None
                 }
                 result => result.err(),
             };
-            if let Some(available) = self.client_after_runtime.take()
-                && !self.runtime_failed
+            if let Some(available) = self.updates.after_runtime.take()
+                && !self.runtime.failed
             {
-                self.client_updates.install(ctx, available);
+                self.updates.client.install(ctx, available);
             }
         }
         while let Ok((generation, reply)) = self.rx.try_recv() {
@@ -743,16 +781,19 @@ impl App {
                 continue;
             }
             match reply {
-                Reply::QuickConnectCode(code) => self.quick_code = Some(code),
-                Reply::Connected(source, sections, session) => {
-                    self.connected(ctx, source, sections, session);
-                }
                 Reply::Page {
                     page,
                     home_rows,
                     notice,
+                    snapshot,
                 } => {
                     self.busy = false;
+                    self.refreshing = false;
+                    if let Some(home) = snapshot
+                        && let Some(i) = self.active
+                    {
+                        self.servers[i].home = Some(home);
+                    }
                     if let Some(location) = &mut self.location {
                         location.offset = page.offset;
                     }
@@ -783,42 +824,26 @@ impl App {
                 Reply::ArtworkDone => self.covers.loading = false,
                 Reply::Failed(error) => {
                     self.busy = false;
-                    self.quick_code = None;
-                    self.form.pending.clear();
+                    self.refreshing = false;
                     self.covers.loading = false;
-                    self.error = Some(error);
-                }
-            }
-        }
-        let auth_events: Vec<_> = self
-            .login
-            .as_ref()
-            .map(|login| login.events.try_iter().collect())
-            .unwrap_or_default();
-        for event in auth_events {
-            match event {
-                auth::Event::Browser(url) => {
-                    self.login_url = Some(url.clone());
-                    ctx.open_url(egui::OpenUrl::new_tab(url));
-                }
-                auth::Event::Failed(error) => {
-                    self.login = None;
-                    self.login_url = None;
-                    self.error = Some(error);
-                }
-                auth::Event::SignedIn(servers) => {
-                    self.login = None;
-                    self.login_url = None;
-                    if servers.is_empty() {
-                        self.error = Some("Signed in, but Plex returned no compatible movie or TV servers for this account.".into());
-                    } else {
-                        self.offer_plex_servers(servers);
+                    // Retrying cannot fix a rejected sign-in, so show the way to sign in again.
+                    if error.is_unauthorized()
+                        && let Some(i) = self.active
+                    {
+                        self.servers[i].online = false;
+                        self.servers[i].expired = true;
                     }
+                    self.error = Some(error.into());
                 }
             }
         }
+        self.poll_sign_in(ctx);
+        self.poll_restore(ctx);
+        self.poll_background();
+        self.poll_retired(ctx);
         let mut finished = None;
         while let Some(event) = self
+            .playback
             .player
             .as_ref()
             .and_then(|player| player.events.try_recv().ok())
@@ -831,10 +856,10 @@ impl App {
                     paused,
                     ..
                 } => {
-                    self.playing_seconds = seconds;
-                    self.playing_duration = duration;
-                    self.buffered = buffered;
-                    self.paused = paused;
+                    self.playback.playing_seconds = seconds;
+                    self.playback.playing_duration = duration;
+                    self.playback.buffered = buffered;
+                    self.playback.paused = paused;
                     if !paused || seconds > 0.0 {
                         self.book.completed = false;
                     }
@@ -848,8 +873,10 @@ impl App {
             }
         }
         if let Some(result) = finished {
-            self.player = None;
-            self.surface = None;
+            // Finished is the worker's last act after releasing libmpv, so this join is
+            // immediate. The surface then goes at once instead of covering the UI.
+            self.playback.player = None;
+            self.playback.surface = None;
             if self.book.is_loaded() {
                 match result {
                     Ok(()) => self.book_ended(ctx),
@@ -860,8 +887,8 @@ impl App {
                 }
                 return;
             }
-            self.overlay_focused = true;
-            self.overlay_hovered = false;
+            self.playback.overlay_focused = true;
+            self.playback.overlay_hovered = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(MIN_BROWSE_SIZE));
             let size = ctx.content_rect().size();
             if size.x < MIN_BROWSE_SIZE.x || size.y < MIN_BROWSE_SIZE.y {
@@ -870,8 +897,8 @@ impl App {
                     size.y.max(MIN_BROWSE_SIZE.y),
                 )));
             }
-            if self.fullscreen {
-                self.fullscreen = false;
+            if self.playback.fullscreen {
+                self.playback.fullscreen = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
             }
             match result {
@@ -899,6 +926,8 @@ impl App {
             search: String::new(),
             offset: 0,
             previous_pages: vec![],
+            shown: 0,
+            previous_shown: vec![],
             library: false,
             parent: None,
         });
@@ -927,7 +956,7 @@ impl App {
     }
 
     fn set_always_on_top(&mut self, ctx: &egui::Context, enabled: bool) {
-        self.always_on_top = enabled;
+        self.playback.always_on_top = enabled;
         ctx.send_viewport_cmd_to(
             egui::ViewportId::ROOT,
             egui::ViewportCommand::WindowLevel(if enabled {
@@ -939,7 +968,7 @@ impl App {
     }
 
     fn is_mini_player(&self, ctx: &egui::Context) -> bool {
-        if self.player.is_none() || self.book.is_loaded() || self.fullscreen {
+        if self.playback.player.is_none() || self.book.is_loaded() || self.playback.fullscreen {
             return false;
         }
         let size = ctx.content_rect().size();
@@ -949,14 +978,19 @@ impl App {
     fn page_previous(&mut self, ctx: &egui::Context) {
         if let Some(location) = &mut self.location {
             location.offset = location.previous_pages.pop().unwrap_or(0);
+            location.shown = location.previous_shown.pop().unwrap_or(0);
         }
         self.load_page(ctx, self.selected_library.is_none());
     }
 
     fn page_next(&mut self, ctx: &egui::Context) {
-        if let (Some(location), Some(page)) = (&mut self.location, &self.page) {
+        if let (Some(location), Some(page)) = (&mut self.location, &self.page)
+            && let Some(next) = page.next
+        {
             location.previous_pages.push(location.offset);
-            location.offset = page.offset + page.items.len();
+            location.previous_shown.push(location.shown);
+            location.offset = next;
+            location.shown += page.items.len();
         }
         self.load_page(ctx, self.selected_library.is_none());
     }
@@ -990,7 +1024,7 @@ impl App {
                     }
                 }
                 ui.horizontal_centered(|ui| {
-                    if self.player.is_none() || self.book.is_loaded() {
+                    if self.playback.player.is_none() || self.book.is_loaded() {
                         if ui
                             .add_enabled(
                                 !self.busy
@@ -1011,7 +1045,7 @@ impl App {
                             "Close player and save progress",
                         ))
                         .clicked()
-                        && let Some(player) = &self.player
+                        && let Some(player) = &self.playback.player
                     {
                         player.stop();
                     }
@@ -1042,16 +1076,19 @@ impl App {
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
                 ui.horizontal(|ui| {
-                    let pin_label = if self.always_on_top {
+                    let pin_label = if self.playback.always_on_top {
                         "Disable always on top"
                     } else {
                         "Always on top"
                     };
                     if ui
-                        .add(CaptionButton::new(Caption::Pin, pin_label).active(self.always_on_top))
+                        .add(
+                            CaptionButton::new(Caption::Pin, pin_label)
+                                .active(self.playback.always_on_top),
+                        )
                         .clicked()
                     {
-                        self.set_always_on_top(ctx, !self.always_on_top);
+                        self.set_always_on_top(ctx, !self.playback.always_on_top);
                     }
                     if ui
                         .add(CaptionButton::new(Caption::Minimize, "Minimize"))
@@ -1386,13 +1423,15 @@ impl App {
             location.search = self.search.clone();
             location.offset = 0;
             location.previous_pages.clear();
+            location.shown = 0;
+            location.previous_shown.clear();
         }
         self.load_page(ctx, false);
     }
 
     fn audiobook_server(&self) -> bool {
         self.active
-            .is_some_and(|i| self.servers[i].session.kind == ServerKind::Audiobookshelf)
+            .is_some_and(|i| self.servers[i].session.kind.plugin().audio_only())
     }
 
     fn continue_heading(&self) -> &'static str {
@@ -1475,9 +1514,14 @@ impl App {
                     .add_enabled(!self.busy, IconButton::new(Icon::Refresh, "Refresh"))
                     .clicked()
                 {
+                    // Also refresh the server's libraries and Continue row now, rather
+                    // than at the next background refresh.
+                    if let Some(i) = self.active {
+                        self.servers[i].check(ctx);
+                    }
                     self.load_page(ctx, false);
                 }
-                if self.busy {
+                if self.busy || self.refreshing {
                     ui.spinner();
                 }
                 if searchable {
@@ -1508,11 +1552,11 @@ impl App {
         }
         ui.add_space(34.0);
         if self.sections.is_empty() {
-            ui.heading(if self.audiobook_server() {
-                "No audiobook libraries available"
-            } else {
-                "No movie or TV libraries available"
-            });
+            let nouns = self.active.map_or_else(
+                || "movie or TV".into(),
+                |i| self.servers[i].session.kind.plugin().library_nouns(),
+            );
+            ui.heading(format!("No {nouns} libraries available"));
             ui.label("Check this user's library access on the server, then reconnect in settings.");
             return;
         }
@@ -1532,8 +1576,8 @@ impl App {
                 .as_ref()
                 .filter(|source| self.book.is_current(source, &item.id))
                 .map(|_| BookCardPlayback {
-                    paused: self.paused,
-                    elapsed_ms: (self.playing_seconds * 1000.0) as u64,
+                    paused: self.playback.paused,
+                    elapsed_ms: (self.playback.playing_seconds * 1000.0) as u64,
                     finished: self.book.completed,
                 })
         };
@@ -1604,6 +1648,7 @@ impl App {
                     }
                 }
                 if let Some(page) = &self.page {
+                    let shown = self.location.as_ref().map_or(page.offset, |l| l.shown);
                     let has_previous = self
                         .location
                         .as_ref()
@@ -1635,8 +1680,8 @@ impl App {
                             ui.label(
                                 RichText::new(format!(
                                     "{}–{}{}",
-                                    page.offset + 1,
-                                    page.offset + page.items.len(),
+                                    shown + 1,
+                                    shown + page.items.len(),
                                     page.total.map(|n| format!(" of {n}")).unwrap_or_default()
                                 ))
                                 .size(13.0)
@@ -1942,18 +1987,37 @@ impl App {
         play
     }
 
+    /// Stops the current player without waiting for it. Its video surface stays alive
+    /// until the worker has saved progress and released libmpv.
+    fn retire_player(&mut self) {
+        let surface = self.playback.surface.take();
+        if let Some(player) = self.playback.player.take() {
+            self.playback.retired.push((player.retire(), surface));
+        }
+    }
+
+    fn poll_retired(&mut self, ctx: &egui::Context) {
+        // Each entry drops its finished worker before the surface that worker rendered to.
+        self.playback
+            .retired
+            .retain(|(retired, _)| !retired.is_finished());
+        if !self.playback.retired.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
+    }
+
     fn start_playback(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
         if runtime::needed() {
             self.request_runtime_setup();
             return;
         }
-        if self.runtime_rx.is_some() {
+        if self.runtime.rx.is_some() {
             return;
         }
         let (Some(mut item), Some(source)) = (self.detail.clone(), self.source.clone()) else {
             return;
         };
-        if self.player.is_some() && !self.book.is_loaded() {
+        if self.playback.player.is_some() && !self.book.is_loaded() {
             return;
         }
         let audiobook = item.kind == Kind::Audiobook;
@@ -1973,30 +2037,30 @@ impl App {
             }
         };
         if self.book.is_loaded() {
-            // Join the previous worker so its final progress reaches the original source.
-            self.player = None;
+            // The previous worker still saves its final progress to the original source.
+            self.retire_player();
             self.book_finished();
         }
-        self.playing_title = item.title.clone();
-        self.playing_format = item
+        self.playback.playing_title = item.title.clone();
+        self.playback.playing_format = item
             .versions
             .get(self.version)
             .map(|m| m.label())
             .unwrap_or_default();
-        self.playing_seconds = if self.resume {
+        self.playback.playing_seconds = if self.resume {
             item.resume_ms.unwrap_or(0) as f64 / 1000.0
         } else {
             0.0
         };
-        self.paused = false;
-        self.speed = 1.0;
-        self.playing_duration = item.duration_ms.unwrap_or(0) as f64 / 1000.0;
-        self.buffered = 0.0;
-        self.seek_position = None;
+        self.playback.paused = false;
+        self.playback.speed = 1.0;
+        self.playback.playing_duration = item.duration_ms.unwrap_or(0) as f64 / 1000.0;
+        self.playback.buffered = 0.0;
+        self.playback.seek_position = None;
         self.notice = None;
         self.error = None;
-        self.overlay_focused = true;
-        self.overlay_hovered = false;
+        self.playback.overlay_focused = true;
+        self.playback.overlay_hovered = false;
         if audiobook {
             self.book_started(&item, &source);
         }
@@ -2007,11 +2071,11 @@ impl App {
             player::StartOptions {
                 version: self.version,
                 resume: self.resume,
-                volume: self.volume.gain(),
+                volume: self.playback.volume.gain(),
             },
         );
-        self.player = Some(player);
-        self.surface = surface;
+        self.playback.player = Some(player);
+        self.playback.surface = surface;
         self.connection_open = false;
         if !audiobook {
             ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(MIN_PLAYBACK_SIZE));
@@ -2115,9 +2179,9 @@ impl App {
                         "GitHub",
                         "https://github.com/HammoTime/perfuse-video-player",
                     );
-                    match &self.client_updates.status {
+                    match &self.updates.client.status {
                         Some(Ok(message)) => {
-                            let color = if self.client_updates.busy() {
+                            let color = if self.updates.client.busy() {
                                 MUTED
                             } else {
                                 GREEN
@@ -2134,24 +2198,31 @@ impl App {
                     let (check, update) = Pill::pair(
                         ui,
                         Pill::secondary(Icon::Refresh, "Check for Perfuse updates"),
-                        Pill::secondary(Icon::Refresh, "Update Perfuse"),
+                        Pill::secondary(
+                            Icon::Refresh,
+                            if self.updates.self_install {
+                                "Update Perfuse"
+                            } else {
+                                "Download Perfuse update"
+                            },
+                        ),
                     );
                     if ui
                         .add_enabled(
                             cfg!(all(windows, target_arch = "x86_64"))
-                                && !self.client_updates.busy()
-                                && self.client_after_runtime.is_none(),
+                                && !self.updates.client.busy()
+                                && self.updates.after_runtime.is_none(),
                             check,
                         )
                         .clicked()
                     {
-                        self.dismissed_updates = None;
-                        self.client_updates.check(ctx);
+                        self.updates.dismissed = None;
+                        self.updates.client.check(ctx);
                     }
-                    if self.client_updates.available.is_some()
+                    if self.updates.client.available.is_some()
                         && ui
                             .add_enabled(
-                                self.runtime_rx.is_none() && !self.client_updates.busy(),
+                                self.runtime.rx.is_none() && !self.updates.client.busy(),
                                 update,
                             )
                             .clicked()
@@ -2166,13 +2237,13 @@ impl App {
         ui.heading("3rd party libraries");
         egui::Frame::new().fill(PANEL).corner_radius(0).inner_margin(28).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            if self.runtime_installed.libraries.is_empty() {
-                ui.label(if self.runtime_rx.is_some() { "Reading installed libraries…" } else { "No playback libraries found." });
+            if self.runtime.installed.libraries.is_empty() {
+                ui.label(if self.runtime.rx.is_some() { "Reading installed libraries…" } else { "No playback libraries found." });
             } else {
                 egui::Grid::new("third_party_libraries").num_columns(2).striped(true)
                     .max_col_width((ui.available_width() * 0.55).max(80.0)).show(ui, |ui| {
                         ui.strong("Name"); ui.strong("Version"); ui.end_row();
-                        for library in &self.runtime_installed.libraries {
+                        for library in &self.runtime.installed.libraries {
                             ui.label(&library.name);
                             ui.label(RichText::new(&library.version).color(MUTED));
                             ui.end_row();
@@ -2183,10 +2254,10 @@ impl App {
             ui.horizontal_wrapped(|ui| {
                 ui.style_mut().override_font_id = Some(egui::FontId::proportional(13.0));
                 ui.colored_label(MUTED, "Playback libraries update together as one runtime.");
-                match &self.runtime_result {
+                match &self.runtime.result {
                     Some(Ok(message)) => { ui.colored_label(GREEN, message); }
                     Some(Err(error)) => { ui.colored_label(ERROR_TEXT, error); }
-                    None if self.runtime_action == RuntimeAction::Check && self.runtime_rx.is_some() => {
+                    None if self.runtime.action == RuntimeAction::Check && self.runtime.rx.is_some() => {
                         ui.colored_label(MUTED, "Checking for library updates…");
                     }
                     None => {}
@@ -2197,14 +2268,14 @@ impl App {
                 ui.label("Updates are managed by PERFUSE_LIBMPV. Remove the override to update here.");
             }
             ui.add_space(16.0);
-            let idle = self.runtime_rx.is_none() && self.player.is_none();
+            let idle = self.runtime.rx.is_none() && self.playback.player.is_none();
             ui.horizontal_wrapped(|ui| {
                 let (check, update) = Pill::pair(ui, Pill::secondary(Icon::Refresh, "Check for Updates"), Pill::secondary(Icon::Refresh, "Update"));
                 if ui.add_enabled(idle && cfg!(windows), check).clicked() {
-                    self.dismissed_updates = None;
+                    self.updates.dismissed = None;
                     self.check_runtime(ctx);
                 }
-                if ui.add_enabled(idle && !self.client_updates.downloading && cfg!(windows) && !overridden && self.runtime_available.is_some(), update).clicked() {
+                if ui.add_enabled(idle && !self.updates.client.downloading && cfg!(windows) && !overridden && self.runtime.available.is_some(), update).clicked() {
                     self.update_available(ctx, false);
                 }
             });
@@ -2212,47 +2283,54 @@ impl App {
     }
 
     fn check_runtime(&mut self, ctx: &egui::Context) {
-        self.runtime_action = RuntimeAction::Check;
-        self.runtime_result = None;
-        self.runtime_status = None;
-        self.runtime_failed = false;
-        self.runtime_rx = Some(runtime::check(ctx.clone()));
+        self.runtime.action = RuntimeAction::Check;
+        self.runtime.result = None;
+        self.runtime.status = None;
+        self.runtime.failed = false;
+        self.runtime.rx = Some(runtime::check(ctx.clone()));
     }
 
     fn update_available(&mut self, ctx: &egui::Context, include_client: bool) {
-        let client = self
-            .client_updates
+        let mut client = self
+            .updates
+            .client
             .available
             .clone()
             .filter(|_| include_client);
-        if let Some(libraries) = self.runtime_available.clone()
+        // A development build or portable copy cannot replace itself. Offer the download.
+        if !self.updates.self_install
+            && let Some(available) = client.take()
+        {
+            ctx.open_url(egui::OpenUrl::new_tab(available.release_page()));
+        }
+        if let Some(libraries) = self.runtime.available.clone()
             && std::env::var_os("PERFUSE_LIBMPV").is_none()
         {
-            self.runtime_prompt = Some(RuntimePrompt::Upgrade {
+            self.runtime.prompt = Some(RuntimePrompt::Upgrade {
                 libraries: Box::new(libraries),
                 client,
             });
         } else if let Some(available) = client {
-            self.client_updates.install(ctx, available);
+            self.updates.client.install(ctx, available);
         }
     }
 
     fn poll_updates(&mut self, ctx: &egui::Context) {
-        if self.client_updates.poll() {
+        if self.updates.client.poll() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
-        if let Some(next) = self.next_update_check {
+        if let Some(next) = self.updates.next_check {
             let now = Instant::now();
             if now < next {
                 ctx.request_repaint_after(next - now);
-            } else if self.runtime_prompt.is_none()
-                && self.runtime_rx.is_none()
-                && !self.client_updates.busy()
+            } else if self.runtime.prompt.is_none()
+                && self.runtime.rx.is_none()
+                && !self.updates.client.busy()
             {
-                self.next_update_check = Some(now + UPDATE_INTERVAL);
+                self.updates.next_check = Some(now + UPDATE_INTERVAL);
                 ctx.request_repaint_after(UPDATE_INTERVAL);
-                self.client_updates.check(ctx);
+                self.updates.client.check(ctx);
                 if std::env::var_os("PERFUSE_LIBMPV").is_none() && !runtime::needed() {
                     self.check_runtime(ctx);
                 }
@@ -2262,12 +2340,14 @@ impl App {
 
     fn update_notification(&mut self, ctx: &egui::Context, offset: f32) {
         let client = self
-            .client_updates
+            .updates
+            .client
             .available
             .as_ref()
             .map(|update| update.version.clone());
         let libraries = self
-            .runtime_available
+            .runtime
+            .available
             .as_ref()
             .filter(|_| std::env::var_os("PERFUSE_LIBMPV").is_none())
             .map(|update| update.version.clone());
@@ -2278,7 +2358,7 @@ impl App {
             (None, None) => return,
         };
         let key = (client, libraries);
-        if self.dismissed_updates.as_ref() == Some(&key) {
+        if self.updates.dismissed.as_ref() == Some(&key) {
             return;
         }
         egui::Area::new(egui::Id::new("update_notification"))
@@ -2290,38 +2370,42 @@ impl App {
                     .inner_margin(16)
                     .show(ui, |ui| {
                         ui.strong(title);
-                        if self.client_updates.downloading {
-                            if let Some(Ok(status)) = &self.client_updates.status {
+                        if self.updates.client.downloading {
+                            if let Some(Ok(status)) = &self.updates.client.status {
                                 ui.label(status);
                             }
-                        } else if self.runtime_action == RuntimeAction::Upgrade
-                            && let Some(status) = &self.runtime_status
+                        } else if self.runtime.action == RuntimeAction::Upgrade
+                            && let Some(status) = &self.runtime.status
                         {
-                            let color = if self.runtime_failed {
+                            let color = if self.runtime.failed {
                                 ERROR_TEXT
                             } else {
                                 TEXT
                             };
                             ui.colored_label(color, status);
                         } else if key.0.is_some()
-                            && let Some(Err(error)) = &self.client_updates.status
+                            && let Some(Err(error)) = &self.updates.client.status
                         {
                             ui.colored_label(ERROR_TEXT, error);
                         }
                         ui.horizontal(|ui| {
-                            let action = match (&key.0, &key.1) {
-                                (Some(_), Some(_)) => "Update both and restart",
-                                (Some(_), None) => "Update Perfuse and restart",
+                            let action = match (&key.0, &key.1, self.updates.self_install) {
+                                (Some(_), Some(_), true) => "Update both and restart",
+                                (Some(_), Some(_), false) => {
+                                    "Update libraries and download Perfuse"
+                                }
+                                (Some(_), None, true) => "Update Perfuse and restart",
+                                (Some(_), None, false) => "Download Perfuse",
                                 _ => "Update libraries",
                             };
-                            let idle = self.runtime_rx.is_none() && !self.client_updates.busy();
+                            let idle = self.runtime.rx.is_none() && !self.updates.client.busy();
                             if ui.add_enabled(idle, egui::Button::new(action)).clicked() {
                                 // The root context owns shutdown even when the notification
                                 // is drawn in the native playback overlay.
                                 self.update_available(ctx, key.0.is_some());
                             }
                             if ui.button("Later").clicked() {
-                                self.dismissed_updates = Some(key.clone());
+                                self.updates.dismissed = Some(key.clone());
                             }
                         });
                     });
@@ -2331,11 +2415,12 @@ impl App {
     fn playback_controls_visible(&mut self, ctx: &egui::Context) -> bool {
         // The embedded Win32 child receives mouse movement instead of egui.
         let pointer = self
+            .playback
             .surface
             .as_ref()
             .and_then(video::Surface::pointer_position);
-        let native_moved = pointer.is_some() && pointer != self.video_pointer;
-        self.video_pointer = pointer;
+        let native_moved = pointer.is_some() && pointer != self.playback.video_pointer;
+        self.playback.video_pointer = pointer;
         let (now, moved, active) = ctx.input(|i| {
             let moved = i.pointer.delta() != Vec2::ZERO;
             let active = i.pointer.any_down()
@@ -2350,56 +2435,60 @@ impl App {
                 });
             (i.time, moved || native_moved, active)
         });
-        if !self.fullscreen {
-            self.last_playback_interaction = now;
-            self.reveal_motion = None;
+        if !self.playback.fullscreen {
+            self.playback.last_playback_interaction = now;
+            self.playback.reveal_motion = None;
             // Unfocused always-on-top windows hide controls until hovered so
             // picture-in-picture stays unobstructed while using other apps.
-            if self.surface.is_some() && self.always_on_top && !self.overlay_focused {
-                return self.overlay_hovered
+            if self.playback.surface.is_some()
+                && self.playback.always_on_top
+                && !self.playback.overlay_focused
+            {
+                return self.playback.overlay_hovered
                     || active
                     || egui::Popup::is_any_open(ctx)
-                    || self.runtime_prompt.is_some();
+                    || self.runtime.prompt.is_some();
             }
             return true;
         }
-        let visible = now - self.last_playback_interaction < FULLSCREEN_CONTROLS_SECONDS;
+        let visible = now - self.playback.last_playback_interaction < FULLSCREEN_CONTROLS_SECONDS;
         let reveal = if visible {
-            self.reveal_motion = None;
+            self.playback.reveal_motion = None;
             moved
         } else if moved {
-            let start = match self.reveal_motion {
+            let start = match self.playback.reveal_motion {
                 Some((start, last)) if now - last <= FULLSCREEN_MOTION_GAP_SECONDS => start,
                 _ => now,
             };
-            self.reveal_motion = Some((start, now));
+            self.playback.reveal_motion = Some((start, now));
             now - start >= FULLSCREEN_REVEAL_SECONDS
         } else {
             if self
+                .playback
                 .reveal_motion
                 .is_some_and(|(_, last)| now - last > FULLSCREEN_MOTION_GAP_SECONDS)
             {
-                self.reveal_motion = None;
+                self.playback.reveal_motion = None;
             }
             false
         };
-        if reveal || active || egui::Popup::is_any_open(ctx) || self.runtime_prompt.is_some() {
-            self.last_playback_interaction = now;
-            self.reveal_motion = None;
+        if reveal || active || egui::Popup::is_any_open(ctx) || self.runtime.prompt.is_some() {
+            self.playback.last_playback_interaction = now;
+            self.playback.reveal_motion = None;
         }
-        now - self.last_playback_interaction < FULLSCREEN_CONTROLS_SECONDS
+        now - self.playback.last_playback_interaction < FULLSCREEN_CONTROLS_SECONDS
     }
 
     fn playback_controls(&mut self, ctx: &egui::Context, mini: bool) {
         let controls_visible = self.playback_controls_visible(ctx);
-        self.controls_opacity = ctx.animate_value_with_time(
+        self.playback.controls_opacity = ctx.animate_value_with_time(
             egui::Id::new("playback_controls_fade"),
             if controls_visible { 1.0 } else { 0.0 },
             if controls_visible { 0.3 } else { 0.375 },
         );
-        let opacity = self.controls_opacity;
+        let opacity = self.playback.controls_opacity;
         let bounds = ctx.available_rect();
-        if self.surface.is_none() {
+        if self.playback.surface.is_none() {
             // The headless app-loop tests use the same overlay layout.
             self.playback_overlay(ctx, bounds, opacity, mini);
         } else {
@@ -2424,15 +2513,16 @@ impl App {
                         self.playback_overlay(overlay, bounds, opacity, mini);
                     } else {
                         let state = self
+                            .playback
                             .surface
                             .as_ref()
                             .map(|s| s.prepare_overlay(&title))
                             .unwrap_or_default();
-                        self.overlay_focused = state.focused;
-                        self.overlay_hovered = state.hovered;
+                        self.playback.overlay_focused = state.focused;
+                        self.playback.overlay_hovered = state.hovered;
                         // Keep the transparent overlay mounted while always-on-top
                         // (windowed) so hovering PiP never steals focus via ShowWindow.
-                        let keep_pip_overlay = state.topmost && !self.fullscreen;
+                        let keep_pip_overlay = state.topmost && !self.playback.fullscreen;
                         overlay.send_viewport_cmd(egui::ViewportCommand::Visible(
                             state.ready && (opacity > 0.0 || keep_pip_overlay),
                         ));
@@ -2443,13 +2533,13 @@ impl App {
                         }
                     }
                     self.runtime_dialog(overlay);
-                    if class != egui::ViewportClass::Embedded && self.runtime_prompt.is_none() {
+                    if class != egui::ViewportClass::Embedded && self.runtime.prompt.is_none() {
                         self.playback_shortcuts(overlay);
                     }
                 },
             );
         }
-        if self.runtime_prompt.is_none() {
+        if self.runtime.prompt.is_none() {
             self.playback_shortcuts(ctx);
         }
     }
@@ -2461,10 +2551,10 @@ impl App {
         opacity: f32,
         mini: bool,
     ) {
-        let Some(player) = &self.player else {
+        let Some(player) = &self.playback.player else {
             return;
         };
-        if self.surface.is_some() {
+        if self.playback.surface.is_some() {
             self.handle_window_resize(ctx, egui::ViewportId::ROOT, mini);
         }
         if mini {
@@ -2494,7 +2584,7 @@ impl App {
                     .show(ctx, |ui| {
                         ui.set_opacity(opacity);
                         let size = (bounds.height().min(bounds.width()) * 0.32).clamp(40.0, 56.0);
-                        let (icon, label) = if self.paused {
+                        let (icon, label) = if self.playback.paused {
                             (Icon::Play, "Play")
                         } else {
                             (Icon::Pause, "Pause")
@@ -2521,16 +2611,18 @@ impl App {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    let button = if self.fullscreen {
+                                    let button = if self.playback.fullscreen {
                                         IconButton::new(Icon::FullscreenExit, "Exit fullscreen")
                                     } else {
                                         IconButton::new(Icon::Fullscreen, "Fullscreen")
                                     };
                                     if ui.add(button.size(40.0)).clicked() {
-                                        self.fullscreen = !self.fullscreen;
+                                        self.playback.fullscreen = !self.playback.fullscreen;
                                         ctx.send_viewport_cmd_to(
                                             egui::ViewportId::ROOT,
-                                            egui::ViewportCommand::Fullscreen(self.fullscreen),
+                                            egui::ViewportCommand::Fullscreen(
+                                                self.playback.fullscreen,
+                                            ),
                                         );
                                     }
                                     ui.with_layout(
@@ -2538,14 +2630,14 @@ impl App {
                                         |ui| {
                                             ui.add(
                                                 egui::Label::new(
-                                                    RichText::new(&self.playing_title)
+                                                    RichText::new(&self.playback.playing_title)
                                                         .size(20.0)
                                                         .strong(),
                                                 )
                                                 .truncate(),
                                             );
                                             ui.label(
-                                                RichText::new(if self.paused {
+                                                RichText::new(if self.playback.paused {
                                                     "Paused"
                                                 } else {
                                                     "Now Playing"
@@ -2573,7 +2665,10 @@ impl App {
                             ui.set_width(ui.available_width());
                             ui.spacing_mut().item_spacing = Vec2::new(14.0, 16.0);
                             control_row(ui, 24.0, |ui| {
-                                let position = self.seek_position.unwrap_or(self.playing_seconds);
+                                let position = self
+                                    .playback
+                                    .seek_position
+                                    .unwrap_or(self.playback.playing_seconds);
                                 ui.label(RichText::new(clock(position)).size(13.0));
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
@@ -2582,7 +2677,8 @@ impl App {
                                             RichText::new(format!(
                                                 "−{}",
                                                 clock(
-                                                    (self.playing_duration - self.playing_seconds)
+                                                    (self.playback.playing_duration
+                                                        - self.playback.playing_seconds)
                                                         .max(0.0)
                                                 )
                                             ))
@@ -2593,17 +2689,20 @@ impl App {
                                         let seek = seekbar(
                                             ui,
                                             &mut position,
-                                            self.playing_duration,
-                                            Some(self.playing_seconds + self.buffered),
+                                            self.playback.playing_duration,
+                                            Some(
+                                                self.playback.playing_seconds
+                                                    + self.playback.buffered,
+                                            ),
                                         );
                                         if seek.dragged() {
-                                            self.seek_position = Some(position);
+                                            self.playback.seek_position = Some(position);
                                         }
                                         if seek.drag_stopped()
                                             || (seek.changed() && !seek.dragged())
                                         {
                                             player.seek(position);
-                                            self.seek_position = None;
+                                            self.playback.seek_position = None;
                                         }
                                     },
                                 );
@@ -2613,9 +2712,9 @@ impl App {
                                     .add(IconButton::new(Icon::Back10, "Back 10s").size(44.0))
                                     .clicked()
                                 {
-                                    player.seek(self.playing_seconds - 10.0);
+                                    player.seek(self.playback.playing_seconds - 10.0);
                                 }
-                                let button = if self.paused {
+                                let button = if self.playback.paused {
                                     Pill::primary(Icon::Play, "Play")
                                 } else {
                                     Pill::primary(Icon::Pause, "Pause")
@@ -2630,7 +2729,7 @@ impl App {
                                     .add(IconButton::new(Icon::Forward10, "Forward 10s").size(44.0))
                                     .clicked()
                                 {
-                                    player.seek(self.playing_seconds + 10.0);
+                                    player.seek(self.playback.playing_seconds + 10.0);
                                 }
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
@@ -2638,7 +2737,7 @@ impl App {
                                         ui.label(
                                             RichText::new(format!(
                                                 "Buffered {} / 5:00",
-                                                clock(self.buffered)
+                                                clock(self.playback.buffered)
                                             ))
                                             .size(12.0)
                                             .color(MUTED),
@@ -2646,7 +2745,7 @@ impl App {
                                         badge(ui, Icon::StatusConnected, "Direct Play", GREEN);
                                         ui.add(
                                             egui::Label::new(
-                                                RichText::new(&self.playing_format)
+                                                RichText::new(&self.playback.playing_format)
                                                     .size(12.0)
                                                     .color(MUTED),
                                             )
@@ -2680,13 +2779,16 @@ impl App {
                                     player.subtitles();
                                 }
                                 let speed = ui
-                                    .add(Pill::secondary(Icon::Speed, &format!("{}×", self.speed)))
+                                    .add(Pill::secondary(
+                                        Icon::Speed,
+                                        &format!("{}×", self.playback.speed),
+                                    ))
                                     .on_hover_text("Playback speed");
                                 egui::Popup::menu(&speed).frame(popover_frame()).show(|ui| {
                                     for speed in [0.5, 0.75, 1.0, 1.25, 1.5, 2.0] {
                                         if ui
                                             .selectable_value(
-                                                &mut self.speed,
+                                                &mut self.playback.speed,
                                                 speed,
                                                 format!("{speed}×"),
                                             )
@@ -2719,7 +2821,7 @@ impl App {
                                     |ui| {
                                         ui.spacing_mut().slider_width = 110.0;
                                         ui.visuals_mut().selection.bg_fill = ACCENT;
-                                        let mut gain = self.volume.gain();
+                                        let mut gain = self.playback.volume.gain();
                                         let slider = ui.add(
                                             egui::Slider::new(&mut gain, 0.0..=100.0)
                                                 .show_value(false)
@@ -2737,11 +2839,11 @@ impl App {
                                         let slider = slider
                                             .labelled_by(label.id)
                                             .on_hover_text(format!("Volume {gain:.0}%"));
-                                        if slider.changed() && self.volume.set(gain) {
+                                        if slider.changed() && self.playback.volume.set(gain) {
                                             player.volume(gain);
                                         }
                                         if !slider.dragged() {
-                                            self.volume.save();
+                                            self.playback.volume.save();
                                         }
                                     },
                                 );
@@ -2752,19 +2854,19 @@ impl App {
     }
 
     fn playback_shortcuts(&mut self, ctx: &egui::Context) {
-        let Some(player) = &self.player else {
+        let Some(player) = &self.playback.player else {
             return;
         };
         // Keep shortcuts active even while the fullscreen panels are hidden.
         if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
-            self.fullscreen = !self.fullscreen;
+            self.playback.fullscreen = !self.playback.fullscreen;
             ctx.send_viewport_cmd_to(
                 egui::ViewportId::ROOT,
-                egui::ViewportCommand::Fullscreen(self.fullscreen),
+                egui::ViewportCommand::Fullscreen(self.playback.fullscreen),
             );
         }
-        if self.fullscreen && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.fullscreen = false;
+        if self.playback.fullscreen && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.playback.fullscreen = false;
             ctx.send_viewport_cmd_to(
                 egui::ViewportId::ROOT,
                 egui::ViewportCommand::Fullscreen(false),
@@ -2776,10 +2878,10 @@ impl App {
                     player.pause();
                 }
                 if i.key_pressed(egui::Key::ArrowLeft) {
-                    player.seek(self.playing_seconds - 10.0);
+                    player.seek(self.playback.playing_seconds - 10.0);
                 }
                 if i.key_pressed(egui::Key::ArrowRight) {
-                    player.seek(self.playing_seconds + 10.0);
+                    player.seek(self.playback.playing_seconds + 10.0);
                 }
             });
         }
@@ -2790,7 +2892,7 @@ impl App {
         target: egui::ViewportId,
         allow_top: bool,
     ) -> bool {
-        if self.fullscreen || ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
+        if self.playback.fullscreen || ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
             return false;
         }
         if ctx.dragged_id().is_some() {
@@ -2812,7 +2914,21 @@ impl App {
 
 impl eframe::App for App {
     fn on_exit(&mut self, _: Option<&eframe::glow::Context>) {
-        self.volume.save();
+        self.playback.volume.save();
+        // Flush progress and join each worker before destroying its video surface. A worker
+        // still waiting on the network after the deadline ends with the process, and its
+        // surface is left to Windows rather than destroyed underneath libmpv.
+        self.retire_player();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        for (retired, surface) in self.playback.retired.drain(..) {
+            if retired.wait_until(deadline) {
+                drop(retired);
+                drop(surface);
+            } else {
+                retired.detach();
+                std::mem::forget(surface);
+            }
+        }
     }
 
     fn clear_color(&self, _: &egui::Visuals) -> [f32; 4] {
@@ -2826,15 +2942,20 @@ impl eframe::App for App {
         self.book_tick(ctx);
         self.poll_updates(ctx);
         self.covers.now = ctx.input(|i| i.time);
-        let video_playing = self.player.is_some() && !self.book.is_loaded();
+        let video_playing = self.playback.player.is_some() && !self.book.is_loaded();
         if !video_playing && self.covers.animating() {
             ctx.request_repaint();
         }
-        if self.player.is_some() || self.busy || self.login.is_some() || self.runtime_rx.is_some() {
+        if self.playback.player.is_some()
+            || self.busy
+            || self.sign_in.busy
+            || self.sign_in.login.is_some()
+            || self.runtime.rx.is_some()
+        {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
         let mini = self.is_mini_player(ctx);
-        if !self.fullscreen && !mini {
+        if !self.playback.fullscreen && !mini {
             self.titlebar(ctx);
         }
         if self.source.is_some() && !video_playing {
@@ -2847,7 +2968,8 @@ impl eframe::App for App {
         if !mini
             && ((show_global_error && self.error.is_some())
                 || self.notice.is_some()
-                || self.runtime_status.is_some())
+                || !self.unreadable.is_empty()
+                || self.runtime.status.is_some())
         {
             egui::TopBottomPanel::bottom("messages")
                 .frame(
@@ -2856,14 +2978,14 @@ impl eframe::App for App {
                         .inner_margin(egui::Margin::same(28)),
                 )
                 .show(ctx, |ui| {
-                    if let Some(status) = self.runtime_status.clone() {
+                    if let Some(status) = self.runtime.status.clone() {
                         ui.horizontal_wrapped(|ui| {
-                            if self.runtime_rx.is_some() {
+                            if self.runtime.rx.is_some() {
                                 ui.spinner();
                             }
                             ui.label(status);
-                            if self.runtime_failed
-                                && self.runtime_action == RuntimeAction::Setup
+                            if self.runtime.failed
+                                && self.runtime.action == RuntimeAction::Setup
                                 && ui.button("Retry playback setup").clicked()
                             {
                                 self.request_runtime_setup();
@@ -2879,6 +3001,24 @@ impl eframe::App for App {
                             }
                         });
                     }
+                    if !self.unreadable.is_empty() {
+                        let labels: Vec<_> =
+                            self.unreadable.iter().map(session::Unreadable::label).collect();
+                        let message = match labels.len() {
+                            1 => format!("Perfuse could not open the saved sign-in for {}. Forget it, then sign in again.", labels[0]),
+                            _ => format!("Perfuse could not open {} saved sign-ins: {}. Forget them, then sign in again.", labels.len(), labels.join(", ")),
+                        };
+                        ui.horizontal_wrapped(|ui| {
+                            ui.add(Icon::Alert.image(18.0, ERROR_TEXT));
+                            ui.colored_label(ERROR_TEXT, message);
+                            if ui.add(Pill::secondary(Icon::Forget, "Forget")).clicked() {
+                                self.forget_unreadable();
+                            }
+                            if ui.add(IconButton::new(Icon::Dismiss, "Dismiss")).clicked() {
+                                self.unreadable.clear();
+                            }
+                        });
+                    }
                     if let Some(notice) = self.notice.clone() {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(notice);
@@ -2890,7 +3030,7 @@ impl eframe::App for App {
                 });
         }
         if video_playing {
-            if let Some(surface) = &self.surface {
+            if let Some(surface) = &self.playback.surface {
                 surface.place(ctx.available_rect(), ctx.pixels_per_point());
                 surface.reclaim_keyboard();
             }
@@ -2934,6 +3074,9 @@ impl eframe::App for App {
                     ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
                 } else if self.book.full {
                     self.book_full_player(ui);
+                } else if self.source.is_none() && self.restoring.is_some() {
+                    // Saved servers appear in a moment. Avoid flashing the welcome screen.
+                    ui.centered_and_justified(|ui| ui.spinner());
                 } else if self.source.is_none() {
                     self.onboarding(ui, ctx);
                 } else {
@@ -2957,7 +3100,7 @@ impl eframe::App for App {
             self.start_playback(ctx, frame);
         }
         self.show_book_toast(ctx);
-        if self.surface.is_none() {
+        if self.playback.surface.is_none() {
             if !mini {
                 self.update_notification(ctx, 58.0);
             }
@@ -2966,6 +3109,40 @@ impl eframe::App for App {
         }
         self.handle_window_resize(ctx, egui::ViewportId::ROOT, true);
     }
+}
+
+/// Artwork a page shows: posters, then Home row posters and movie backdrops, then the
+/// parent's hero art. Each path appears once.
+fn page_art(
+    page: &Page,
+    home_rows: Option<(&[Item], &[Item])>,
+    parent: Option<&Item>,
+) -> Vec<String> {
+    let mut art: Vec<_> = page
+        .items
+        .iter()
+        .filter_map(|item| item.thumb.clone())
+        .collect();
+    if let Some((on_deck, released)) = home_rows {
+        let rows = || on_deck.iter().chain(released.iter());
+        art.extend(rows().filter_map(|item| item.thumb.clone()));
+        // Landscape Home cards prefer movie backdrops.
+        art.extend(
+            rows()
+                .filter(|item| item.kind == Kind::Movie)
+                .filter_map(|item| item.art.clone()),
+        );
+    }
+    if let Some(parent) = parent {
+        art.extend(
+            [parent.thumb.clone(), parent.art.clone()]
+                .into_iter()
+                .flatten(),
+        );
+    }
+    let mut seen = std::collections::HashSet::new();
+    art.retain(|path| seen.insert(path.clone()));
+    art
 }
 
 /// Sends cached artwork straight away, then fetches the rest from the server.
@@ -3973,11 +4150,7 @@ fn book_card(
                     }
                 })
             };
-            let author = item
-                .book
-                .as_ref()
-                .map(|book| book.author.as_str())
-                .filter(|s| !s.is_empty());
+            let author = Some(item.book.author.as_str()).filter(|s| !s.is_empty());
             let subtitle = [author, duration.as_deref()]
                 .into_iter()
                 .flatten()
@@ -4369,14 +4542,10 @@ mod tests {
         app.sections.push(Library {
             id: "1".into(),
             title: "Movies".into(),
-            kind: Kind::Movie,
+            kind: LibraryKind::Movies,
         });
         app.selected_library = Some("1".into());
-        app.page = Some(Page {
-            items: vec![item.clone(); 5],
-            offset: 0,
-            total: Some(5),
-        });
+        app.page = Some(Page::new(vec![item.clone(); 5], 0, Some(5)));
         for details in [false, true] {
             app.detail = details.then(|| item.clone());
             let _ = ctx.run(

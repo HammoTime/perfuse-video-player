@@ -1,16 +1,45 @@
 //! The complete session lives in Windows Credential Manager, never a plaintext file.
-use perfuse::media::Source;
 pub use perfuse::plugins::Credentials as Session;
+use perfuse::{media::Source, plugins::OpenOptions};
 
 pub fn open(session: &Session) -> Result<Source, String> {
     if session.client_id.is_empty() || session.client_id.len() > 200 {
         return Err("The saved device identifier is invalid. Sign in again.".into());
     }
-    (session.kind.plugin().open)(session, !cfg!(test))
+    let options = OpenOptions {
+        cache_artwork: !cfg!(test),
+    };
+    (session.kind.plugin().open)(session, options).map_err(String::from)
+}
+
+/// Everything Credential Manager returned. One unreadable entry never hides the others.
+#[derive(Default)]
+pub struct Saved {
+    pub sessions: Vec<Session>,
+    /// Entries that no longer open. They can only be forgotten.
+    pub unreadable: Vec<Unreadable>,
+    /// A failure to list one server type's entries.
+    pub error: Option<String>,
+}
+
+// Deliberately no Debug or secret: only the Credential Manager entry name.
+#[derive(Clone)]
+pub struct Unreadable {
+    target: String,
+}
+
+impl Unreadable {
+    /// Server type and address, such as "Plex · https://media.example.test".
+    pub fn label(&self) -> String {
+        self.target
+            .strip_prefix("Perfuse/")
+            .unwrap_or(&self.target)
+            .replacen('/', " · ", 1)
+    }
 }
 
 #[cfg(windows)]
-pub use windows::{clear, load, save};
+pub use windows::{clear, forget_unreadable, load, save};
 
 pub fn origin(server: &str) -> Option<String> {
     reqwest::Url::parse(server.trim())
@@ -20,7 +49,7 @@ pub fn origin(server: &str) -> Option<String> {
 
 #[cfg(windows)]
 mod windows {
-    use super::Session;
+    use super::{Saved, Session, Unreadable};
     use perfuse::plugins::{BUILTIN, ServerKind};
     use std::{
         fs::{self, File},
@@ -79,23 +108,38 @@ mod windows {
             .map(|id| format!("Perfuse/{}/{id}", session.kind.plugin().name))
             .ok_or_else(|| "Invalid server address.".into())
     }
-    pub fn load() -> Result<Vec<Session>, String> {
-        let mut sessions = Vec::new();
+    pub fn load() -> Saved {
+        let mut saved = Saved::default();
         for plugin in BUILTIN {
-            load_kind(plugin.kind, &mut sessions)?;
+            if let Err(error) = load_kind(plugin.kind, &mut saved) {
+                saved.error = Some(error);
+            }
         }
-        if let Some(legacy) = read(TARGET)?
-            && legacy.kind == ServerKind::Plex
-            && !sessions.iter().any(|s| {
-                s.kind == legacy.kind && super::origin(&s.server) == super::origin(&legacy.server)
-            })
-        {
-            sessions.push(legacy);
+        match read(TARGET) {
+            Ok(Some(legacy))
+                if legacy.kind == ServerKind::Plex
+                    && !saved.sessions.iter().any(|s| {
+                        s.kind == legacy.kind
+                            && super::origin(&s.server) == super::origin(&legacy.server)
+                    }) =>
+            {
+                saved.sessions.push(legacy);
+            }
+            Ok(_) => {}
+            Err(_) => saved.unreadable.push(Unreadable {
+                target: TARGET.into(),
+            }),
         }
-        Ok(sessions)
+        saved
     }
 
-    fn load_kind(kind: ServerKind, sessions: &mut Vec<Session>) -> Result<(), String> {
+    /// Deletes a saved sign-in that no longer opens.
+    pub fn forget_unreadable(entry: &Unreadable) -> Result<(), String> {
+        let _store = lock_store()?;
+        delete(&entry.target)
+    }
+
+    fn load_kind(kind: ServerKind, saved: &mut Saved) -> Result<(), String> {
         let filter = wide(&format!("Perfuse/{}/*", kind.plugin().name));
         let mut count = 0;
         let mut list = std::ptr::null_mut();
@@ -116,14 +160,22 @@ mod windows {
             // SAFETY: releases the entire result returned by CredEnumerateW.
             unsafe { CredFree(list.cast()) };
             for name in names {
-                if let Some(session) = read(&name)?
-                    && session.kind == kind
-                    && target(&session)? == name
-                {
+                let opened = read(&name).and_then(|session| {
+                    let Some(session) = session else {
+                        return Ok(None);
+                    };
+                    if session.kind != kind || target(&session)? != name {
+                        return Err("The saved sign-in does not match its entry.".into());
+                    }
                     if kind == ServerKind::Audiobookshelf {
                         remember(&session, false)?;
                     }
-                    sessions.push(session);
+                    Ok(Some(session))
+                });
+                match opened {
+                    Ok(Some(session)) => saved.sessions.push(session),
+                    Ok(None) => {}
+                    Err(_) => saved.unreadable.push(Unreadable { target: name }),
                 }
             }
         } else if unsafe { GetLastError() } != ERROR_NOT_FOUND {
@@ -164,51 +216,57 @@ mod windows {
         };
         let rotate = save.clone();
         let rotate_name = name.clone();
-        session.token.remember(
-            |token| {
-                if write_now {
-                    let _store = lock_store()?;
-                    save(&name, token.clone())?;
-                }
-                Ok(())
-            },
-            move |pair, refresh| {
-                let store = lock_store()?;
-                let saved = read(&rotate_name)?.and_then(|session| session.token.snapshot());
-                match saved {
-                    Some(saved) if saved.login == pair.login => {
-                        if saved.revision > pair.revision {
-                            *pair = saved;
-                        } else {
-                            refresh(pair)?;
-                            rotate(&rotate_name, pair.clone().into())?;
+        session
+            .token
+            .remember(
+                |token| {
+                    if write_now {
+                        let _store = lock_store()?;
+                        save(&name, token.clone())?;
+                    }
+                    Ok(())
+                },
+                move |pair, refresh| {
+                    let store = lock_store()?;
+                    let saved = read(&rotate_name)?.and_then(|session| session.token.snapshot());
+                    match saved {
+                        Some(saved) if saved.login == pair.login => {
+                            if saved.revision > pair.revision {
+                                *pair = saved;
+                            } else {
+                                refresh(pair)?;
+                                rotate(&rotate_name, pair.clone().into())?;
+                            }
+                            Ok(())
                         }
-                        Ok(())
+                        _ => {
+                            // Another instance removed or replaced the login. Only refresh in memory.
+                            drop(store);
+                            refresh(pair)
+                        }
                     }
-                    _ => {
-                        // Another instance removed or replaced the login. Only refresh in memory.
-                        drop(store);
-                        refresh(pair)
-                    }
-                }
-            },
-        )
+                },
+            )
+            .map_err(String::from)
     }
     pub fn clear(session: &Session) -> Result<(), String> {
         let name = target(session)?;
         if session.kind == ServerKind::Audiobookshelf {
-            return session.token.forget(|expected| {
-                let _store = lock_store()?;
-                if let Some(saved) = read(&name)?
-                    && match expected {
-                        Some(id) => saved.token.snapshot().is_some_and(|pair| pair.login == id),
-                        None => saved.token.fixed().ok() == session.token.fixed().ok(),
+            return session
+                .token
+                .forget(|expected| {
+                    let _store = lock_store()?;
+                    if let Some(saved) = read(&name)?
+                        && match expected {
+                            Some(id) => saved.token.snapshot().is_some_and(|pair| pair.login == id),
+                            None => saved.token.fixed().ok() == session.token.fixed().ok(),
+                        }
+                    {
+                        delete(&name)?;
                     }
-                {
-                    delete(&name)?;
-                }
-                Ok(())
-            });
+                    Ok(())
+                })
+                .map_err(String::from);
         }
         if session.kind == ServerKind::Plex
             && read(TARGET)?
@@ -361,8 +419,12 @@ mod windows {
 }
 
 #[cfg(not(windows))]
-pub fn load() -> Result<Vec<Session>, String> {
-    Ok(vec![])
+pub fn load() -> Saved {
+    Saved::default()
+}
+#[cfg(not(windows))]
+pub fn forget_unreadable(_entry: &Unreadable) -> Result<(), String> {
+    Ok(())
 }
 #[cfg(not(windows))]
 pub fn save(session: &Session) -> Result<(), String> {

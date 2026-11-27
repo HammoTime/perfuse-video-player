@@ -3,34 +3,74 @@ pub mod auth;
 #[cfg(test)]
 mod tests;
 
-use super::{Plugin, ServerKind};
-use crate::{cache::Artwork, http, media::*};
+use super::{Credentials, OpenOptions, Plugin, ServerKind, SignInMethod, SignInRequest};
+use crate::{cache::Artwork, http, media::*, plugins::credentials::lock};
 use reqwest::{
     Url,
     blocking::{Client, RequestBuilder, Response},
     header,
 };
 use serde::{Deserialize, de::DeserializeOwned};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+
+const SERVER: &str = "Jellyfin";
 
 pub static PLUGIN: Plugin = Plugin {
     kind: ServerKind::Jellyfin,
     id: "jellyfin",
-    name: "Jellyfin",
+    name: SERVER,
     default_address: "http://localhost:8096",
-    open: |session, cache| {
+    address_example: "http://192.168.1.30:8096",
+    description: "Movies and TV. Use your server address and Jellyfin account.",
+    libraries: &[LibraryKind::Movies, LibraryKind::Shows],
+    sign_in: &[
+        SignInMethod::Password { required: false },
+        SignInMethod::QuickConnect,
+    ],
+    authenticate,
+    open: |session, options: OpenOptions| {
         Ok(Arc::new(Jellyfin {
             api: Api::new(
                 &session.server,
                 &session.client_id,
                 Some(session.token.fixed()?),
             )?,
-            artwork: Artwork::new(cache),
+            artwork: Artwork::new(options.cache_artwork),
+            views: Mutex::default(),
         }))
     },
 };
 
+fn authenticate(session: &mut Credentials, request: &SignInRequest<'_>) -> SourceResult<()> {
+    let token = match request.method {
+        SignInMethod::Password { .. } => auth::password(
+            &session.server,
+            &session.client_id,
+            request.username,
+            request.password,
+        )?,
+        SignInMethod::QuickConnect => auth::quick_connect(
+            &session.server,
+            &session.client_id,
+            request.show_code,
+            request.cancelled,
+        )?,
+        _ => {
+            return Err(SourceError::Unsupported(
+                "Jellyfin does not offer that sign-in.".into(),
+            ));
+        }
+    };
+    session.token = token.into();
+    Ok(())
+}
+
 const TICKS_PER_MS: u64 = 10_000;
+/// How long Home reuses the library list to tag items with their library.
+const VIEWS_TTL: Duration = Duration::from_secs(15 * 60);
 
 // No Debug: the MediaBrowser header authenticates both API requests and libmpv.
 struct Api {
@@ -68,9 +108,7 @@ impl Api {
     }
 
     fn url(&self, path: &str) -> Url {
-        let mut url = self.base.clone();
-        url.set_path(path);
-        url
+        http::endpoint(&self.base, path)
     }
 
     fn get(&self, path: &str) -> RequestBuilder {
@@ -89,31 +127,23 @@ fn header_parameter(value: &str) -> bool {
             .all(|b| b.is_ascii_graphic() && !matches!(b, b'"' | b'\\' | b','))
 }
 
-fn send(request: RequestBuilder) -> Result<Response, String> {
-    request.send().map_err(|_| {
-        "Cannot reach Jellyfin. Check the address, network, and TLS certificate.".into()
-    })
+fn send(request: RequestBuilder) -> SourceResult<Response> {
+    http::send(request, SERVER)
 }
 
-fn json<T: DeserializeOwned>(request: RequestBuilder) -> Result<T, String> {
-    http::json(send(request)?, "Jellyfin")
+fn json<T: DeserializeOwned>(request: RequestBuilder) -> SourceResult<T> {
+    http::json(send(request)?, SERVER)
 }
 
-fn identifier(id: &str) -> Result<&str, String> {
-    if id.is_empty()
-        || id.len() > 128
-        || !id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
-    {
-        return Err("Jellyfin returned an invalid identifier.".into());
-    }
-    Ok(id)
+fn identifier(id: &str) -> SourceResult<&str> {
+    super::identifier(id, SERVER)
 }
 
 struct Jellyfin {
     api: Api,
     artwork: Artwork,
+    // The last library list, which Home uses to tag Continue Watching and Recently Added.
+    views: Mutex<Option<(Instant, Vec<Library>)>>,
 }
 
 #[derive(Deserialize)]
@@ -181,7 +211,7 @@ fn image_ref(id: &str, kind: &str, tag: Option<&String>) -> Option<String> {
 }
 
 impl Entry {
-    fn into_item(self, library_id: Option<&str>) -> Result<Item, String> {
+    fn into_item(self, library_id: Option<&str>) -> SourceResult<Item> {
         identifier(&self.id)?;
         let thumb = image_ref(
             &self.id,
@@ -211,7 +241,7 @@ impl Entry {
         });
         let user = self.user_data.unwrap_or_default();
         Ok(Item {
-            book: None,
+            book: Book::default(),
             id: self.id,
             title: self.name,
             kind: match self.kind.as_str() {
@@ -302,7 +332,7 @@ impl Jellyfin {
         search: &str,
         offset: usize,
         library: Option<&str>,
-    ) -> Result<Page, String> {
+    ) -> SourceResult<Page> {
         let mut request = request
             .query(&[("startIndex", offset), ("limit", PAGE_SIZE)])
             .query(&[("fields", "Overview"), ("enableUserData", "true")]);
@@ -313,15 +343,15 @@ impl Jellyfin {
         if result.start_index.unwrap_or(0) != offset || result.items.len() > PAGE_SIZE {
             return Err("Jellyfin did not return the requested page. Refresh the library.".into());
         }
-        Ok(Page {
-            items: result
+        Ok(Page::new(
+            result
                 .items
                 .into_iter()
                 .map(|item| item.into_item(library))
                 .collect::<Result<_, _>>()?,
             offset,
-            total: result.total_record_count,
-        })
+            result.total_record_count,
+        ))
     }
 
     fn library_items(
@@ -330,7 +360,7 @@ impl Jellyfin {
         types: &str,
         sort: &str,
         order: &str,
-    ) -> Result<RequestBuilder, String> {
+    ) -> SourceResult<RequestBuilder> {
         Ok(self.api.get("/Items").query(&[
             ("parentId", identifier(&library.id)?),
             ("recursive", "true"),
@@ -341,9 +371,19 @@ impl Jellyfin {
         ]))
     }
 
+    /// The library list, reused for a while so Home does not fetch it for every row.
+    fn views(&self) -> SourceResult<Vec<Library>> {
+        if let Some((fetched, libraries)) = &*lock(&self.views)
+            && fetched.elapsed() < VIEWS_TTL
+        {
+            return Ok(libraries.clone());
+        }
+        self.libraries()
+    }
+
     // Jellyfin Home results do not carry a library ID. Resolve membership in batches
     // so hidden libraries also disappear from cross-server Continue Watching.
-    fn tag_home_libraries(&self, items: &mut [Item]) -> Result<(), String> {
+    fn tag_home_libraries(&self, items: &mut [Item]) -> SourceResult<()> {
         if items.is_empty() {
             return Ok(());
         }
@@ -352,8 +392,8 @@ impl Jellyfin {
             #[serde(rename = "Id")]
             id: String,
         }
-        for library in self.libraries()? {
-            let kind = if library.kind == Kind::Series {
+        for library in self.views()? {
+            let kind = if library.kind == LibraryKind::Shows {
                 Kind::Episode
             } else {
                 Kind::Movie
@@ -388,13 +428,22 @@ impl MediaSource for Jellyfin {
         self.api.base.as_str()
     }
 
-    fn libraries(&self) -> Result<Vec<Library>, String> {
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            recently_released: true,
+            children: true,
+            sign_out: true,
+            ..Capabilities::default()
+        }
+    }
+
+    fn libraries(&self) -> SourceResult<Vec<Library>> {
         let result: Listing<View> = json(self.api.get("/UserViews"))?;
         let mut libraries = Vec::new();
         for view in result.items {
             let kind = match view.collection_type.as_deref() {
-                Some("movies") => Kind::Movie,
-                Some("tvshows") => Kind::Series,
+                Some("movies") => LibraryKind::Movies,
+                Some("tvshows") => LibraryKind::Shows,
                 _ => continue,
             };
             identifier(&view.id)?;
@@ -404,13 +453,14 @@ impl MediaSource for Jellyfin {
                 kind,
             });
         }
+        *lock(&self.views) = Some((Instant::now(), libraries.clone()));
         Ok(libraries)
     }
 
-    fn browse(&self, scope: &Browse, search: &str, offset: usize) -> Result<Page, String> {
+    fn browse(&self, scope: &Browse, search: &str, offset: usize) -> SourceResult<Page> {
         let request = match scope {
             Browse::Library(library) => {
-                let types = if library.kind == Kind::Series {
+                let types = if library.kind == LibraryKind::Shows {
                     "Series"
                 } else {
                     "Movie"
@@ -441,32 +491,26 @@ impl MediaSource for Jellyfin {
             offset,
             None,
         )?;
-        self.tag_home_libraries(&mut page.items)?;
+        // Best effort: untagged items stay visible rather than failing the whole Home row.
+        let _ = self.tag_home_libraries(&mut page.items);
         Ok(page)
     }
 
-    fn recently_released(&self, libraries: &[Library]) -> Result<Vec<Item>, String> {
+    fn recently_released(&self, libraries: &[Library]) -> SourceResult<Vec<Item>> {
         let mut items = Vec::new();
         for library in libraries {
-            let types = if library.kind == Kind::Series {
+            let types = if library.kind == LibraryKind::Shows {
                 "Episode"
             } else {
                 "Movie"
             };
             let request = self.library_items(library, types, "PremiereDate", "Descending")?;
-            items.extend(
-                self.page(request, "", 0, Some(&library.id))?
-                    .items
-                    .into_iter()
-                    .filter(|i| i.playable() && i.release_date.is_some()),
-            );
+            items.extend(self.page(request, "", 0, Some(&library.id))?.items);
         }
-        items.sort_by(|a, b| b.release_date.cmp(&a.release_date));
-        items.truncate(24);
-        Ok(items)
+        Ok(newest_released(items))
     }
 
-    fn item(&self, id: &str) -> Result<Item, String> {
+    fn item(&self, id: &str) -> SourceResult<Item> {
         let entry: Entry = json(self.api.get(&format!("/Items/{}", identifier(id)?)))?;
         if entry.id != id {
             return Err("Jellyfin returned a different item than requested.".into());
@@ -478,7 +522,7 @@ impl MediaSource for Jellyfin {
         self.artwork.cached(self.address(), path)
     }
 
-    fn artwork(&self, path: &str) -> Result<image::RgbaImage, String> {
+    fn artwork(&self, path: &str) -> SourceResult<image::RgbaImage> {
         let mut parts = path.split('/');
         let (Some(id), Some(kind @ ("Primary" | "Backdrop")), Some(tag), None) =
             (parts.next(), parts.next(), parts.next(), parts.next())
@@ -497,7 +541,10 @@ impl MediaSource for Jellyfin {
         self.artwork.fetch(self.address(), path, request)
     }
 
-    fn playback(&self, item: &Item, version: &Version) -> Result<Playback, String> {
+    fn playback(&self, item: &Item, version: &Version, track: usize) -> SourceResult<Playback> {
+        if track != 0 {
+            return Err("Jellyfin versions have a single playable file.".into());
+        }
         let mut url = self
             .api
             .url(&format!("/Videos/{}/stream", identifier(&item.id)?));
@@ -506,11 +553,11 @@ impl MediaSource for Jellyfin {
             .append_pair("mediaSourceId", identifier(version.stream.direct_file()?)?);
         Ok(Playback {
             url,
-            headers: vec![format!("Authorization: {}", self.api.authorization)],
+            headers: vec![Playback::header("authorization", &self.api.authorization)?],
         })
     }
 
-    fn report(&self, item: &Item, version: &Version, progress: Progress) -> Result<(), String> {
+    fn report(&self, item: &Item, version: &Version, progress: Progress) -> SourceResult<()> {
         let path = match progress.state {
             PlaybackState::Started => "/Sessions/Playing",
             PlaybackState::Playing | PlaybackState::Paused => "/Sessions/Playing/Progress",
@@ -524,6 +571,15 @@ impl MediaSource for Jellyfin {
             "PlayMethod": "DirectPlay",
             "CanSeek": true,
         }));
-        http::check_status(send(request)?.status(), "Jellyfin")
+        http::check_status(send(request)?.status(), SERVER)
+    }
+
+    /// Ends this device's session, which revokes its access token on the server.
+    fn sign_out(&self) -> SourceResult<()> {
+        let request = self
+            .api
+            .post("/Sessions/Logout")
+            .timeout(Duration::from_secs(4));
+        http::check_status(send(request)?.status(), SERVER)
     }
 }

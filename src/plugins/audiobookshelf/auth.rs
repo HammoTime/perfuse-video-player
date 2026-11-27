@@ -1,134 +1,19 @@
 //! Audiobookshelf's native-client login and rotating bearer credentials.
-use crate::{http, plugins::Credentials};
+use crate::{
+    http,
+    media::{SourceError, SourceResult},
+    plugins::{Credentials, SessionToken, SignInMethod, SignInRequest, TokenPair},
+};
 use reqwest::{
     StatusCode, Url,
     blocking::{Client, RequestBuilder, Response},
     header::{AUTHORIZATION, HeaderValue},
 };
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::sync::{Arc, Mutex};
+use serde::{Deserialize, de::DeserializeOwned};
+use std::time::Duration;
 
-const SERVER: &str = "Audiobookshelf";
+pub(super) const SERVER: &str = "Audiobookshelf";
 const INVALID: &str = "Invalid Audiobookshelf sign-in. Sign in again.";
-
-// Existing Plex, Jellyfin and legacy Audiobookshelf tokens serialize as plain strings.
-// A rotating pair is shared by the UI, request workers and Credential Manager writer.
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(transparent)]
-pub struct SessionToken(Secret);
-
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(untagged)]
-enum Secret {
-    Fixed(String),
-    Rotating(Arc<Mutex<Tokens>>),
-}
-
-#[derive(Deserialize, Serialize)]
-struct Tokens {
-    #[serde(flatten)]
-    pair: TokenPair,
-    #[serde(skip)]
-    rotate_saved: Option<Box<RotateSaved>>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct TokenPair {
-    // A stable local identity distinguishes a restored login from a replacement account.
-    pub login: u64,
-    pub revision: u64,
-    access: String,
-    refresh: String,
-}
-
-pub type Refresh<'a> = dyn FnMut(&mut TokenPair) -> Result<(), String> + 'a;
-type RotateSaved = dyn Fn(&mut TokenPair, &mut Refresh<'_>) -> Result<(), String> + Send + Sync;
-
-impl From<TokenPair> for SessionToken {
-    fn from(pair: TokenPair) -> Self {
-        Self(Secret::Rotating(Arc::new(Mutex::new(Tokens {
-            pair,
-            rotate_saved: None,
-        }))))
-    }
-}
-
-impl From<String> for SessionToken {
-    fn from(value: String) -> Self {
-        Self(Secret::Fixed(value))
-    }
-}
-
-impl From<&str> for SessionToken {
-    fn from(value: &str) -> Self {
-        Self::from(value.to_owned())
-    }
-}
-
-impl SessionToken {
-    pub fn fixed(&self) -> Result<&str, String> {
-        match &self.0 {
-            Secret::Fixed(value) => Ok(value),
-            Secret::Rotating(_) => Err("This sign-in is for a different media source.".into()),
-        }
-    }
-
-    fn pair(access: String, refresh: String) -> Self {
-        use std::hash::{BuildHasher, RandomState};
-        let login = RandomState::new().hash_one(&refresh);
-        TokenPair {
-            login,
-            revision: 0,
-            access,
-            refresh,
-        }
-        .into()
-    }
-
-    fn access(&self) -> String {
-        match &self.0 {
-            Secret::Fixed(value) => value.clone(),
-            Secret::Rotating(tokens) => tokens.lock().unwrap().pair.access.clone(),
-        }
-    }
-
-    pub fn snapshot(&self) -> Option<TokenPair> {
-        match &self.0 {
-            Secret::Rotating(tokens) => Some(tokens.lock().unwrap().pair.clone()),
-            Secret::Fixed(_) => None,
-        }
-    }
-
-    /// Save a stable snapshot and subscribe to subsequent rotations, or subscribe on restore.
-    pub fn remember(
-        &self,
-        save: impl FnOnce(&SessionToken) -> Result<(), String>,
-        rotate: impl Fn(&mut TokenPair, &mut Refresh<'_>) -> Result<(), String> + Send + Sync + 'static,
-    ) -> Result<(), String> {
-        if let Secret::Rotating(shared) = &self.0 {
-            let mut tokens = shared.lock().unwrap();
-            save(&tokens.pair.clone().into())?;
-            tokens.rotate_saved = Some(Box::new(rotate));
-        } else {
-            save(self)?;
-        }
-        Ok(())
-    }
-
-    pub fn forget(
-        &self,
-        remove: impl FnOnce(Option<u64>) -> Result<(), String>,
-    ) -> Result<(), String> {
-        if let Secret::Rotating(shared) = &self.0 {
-            let mut tokens = shared.lock().unwrap();
-            remove(Some(tokens.pair.login))?;
-            tokens.rotate_saved = None;
-            Ok(())
-        } else {
-            remove(None)
-        }
-    }
-}
 
 #[derive(Deserialize)]
 struct Login {
@@ -152,29 +37,39 @@ fn valid(value: &str) -> bool {
 }
 
 impl UserTokens {
-    fn pair(self) -> Result<(String, String), String> {
+    fn pair(self) -> SourceResult<(String, String)> {
         match (self.access_token, self.refresh_token) {
             (Some(access), Some(refresh)) if valid(&access) && valid(&refresh) => {
                 Ok((access, refresh))
             }
-            _ => Err(INVALID.into()),
+            _ => Err(SourceError::Unauthorized(INVALID.into())),
         }
     }
 }
 
-fn send(request: RequestBuilder) -> Result<Response, String> {
-    request.send().map_err(|_| {
-        "Cannot reach Audiobookshelf. Check the address, network, and TLS certificate.".into()
-    })
+fn send(request: RequestBuilder) -> SourceResult<Response> {
+    http::send(request, SERVER)
 }
 
-fn sensitive(value: &str) -> Result<HeaderValue, String> {
+fn sensitive(value: &str) -> SourceResult<HeaderValue> {
     let mut header = HeaderValue::from_str(value).map_err(|_| INVALID.to_owned())?;
     header.set_sensitive(true);
     Ok(header)
 }
 
-pub fn password(session: &mut Credentials, username: &str, password: &str) -> Result<(), String> {
+pub(super) fn authenticate(
+    session: &mut Credentials,
+    request: &SignInRequest<'_>,
+) -> SourceResult<()> {
+    match request.method {
+        SignInMethod::Password { .. } => password(session, request.username, request.password),
+        _ => Err(SourceError::Unsupported(
+            "Audiobookshelf does not offer that sign-in.".into(),
+        )),
+    }
+}
+
+pub fn password(session: &mut Credentials, username: &str, password: &str) -> SourceResult<()> {
     if username.trim().is_empty() || password.is_empty() {
         return Err("Enter your Audiobookshelf username and password.".into());
     }
@@ -194,7 +89,7 @@ pub fn password(session: &mut Credentials, username: &str, password: &str) -> Re
         user.token.filter(|s| valid(s)).ok_or(INVALID)?.into()
     } else {
         let (access, refresh) = user.pair()?;
-        SessionToken::pair(access, refresh)
+        SessionToken::rotating(access, refresh)
     };
     Ok(())
 }
@@ -202,16 +97,19 @@ pub fn password(session: &mut Credentials, username: &str, password: &str) -> Re
 pub(super) struct Api {
     pub(super) base: Url,
     client: Client,
-    token: SessionToken,
+    pub(super) token: SessionToken,
 }
 
 impl Api {
-    pub(super) fn new(session: &Credentials) -> Result<Self, String> {
+    pub(super) fn new(session: &Credentials) -> SourceResult<Self> {
         let base = http::base_url(&session.server)?;
         if !valid(&session.token.access())
-            || matches!(&session.token.0, Secret::Rotating(tokens) if !valid(&tokens.lock().unwrap().pair.refresh))
+            || session
+                .token
+                .refresh_token()
+                .is_some_and(|refresh| !valid(&refresh))
         {
-            return Err(INVALID.into());
+            return Err(SourceError::Unauthorized(INVALID.into()));
         }
         Ok(Self {
             base,
@@ -221,9 +119,7 @@ impl Api {
     }
 
     pub(super) fn url(&self, path: &str) -> Url {
-        let mut url = self.base.clone();
-        url.set_path(path);
-        url
+        http::endpoint(&self.base, path)
     }
 
     pub(super) fn get(&self, path: &str) -> RequestBuilder {
@@ -239,56 +135,64 @@ impl Api {
         self.client.delete(self.url(path))
     }
 
-    pub(super) fn playback_header(&self, path: &str) -> Result<String, String> {
+    pub(super) fn playback_header(
+        &self,
+        path: &str,
+    ) -> SourceResult<(reqwest::header::HeaderName, HeaderValue)> {
         // A book can be opened after a long pause. Renew an expired bearer before
         // handing the media URL to libmpv, which cannot perform a token exchange.
-        if matches!(self.token.0, Secret::Rotating(_)) {
-            let response = self.send(self.client.head(self.url(path)))?;
-            http::check_status(response.status(), SERVER)?;
+        if self.token.is_rotating() {
+            let request = self
+                .client
+                .head(self.url(path))
+                .timeout(Duration::from_secs(8));
+            http::check_status(self.send(request)?.status(), SERVER)?;
         }
-        Ok(format!("Authorization: Bearer {}", self.token.access()))
+        crate::media::Playback::header("authorization", &format!("Bearer {}", self.token.access()))
     }
 
-    pub(super) fn send(&self, request: RequestBuilder) -> Result<Response, String> {
+    pub(super) fn send(&self, request: RequestBuilder) -> SourceResult<Response> {
         let access = self.token.access();
         let with_token = |req: RequestBuilder, token: &str| {
             send(req.header(AUTHORIZATION, sensitive(&format!("Bearer {token}"))?))
         };
         let retry = request.try_clone();
         let response = with_token(request, &access)?;
-        if response.status() != StatusCode::UNAUTHORIZED {
+        if response.status() != StatusCode::UNAUTHORIZED || !self.token.is_rotating() {
             return Ok(response);
         }
-        let (Secret::Rotating(shared), Some(retry)) = (&self.token.0, retry) else {
+        let Some(retry) = retry else {
             return Ok(response);
         };
         drop(response);
-        let mut tokens = shared.lock().unwrap();
-        // Multiple workers may observe the same 401. Rotate exactly once.
-        if tokens.pair.access == access {
-            let Tokens { pair, rotate_saved } = &mut *tokens;
-            let mut refresh = |pair: &mut TokenPair| {
-                let response = send(
-                    self.post("/auth/refresh")
-                        .header("x-refresh-token", sensitive(&pair.refresh)?),
-                )?;
-                (pair.access, pair.refresh) = http::json::<Login>(response, SERVER)?.user.pair()?;
-                pair.revision = pair.revision.saturating_add(1);
-                Ok(())
-            };
-            if let Some(rotate) = rotate_saved {
-                rotate(pair, &mut refresh)?;
-            } else {
-                refresh(pair)?;
-            }
-        }
-        let access = tokens.pair.access.clone();
-        drop(tokens);
+        // Multiple workers may observe the same 401. The token rotates exactly once.
+        let access = self.token.rotate(&access, &mut |pair: &mut TokenPair| {
+            let response = send(
+                self.post("/auth/refresh")
+                    .header("x-refresh-token", sensitive(&pair.refresh)?),
+            )?;
+            (pair.access, pair.refresh) = http::json::<Login>(response, SERVER)?.user.pair()?;
+            pair.revision = pair.revision.saturating_add(1);
+            Ok(())
+        })?;
         with_token(retry, &access)
     }
 
-    pub(super) fn json<T: DeserializeOwned>(&self, request: RequestBuilder) -> Result<T, String> {
+    pub(super) fn json<T: DeserializeOwned>(&self, request: RequestBuilder) -> SourceResult<T> {
         http::json(self.send(request)?, SERVER)
+    }
+
+    /// Ends the session behind the refresh token, so neither token can be renewed.
+    pub(super) fn sign_out(&self) -> SourceResult<()> {
+        let Some(refresh) = self.token.refresh_token() else {
+            return Ok(());
+        };
+        let response = send(
+            self.post("/logout")
+                .timeout(Duration::from_secs(4))
+                .header("x-refresh-token", sensitive(&refresh)?),
+        )?;
+        http::check_status(response.status(), SERVER)
     }
 }
 
@@ -300,6 +204,7 @@ mod tests {
         plugins::ServerKind,
     };
     use serde_json::{Value, json};
+    use std::sync::{Arc, Mutex};
 
     fn credentials(server: String) -> Credentials {
         Credentials {
@@ -344,10 +249,10 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(
-            api.playback_header("/api/items/book/file/1").unwrap(),
-            "Authorization: Bearer new-access"
-        );
+        let (name, value) = api.playback_header("/api/items/book/file/1").unwrap();
+        assert_eq!(name, "authorization");
+        assert_eq!(value.to_str().unwrap(), "Bearer new-access");
+        assert!(value.is_sensitive());
         let requests = worker.join().unwrap();
         assert!(requests[0].headers.contains("x-return-tokens: true"));
         assert_eq!(
@@ -387,7 +292,7 @@ mod tests {
             ok("GET /api/libraries", Value::Null),
         ]);
         let mut session = credentials(server);
-        session.token = SessionToken::pair("old".into(), "original".into());
+        session.token = SessionToken::rotating("old".into(), "original".into());
         let api = Api::new(&session).unwrap();
         session
             .token
@@ -407,6 +312,30 @@ mod tests {
         let _: Value = api.json(api.get("/api/libraries")).unwrap();
         assert_eq!(session.token.snapshot().unwrap().refresh, "rotated");
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn a_rejected_refresh_reports_an_expired_sign_in() {
+        let (server, worker) = fixture(vec![
+            ("GET /api/libraries", 401, vec![]),
+            ("POST /auth/refresh", 401, vec![]),
+        ]);
+        let mut session = credentials(server);
+        session.token = SessionToken::rotating("old".into(), "revoked".into());
+        let api = Api::new(&session).unwrap();
+        let error = api.json::<Value>(api.get("/api/libraries")).unwrap_err();
+        assert!(error.is_unauthorized());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn sign_out_ends_the_refresh_session() {
+        let (server, worker) = fixture(vec![("POST /logout", 200, vec![])]);
+        let mut session = credentials(server);
+        session.token = SessionToken::rotating("access".into(), "refresh".into());
+        Api::new(&session).unwrap().sign_out().unwrap();
+        let requests = worker.join().unwrap();
+        assert!(requests[0].headers.contains("x-refresh-token: refresh"));
     }
 
     #[test]

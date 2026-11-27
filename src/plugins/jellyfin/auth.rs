@@ -1,5 +1,6 @@
 //! Exchange account credentials or an approved Quick Connect code for a user token.
 use super::{Api, http, json, send};
+use crate::media::SourceResult;
 use serde::Deserialize;
 use std::{
     thread,
@@ -17,7 +18,7 @@ pub fn password(
     device: &str,
     username: &str,
     password: &str,
-) -> Result<String, String> {
+) -> SourceResult<String> {
     if username.trim().is_empty() {
         return Err("Enter your Jellyfin username.".into());
     }
@@ -46,7 +47,7 @@ pub fn quick_connect(
     device: &str,
     show_code: impl FnOnce(String),
     cancelled: impl Fn() -> bool,
-) -> Result<String, String> {
+) -> SourceResult<String> {
     let api = Api::new(server, device, None)?;
     let response = send(api.post("/QuickConnect/Initiate"))?;
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {

@@ -8,9 +8,10 @@ jobs:
   check:
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
@@ -21,7 +22,7 @@ jobs:
         run: cargo test --locked ui_tests::login_snapshots -- --ignored
       - name: Upload rendered UI and visual diffs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: login-ui
           if-no-files-found: ignore
@@ -36,7 +37,7 @@ jobs:
         run: cargo test --locked ui_tests::library_snapshots -- --ignored
       - name: Upload library UI and visual diffs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: library-ui
           if-no-files-found: ignore

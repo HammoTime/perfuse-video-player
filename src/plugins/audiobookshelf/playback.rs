@@ -1,5 +1,5 @@
 use super::{Audiobookshelf, identifier};
-use crate::media::{AudioTrack, Item, Playback, Progress, Stream, Version};
+use crate::media::{AudioTrack, Item, Playback, Progress, SourceResult, Stream, Version};
 use serde::Deserialize;
 use std::time::Duration;
 
@@ -11,7 +11,7 @@ pub(super) struct Track {
     codec: Option<String>,
 }
 
-pub(super) fn version(tracks: Vec<Track>) -> Result<(Version, u64), String> {
+pub(super) fn version(tracks: Vec<Track>) -> SourceResult<(Version, u64)> {
     let audio_codec = tracks.first().and_then(|t| t.codec.clone());
     let mut files = Vec::with_capacity(tracks.len());
     let mut seconds = 0.0_f64;
@@ -44,13 +44,24 @@ pub(super) fn version(tracks: Vec<Track>) -> Result<(Version, u64), String> {
 }
 
 impl Audiobookshelf {
-    pub(super) fn book_playback(&self, item: &Item, version: &Version) -> Result<Playback, String> {
-        let reference = match &version.stream {
-            Stream::Audiobook(tracks) => {
-                &tracks.first().ok_or("This book has no audio tracks.")?.file
-            }
-            stream => stream.direct_file()?,
+    pub(super) fn book_playback(
+        &self,
+        item: &Item,
+        version: &Version,
+        track: usize,
+    ) -> SourceResult<Playback> {
+        let Stream::Audiobook(tracks) = &version.stream else {
+            return Err(version
+                .stream
+                .direct_file()
+                .err()
+                .unwrap_or("This book has no audio tracks.")
+                .into());
         };
+        let reference = &tracks
+            .get(track)
+            .ok_or("This book has no audio track there.")?
+            .file;
         let file = identifier(reference)?;
         let id = identifier(&item.id)?;
         let path = format!("/api/items/{id}/file/{file}");
@@ -65,7 +76,7 @@ impl Audiobookshelf {
         item: &Item,
         _version: &Version,
         progress: Progress,
-    ) -> Result<(), String> {
+    ) -> SourceResult<()> {
         let id = identifier(&item.id)?;
         let duration = progress.duration_ms;
         let position = progress.position_ms.min(duration);
@@ -78,7 +89,7 @@ impl Audiobookshelf {
                 "currentTime": position as f64 / 1000.0,
                 "progress": position as f64 / duration.max(1) as f64,
             }));
-        crate::http::check_status(self.api.send(request)?.status(), "Audiobookshelf")
+        crate::http::check_status(self.api.send(request)?.status(), super::SERVER)
     }
 }
 
@@ -87,7 +98,10 @@ mod tests {
     use super::*;
     use crate::http_fixture::fixture;
     use crate::media::PlaybackState;
-    use crate::plugins::audiobookshelf::{PLUGIN, tests::credentials};
+    use crate::plugins::{
+        OpenOptions,
+        audiobookshelf::{PLUGIN, tests::credentials},
+    };
 
     #[test]
     fn track_references_and_progress_stay_on_the_book_timeline() {
@@ -95,7 +109,7 @@ mod tests {
             ("PATCH /api/me/progress/book", 200, vec![]),
             ("PATCH /api/me/progress/book", 403, vec![]),
         ]);
-        let client = (PLUGIN.open)(&credentials(&origin), false).unwrap();
+        let client = (PLUGIN.open)(&credentials(&origin), OpenOptions::default()).unwrap();
         let item = Item {
             id: "book".into(),
             ..Item::default()
@@ -107,17 +121,21 @@ mod tests {
             panic!("expected tracks");
         };
         assert_eq!(tracks[1].start_ms, 9125);
-        let playback = client.playback(&item, &version).unwrap();
+        let playback = client.playback(&item, &version, 0).unwrap();
         assert_eq!(
             playback.url.as_str(),
             format!("{origin}/api/items/book/file/file1")
         );
-        assert!(
-            playback
-                .headers
-                .iter()
-                .any(|h| h == "Authorization: Bearer test-token")
+        assert_eq!(
+            playback.header_lines(),
+            ["authorization: Bearer test-token"]
         );
+        let second = client.playback(&item, &version, 1).unwrap();
+        assert_eq!(
+            second.url.as_str(),
+            format!("{origin}/api/items/book/file/file2")
+        );
+        assert!(client.playback(&item, &version, 2).is_err());
         let progress = || Progress {
             state: PlaybackState::Stopped,
             position_ms: 9500,

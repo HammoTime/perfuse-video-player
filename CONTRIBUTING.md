@@ -52,15 +52,22 @@ python3 tools/demo_server.py
 
 In **Manual server connection**, connect to `http://127.0.0.1:32499` with the token `demo`. The fixture provides synthetic movies, TV episodes, artwork, a generated audio file and in-memory playback progress. With the fixture running and libmpv available, the optional `cargo test --locked embedded_playback_and_cache -- --ignored` checks in-process playback and buffering.
 
-For a development connection to your own Plex server, `PLEX_URL` and `PLEX_TOKEN` override remembered Plex values or prefill its manual form. All three sources accept HTTP(S) server origins without path prefixes. **Remember me** stores sign-in credentials in Windows Credential Manager. Removing a server in Settings also removes its saved sign-in.
+For a development connection to your own Plex server, `PLEX_URL` and `PLEX_TOKEN` override remembered Plex values or prefill its manual form. All three sources accept HTTP(S) server origins without path prefixes. **Remember me** stores sign-in credentials in Windows Credential Manager, and the last libraries, Continue rows and Home of each remembered server in `%LOCALAPPDATA%\Perfuse\Metadata` so startup shows them before the first refresh. Those snapshots hold no credentials. Servers refresh every 15 minutes, or when you press Refresh on a server's Home. Removing a server in Settings signs out on servers that can revoke the sign-in (Jellyfin and Audiobookshelf), then removes its saved sign-in, preferences and snapshots.
 
 The screenshot tests exercise egui layout and interaction. Use a Windows app build for testing native video output, hardware decoding and actual account sign-in.
 
 ### Media source plugins
 
-The Perfuse library exposes `media::MediaSource` and shared types for libraries, items, versions and playback progress. The compiled-in plugins in `src/plugins/plex/`, `src/plugins/jellyfin/` and `src/plugins/audiobookshelf/` translate server responses into those types and supply authenticated direct-play requests. Plugin registration lives in `src/plugins/mod.rs`.
+The Perfuse library exposes `media::MediaSource` and shared types for libraries, items, versions and playback progress. The compiled-in plugins in `src/plugins/plex/`, `src/plugins/jellyfin/` and `src/plugins/audiobookshelf/` translate server responses into those types and supply authenticated direct-play requests, one track at a time. Plugin registration lives in `src/plugins/mod.rs`.
 
-Run `cargo test --locked --lib plugins::jellyfin` for the Jellyfin protocol tests. Their loopback server exercises account sign-in, Quick Connect, library and Home queries, image fetching, version selection and playback reporting. See AGENTS.md for the request paths and credential format.
+- Each `Plugin` describes its sign-in methods, library types and copy.
+- Each source reports optional features through `capabilities()`.
+- Failures are a typed `SourceError`, so an expired sign-in (`Unauthorized`) is told apart from an unreachable server.
+- Shared credentials, including Audiobookshelf's rotating pair, live in `src/plugins/credentials.rs`. Token exchanges never hold the lock that readers use.
+
+Shared screens use these descriptions instead of checking the server type. Only icons and Plex's account server picker remain type-specific.
+
+Run `cargo test --locked --lib plugins::jellyfin` for the Jellyfin protocol tests. Their loopback server exercises account sign-in, Quick Connect, library and Home queries, image fetching, version selection and playback reporting.
 
 Run `cargo test --locked --lib plugins::audiobookshelf` for the audiobook protocol fixtures. Book positions and bookmarks use time from the start of the book, including for books split across several audio files.
 

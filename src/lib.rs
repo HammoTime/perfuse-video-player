@@ -1,10 +1,12 @@
 //! Perfuse's media model and compiled-in media source plugins.
 
 pub mod media;
+pub mod metadata;
 pub mod plugins;
 
 mod cache;
 mod http;
+pub use http::unencrypted_remote;
 #[cfg(test)]
 #[path = "plugins/http_fixture.rs"]
 mod http_fixture;

@@ -1,31 +1,36 @@
 pub mod auth;
 
-use super::{Plugin, ServerKind};
+use super::{OpenOptions, Plugin, ServerKind, SignInMethod, token_only};
 use crate::{
     cache::Artwork,
     http,
     media::{
-        Browse, Item, Kind, Library, MediaSource, PAGE_SIZE, Page, Playback, PlaybackState,
-        Progress, Stream, Version,
+        Browse, Capabilities, Item, Kind, Library, LibraryKind, MediaSource, PAGE_SIZE, Page,
+        Playback, PlaybackState, Progress, SourceError, SourceResult, Stream, Version,
+        newest_released,
     },
 };
 use reqwest::{Url, blocking::Client, header};
 use serde::Deserialize;
 use std::{sync::Arc, time::Duration};
 
-const RELEASED_LIMIT: usize = 24;
-
 pub static PLUGIN: Plugin = Plugin {
     kind: ServerKind::Plex,
     id: "plex",
     name: "Plex",
     default_address: "http://localhost:32400",
-    open: |credentials, cache_artwork| {
+    address_example: "https://192.168.1.20:32400",
+    description: "Movies and TV. Sign in with your Plex account.",
+    libraries: &[LibraryKind::Movies, LibraryKind::Shows],
+    // Account sign-in runs in the browser and discovers servers through plex.tv.
+    sign_in: &[SignInMethod::Account, SignInMethod::Token],
+    authenticate: token_only,
+    open: |credentials, options: OpenOptions| {
         Ok(Arc::new(Plex::new(
             &credentials.server,
             credentials.token.fixed()?,
             &credentials.client_id,
-            cache_artwork,
+            options.cache_artwork,
         )?))
     },
 };
@@ -82,7 +87,7 @@ impl From<PlexItem> for Item {
     fn from(item: PlexItem) -> Self {
         Self {
             id: item.rating_key,
-            book: None,
+            book: Default::default(),
             library_id: item.library_section_id.and_then(|v| match v {
                 serde_json::Value::String(s) => Some(s),
                 serde_json::Value::Number(n) => Some(n.to_string()),
@@ -232,17 +237,14 @@ impl Plex {
         path: &str,
         query: &[(&str, String)],
         offset: Option<usize>,
-    ) -> Result<Container, String> {
+    ) -> SourceResult<Container> {
         let mut request = self.http.get(self.url(path)?).query(query);
         if let Some(offset) = offset {
             request = request
                 .header("X-Plex-Container-Start", offset)
                 .header("X-Plex-Container-Size", PAGE_SIZE);
         }
-        let response = request.send().map_err(|_| {
-            "Cannot reach Plex. Check the address, network, and TLS certificate.".to_owned()
-        })?;
-        http::json::<Response>(response, "Plex").map(|r| r.container)
+        http::json::<Response>(http::send(request, "Plex")?, "Plex").map(|r| r.container)
     }
 }
 
@@ -251,21 +253,35 @@ impl MediaSource for Plex {
         self.base.as_str()
     }
 
-    fn libraries(&self) -> Result<Vec<Library>, String> {
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            recently_released: true,
+            children: true,
+            ..Capabilities::default()
+        }
+    }
+
+    fn libraries(&self) -> SourceResult<Vec<Library>> {
         Ok(self
             .request("/library/sections", &[], None)?
             .directories
             .into_iter()
-            .filter(|s| matches!(s.kind.as_str(), "movie" | "show"))
-            .map(|s| Library {
-                id: s.key,
-                title: s.title,
-                kind: kind(&s.kind),
+            .filter_map(|s| {
+                let kind = match s.kind.as_str() {
+                    "movie" => LibraryKind::Movies,
+                    "show" => LibraryKind::Shows,
+                    _ => return None,
+                };
+                Some(Library {
+                    id: s.key,
+                    title: s.title,
+                    kind,
+                })
             })
             .collect())
     }
 
-    fn browse(&self, scope: &Browse, search: &str, offset: usize) -> Result<Page, String> {
+    fn browse(&self, scope: &Browse, search: &str, offset: usize) -> SourceResult<Page> {
         let path = match scope {
             Browse::RecentlyAdded => "/library/recentlyAdded".to_owned(),
             Browse::ContinueWatching => "/library/onDeck".to_owned(),
@@ -283,19 +299,19 @@ impl MediaSource for Plex {
                 "Plex did not honor the requested page. Refresh the library to start again.".into(),
             );
         }
-        Ok(Page {
-            offset: result.offset.unwrap_or(0),
-            total: result.total_size,
-            items: result.items.into_iter().map(Item::from).collect(),
-        })
+        Ok(Page::new(
+            result.items.into_iter().map(Item::from).collect(),
+            result.offset.unwrap_or(0),
+            result.total_size,
+        ))
     }
 
     /// Newest movies and episodes by release date across the given libraries.
-    fn recently_released(&self, sections: &[Library]) -> Result<Vec<Item>, String> {
+    fn recently_released(&self, sections: &[Library]) -> SourceResult<Vec<Item>> {
         let mut items = vec![];
         for section in sections {
             // Episodes rather than shows, so new episodes of older series appear.
-            let kind = if section.kind == Kind::Series {
+            let kind = if section.kind == LibraryKind::Shows {
                 "4"
             } else {
                 "1"
@@ -305,27 +321,18 @@ impl MediaSource for Plex {
                 ("sort", "originallyAvailableAt:desc".to_owned()),
             ];
             let result = self.request(&section_path(&section.id)?, &query, Some(0))?;
-            items.extend(
-                result
-                    .items
-                    .into_iter()
-                    .map(Item::from)
-                    .filter(|item| item.playable() && item.release_date.is_some()),
-            );
+            items.extend(result.items.into_iter().map(Item::from));
         }
-        // ISO dates sort chronologically as strings.
-        items.sort_by(|a, b| b.release_date.cmp(&a.release_date));
-        items.truncate(RELEASED_LIMIT);
-        Ok(items)
+        Ok(newest_released(items))
     }
 
-    fn item(&self, id: &str) -> Result<Item, String> {
+    fn item(&self, id: &str) -> SourceResult<Item> {
         self.request(&metadata_path(id)?, &[], None)?
             .items
             .into_iter()
             .next()
             .map(Item::from)
-            .ok_or_else(|| "This item is no longer available.".to_owned())
+            .ok_or_else(|| "This item is no longer available.".into())
     }
 
     /// Artwork from the local disk cache only, without a network request.
@@ -334,7 +341,7 @@ impl MediaSource for Plex {
     }
 
     /// Fetches artwork from the server and stores it in the disk cache.
-    fn artwork(&self, path: &str) -> Result<image::RgbaImage, String> {
+    fn artwork(&self, path: &str) -> SourceResult<image::RgbaImage> {
         let source = self.url(path)?;
         let backdrop = source.path().split('/').any(|part| part == "art");
         let request = self.http.get(self.url("/photo/:/transcode")?).query(&[
@@ -346,7 +353,10 @@ impl MediaSource for Plex {
         self.artwork.fetch(self.address(), path, request)
     }
 
-    fn playback(&self, _: &Item, version: &Version) -> Result<Playback, String> {
+    fn playback(&self, _: &Item, version: &Version, track: usize) -> SourceResult<Playback> {
+        if track != 0 {
+            return Err("Plex versions have a single playable file.".into());
+        }
         let url = self.url(version.stream.direct_file()?)?;
         if !url.path().starts_with("/library/parts/")
             || url
@@ -357,11 +367,11 @@ impl MediaSource for Plex {
         }
         Ok(Playback {
             url,
-            headers: vec![format!("X-Plex-Token: {}", self.token)],
+            headers: vec![Playback::header("x-plex-token", &self.token)?],
         })
     }
 
-    fn report(&self, item: &Item, _: &Version, progress: Progress) -> Result<(), String> {
+    fn report(&self, item: &Item, _: &Version, progress: Progress) -> SourceResult<()> {
         let state = match progress.state {
             PlaybackState::Started => return Ok(()),
             PlaybackState::Playing => "playing",
@@ -380,7 +390,9 @@ impl MediaSource for Plex {
                 ("duration", progress.duration_ms.to_string()),
             ])
             .send()
-            .map_err(|_| "Playback progress could not reach Plex.".to_owned())?;
+            .map_err(|_| {
+                SourceError::Unreachable("Playback progress could not reach Plex.".into())
+            })?;
         http::check_status(response.status(), "Plex")
     }
 }
@@ -441,16 +453,16 @@ mod tests {
         assert!(metadata_path("../1").is_err());
         assert!(section_path("1?token=x").is_err());
         let response: Response = serde_json::from_str(r#"{"MediaContainer":{"offset":36,"totalSize":80,"Metadata":[{"ratingKey":"42","title":"Test","type":"movie","Media":[{"videoCodec":"hevc","Part":[{"key":"/library/parts/4/file.mkv"}]}]}]}}"#).unwrap();
-        let page = Page {
-            items: response
+        let page = Page::new(
+            response
                 .container
                 .items
                 .into_iter()
                 .map(Item::from)
                 .collect(),
-            offset: 36,
-            total: Some(80),
-        };
+            36,
+            Some(80),
+        );
         assert!(page.items[0].playable());
         assert_eq!(
             page.items[0].versions[0].stream.direct_file(),
@@ -509,7 +521,7 @@ mod tests {
         let library = Library {
             id: "1".into(),
             title: "Movies".into(),
-            kind: Kind::Movie,
+            kind: LibraryKind::Movies,
         };
         let page = plex
             .browse(&Browse::Library(library), "quiet orbit", 36)
@@ -517,8 +529,13 @@ mod tests {
         assert_eq!(page.offset, 36);
         assert_eq!(page.items[0].title, "Quiet Orbit");
         assert!(!page.has_next());
-        assert!(plex.libraries().unwrap_err().contains("redirected"));
-        assert!(plex.libraries().unwrap_err().contains("denied access"));
+        assert!(
+            plex.libraries()
+                .unwrap_err()
+                .message()
+                .contains("redirected")
+        );
+        assert!(plex.libraries().unwrap_err().is_unauthorized());
         server.join().unwrap();
     }
 
@@ -561,11 +578,12 @@ mod tests {
             false,
         )
         .unwrap();
-        let sections = [("1", Kind::Movie), ("2", Kind::Series)].map(|(id, kind)| Library {
-            id: id.into(),
-            title: String::new(),
-            kind,
-        });
+        let sections =
+            [("1", LibraryKind::Movies), ("2", LibraryKind::Shows)].map(|(id, kind)| Library {
+                id: id.into(),
+                title: String::new(),
+                kind,
+            });
         let titles: Vec<_> = plex
             .recently_released(&sections)
             .unwrap()

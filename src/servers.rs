@@ -69,10 +69,15 @@ impl HoverPopover {
     }
 }
 
+/// How often servers refresh their libraries and Continue rows in the background.
+/// Refresh in a server's Home forces one sooner.
+pub(super) const REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
 enum Check {
     Libraries(Vec<Library>, Duration),
     Continue(Vec<Item>, Artwork),
-    Offline,
+    Offline(String),
+    Expired,
 }
 
 pub(super) struct Server {
@@ -81,13 +86,19 @@ pub(super) struct Server {
     pub sections: Vec<Library>,
     pub prefs: prefs::LibraryOrder,
     pub online: bool,
+    /// The server rejected this sign-in. Retrying cannot help; signing in again can.
+    pub expired: bool,
     pub dragging_section: Option<usize>,
-    remembered: bool,
+    pub(super) remembered: bool,
     latency: Option<Duration>,
     pending: Option<Receiver<Check>>,
     checking: bool,
+    offline_reason: Option<String>,
     pub(super) items: Vec<Item>,
     pub(super) artwork: Artwork,
+    /// The last Home seen for this server, shown while a fresh one loads.
+    pub(super) home: Option<metadata::Home>,
+    pub(super) store: metadata::Store,
     expanded: Option<bool>,
     rename: Option<String>,
     library_popover: HoverPopover,
@@ -103,22 +114,48 @@ impl Server {
     ) -> Self {
         Self {
             prefs: prefs::load_library_order(&session),
+            store: metadata::Store::new(session.kind.plugin().id, &session.server),
             session,
             source,
             sections,
             online: true,
+            expired: false,
             dragging_section: None,
             remembered,
             latency: None,
             pending: None,
             checking: false,
+            offline_reason: None,
             items: vec![],
             artwork: Artwork::default(),
+            home: None,
             expanded: None,
             rename: None,
             library_popover: HoverPopover::default(),
             focus_remove: false,
         }
+    }
+
+    /// A remembered server shown from its last snapshot until its first refresh.
+    pub fn restored(restored: Restored, ctx: &egui::Context) -> Self {
+        let mut server = Self::new(restored.session, restored.source, vec![], true);
+        if let Some(overview) = restored.overview {
+            server.sections = overview.libraries;
+            server.items = overview.continue_items;
+        }
+        for (path, image) in restored.art {
+            let texture = ctx.load_texture(&path, image, egui::TextureOptions::LINEAR);
+            server.artwork.insert(path, texture);
+        }
+        server.home = restored.home;
+        server
+    }
+
+    /// Stops keeping snapshots for a server whose sign-in is no longer remembered.
+    pub fn forget_snapshots(&mut self) {
+        self.home = None;
+        let store = self.store.clone();
+        tasks::spawn(move || store.forget());
     }
 
     pub fn name(&self) -> String {
@@ -261,59 +298,76 @@ impl Server {
         self.checking = true;
         let (source, ctx) = (self.source.clone(), ctx.clone());
         let mut previous_art = self.artwork.clone();
-        thread::spawn(move || {
+        let store = self.remembered.then(|| self.store.clone());
+        tasks::spawn(move || {
             let start = Instant::now();
-            if let Ok(libraries) = source.libraries() {
-                if tx
-                    .send(Check::Libraries(libraries, start.elapsed()))
-                    .is_err()
-                {
+            let libraries = match source.libraries() {
+                Ok(libraries) => libraries,
+                Err(error) => {
+                    let _ = tx.send(if error.is_unauthorized() {
+                        Check::Expired
+                    } else {
+                        Check::Offline(error.into())
+                    });
+                    ctx.request_repaint();
                     return;
                 }
-                ctx.request_repaint();
-                if let Ok(page) = source.browse(&Browse::ContinueWatching, "", 0) {
-                    let mut artwork = Artwork::default();
-                    for item in &page.items {
-                        let Some(path) = item
-                            .art
-                            .as_ref()
-                            .filter(|_| item.kind == Kind::Movie)
-                            .or(item.thumb.as_ref())
-                        else {
-                            continue;
-                        };
-                        if artwork.contains(path) {
-                            continue;
-                        }
-                        if let Some(texture) = previous_art.textures.remove(path) {
-                            artwork.textures.insert(path.clone(), texture);
-                            continue;
-                        }
-                        if let Some(img) = source
-                            .cached_artwork(path)
-                            .or_else(|| source.artwork(path).ok())
-                        {
-                            let image = egui::ColorImage::from_rgba_unmultiplied(
-                                [img.width() as usize, img.height() as usize],
-                                img.as_raw(),
-                            );
-                            artwork.insert(
-                                path.clone(),
-                                ctx.load_texture(path, image, egui::TextureOptions::LINEAR),
-                            );
-                        }
-                    }
-                    let _ = tx.send(Check::Continue(page.items, artwork));
+            };
+            if tx
+                .send(Check::Libraries(libraries.clone(), start.elapsed()))
+                .is_err()
+            {
+                return;
+            }
+            ctx.request_repaint();
+            if let Ok(page) = source.browse(&Browse::ContinueWatching, "", 0) {
+                if let Some(store) = &store {
+                    store.save_overview(&metadata::Overview {
+                        libraries,
+                        continue_items: page.items.clone(),
+                    });
                 }
-            } else {
-                let _ = tx.send(Check::Offline);
+                let mut artwork = Artwork::default();
+                for item in &page.items {
+                    let Some(path) = item
+                        .art
+                        .as_ref()
+                        .filter(|_| item.kind == Kind::Movie)
+                        .or(item.thumb.as_ref())
+                    else {
+                        continue;
+                    };
+                    if artwork.contains(path) {
+                        continue;
+                    }
+                    if let Some(texture) = previous_art.textures.remove(path) {
+                        artwork.textures.insert(path.clone(), texture);
+                        continue;
+                    }
+                    if let Some(img) = source
+                        .cached_artwork(path)
+                        .or_else(|| source.artwork(path).ok())
+                    {
+                        let image = egui::ColorImage::from_rgba_unmultiplied(
+                            [img.width() as usize, img.height() as usize],
+                            img.as_raw(),
+                        );
+                        artwork.insert(
+                            path.clone(),
+                            ctx.load_texture(path, image, egui::TextureOptions::LINEAR),
+                        );
+                    }
+                }
+                let _ = tx.send(Check::Continue(page.items, artwork));
             }
             drop(tx);
             ctx.request_repaint();
         });
     }
 
-    fn status_row(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    /// Shows the server's status. Returns true when the user asks to sign in again.
+    fn status_row(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> bool {
+        let mut sign_in = false;
         ui.add(egui::Separator::default().spacing(1.0));
         control_row(ui, 58.0, |ui| {
             ui.spacing_mut().item_spacing.x = 12.0;
@@ -342,12 +396,20 @@ impl Server {
                 },
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if offline {
-                    if ui
-                        .add(egui::Button::new("Retry").corner_radius(EDGE))
+                if offline && self.expired {
+                    sign_in = ui
+                        .add(egui::Button::new("Sign in").corner_radius(EDGE))
                         .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .clicked()
-                    {
+                        .clicked();
+                } else if offline {
+                    let retry = ui
+                        .add(egui::Button::new("Retry").corner_radius(EDGE))
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    let retry = match &self.offline_reason {
+                        Some(reason) => retry.on_hover_text(reason),
+                        None => retry,
+                    };
+                    if retry.clicked() {
                         self.check(ctx);
                     }
                 } else {
@@ -355,11 +417,18 @@ impl Server {
                 }
             });
         });
+        sign_in
     }
 
     fn status(&self) -> (Icon, Color32, String) {
         if self.checking {
             (Icon::Refresh, MUTED, "Checking…".into())
+        } else if self.expired {
+            (
+                Icon::StatusOffline,
+                Color32::from_rgb(255, 138, 128),
+                "Sign-in expired".into(),
+            )
         } else if !self.online {
             (
                 Icon::StatusOffline,
@@ -388,6 +457,7 @@ impl App {
         self.sections = server.libraries();
         self.generation.fetch_add(1, Ordering::Relaxed);
         self.busy = false;
+        self.refreshing = false;
         self.history.clear();
         self.detail = None;
         self.location = None;
@@ -404,15 +474,12 @@ impl App {
     }
 
     pub(super) fn poll_servers(&mut self, ctx: &egui::Context) {
-        let due = Instant::now() >= self.next_health_check;
+        let due = Instant::now() >= self.next_refresh;
         if due {
-            self.next_health_check = Instant::now() + Duration::from_secs(60);
+            self.next_refresh = Instant::now() + REFRESH_INTERVAL;
         }
         if !self.servers.is_empty() {
-            ctx.request_repaint_after(
-                self.next_health_check
-                    .saturating_duration_since(Instant::now()),
-            );
+            ctx.request_repaint_after(self.next_refresh.saturating_duration_since(Instant::now()));
         }
         for (i, s) in self.servers.iter_mut().enumerate() {
             if due {
@@ -422,6 +489,8 @@ impl App {
                 match rx.try_recv() {
                     Ok(Check::Libraries(libs, latency)) => {
                         s.online = true;
+                        s.expired = false;
+                        s.offline_reason = None;
                         s.checking = false;
                         s.latency = Some(latency);
                         s.sections = libs;
@@ -433,9 +502,15 @@ impl App {
                         s.items = items;
                         s.artwork = art;
                     }
-                    Ok(Check::Offline) => {
+                    Ok(Check::Offline(reason)) => {
                         s.checking = false;
                         s.online = false;
+                        s.offline_reason = Some(reason);
+                    }
+                    Ok(Check::Expired) => {
+                        s.checking = false;
+                        s.online = false;
+                        s.expired = true;
                     }
                     Err(mpsc::TryRecvError::Disconnected) => {
                         s.pending = None;
@@ -618,6 +693,7 @@ impl App {
         if !open {
             return;
         }
+        let mut sign_in = None;
         let panel = popup
             .close_behavior(egui::PopupCloseBehavior::IgnoreClicks)
             .show(|ui| {
@@ -634,7 +710,9 @@ impl App {
                     .max_height(max_height)
                     .show(ui, |ui| {
                         for (i, server) in self.servers.iter_mut().enumerate() {
-                            ui.push_id(i, |ui| server.status_row(ui, ctx));
+                            if ui.push_id(i, |ui| server.status_row(ui, ctx)).inner {
+                                sign_in = Some(i);
+                            }
                         }
                     });
                 ui.add(egui::Separator::default().spacing(1.0));
@@ -679,6 +757,10 @@ impl App {
                 });
             });
         self.status_popover.dismiss_if_closed(panel, &response);
+        if let Some(i) = sign_in {
+            self.status_popover = HoverPopover::Closed;
+            self.sign_in_again(i);
+        }
     }
 
     pub(super) fn servers_home(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -857,8 +939,9 @@ impl App {
                                             .book
                                             .is_current(&server.source, &entry.id)
                                             .then_some(BookCardPlayback {
-                                                paused: self.paused,
-                                                elapsed_ms: (self.playing_seconds * 1000.0) as u64,
+                                                paused: self.playback.paused,
+                                                elapsed_ms: (self.playback.playing_seconds * 1000.0)
+                                                    as u64,
                                                 finished: self.book.completed,
                                             });
                                         book_card(ui, entry, &server.artwork, width, playing)
@@ -923,7 +1006,27 @@ impl App {
 
     pub(super) fn offline_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         if let Some(i) = self.active {
+            if self.servers[i].expired {
+                ui.heading(format!("Sign in to {} again", self.servers[i].name()));
+                ui.label(
+                    RichText::new(format!(
+                        "{} no longer accepts the saved sign-in. It may have expired or been revoked.",
+                        self.servers[i].name()
+                    ))
+                    .color(MUTED),
+                );
+                if ui
+                    .add(Pill::primary(Icon::SignInBrowser, "Sign in again"))
+                    .clicked()
+                {
+                    self.sign_in_again(i);
+                }
+                return;
+            }
             ui.heading(format!("Can't reach {}", self.servers[i].name()));
+            if let Some(reason) = &self.servers[i].offline_reason {
+                ui.label(RichText::new(reason).color(MUTED));
+            }
             if ui
                 .button("Try again")
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -943,6 +1046,7 @@ impl App {
     }
 
     pub(super) fn server_settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let background = self.background_tx.clone();
         let count = self.servers.len();
         let online = self
             .servers
@@ -971,7 +1075,7 @@ impl App {
                 .corner_radius(0)
                 .min_size(Vec2::new(108.0, 36.0));
                 let button = ui.add_enabled(!self.busy, add);
-                self.form.focus("Add server", &button);
+                self.sign_in.form.focus("Add server", &button);
                 if button.clicked() {
                     self.adding = true;
                     self.choose_source(None);
@@ -1207,15 +1311,25 @@ impl App {
                                     )
                                     .changed()
                                 {
-                                    let result = if remembered {
-                                        session::save(&s.session)
-                                    } else {
-                                        session::clear(&s.session)
-                                    };
-                                    match result {
-                                        Ok(()) => s.remembered = remembered,
-                                        Err(error) => self.error = Some(error),
+                                    // Credential Manager can wait on another instance's lock.
+                                    s.remembered = remembered;
+                                    if !remembered {
+                                        s.forget_snapshots();
                                     }
+                                    let (session, tx) = (s.session.clone(), background.clone());
+                                    tasks::spawn(move || {
+                                        let result = if remembered {
+                                            session::save(&session)
+                                        } else {
+                                            session::clear(&session)
+                                        };
+                                        let _ = tx.send(Background::Remembered {
+                                            kind: session.kind,
+                                            origin: session::origin(&session.server),
+                                            wanted: remembered,
+                                            result,
+                                        });
+                                    });
                                 }
                             });
                             ui.separator();
@@ -1283,9 +1397,15 @@ impl App {
                     let server = &self.servers[i];
                     ui.label(RichText::new(format!("Remove {}?", server.name())).heading().size(22.0));
                     let kind = server.session.kind.plugin().name;
-                    let message = format!(
-                        "Perfuse will sign out of this {kind} server and forget its saved sign-in. Your progress stays on the server."
-                    );
+                    let message = if server.source.capabilities().sign_out {
+                        format!(
+                            "Perfuse will sign out of this {kind} server and forget its saved sign-in. Your progress stays on the server."
+                        )
+                    } else {
+                        format!(
+                            "Perfuse will forget its saved sign-in for this {kind} server. The sign-in stays valid until you revoke it in your {kind} account. Your progress stays on the server."
+                        )
+                    };
                     ui.label(RichText::new(message).color(MUTED));
                     ui.separator();
                     ui.horizontal(|ui| {
@@ -1307,39 +1427,36 @@ impl App {
                     }).inner
                 });
             if modal.inner {
-                if self.servers[i].remembered
-                    && let Err(error) = session::clear(&self.servers[i].session)
-                {
-                    self.error = Some(error);
+                let removed = self.servers.remove(i);
+                // A book from this server saves its final position before the sign-out.
+                let book = if self.book.uses_source(&removed.source) {
+                    self.book_finished();
+                    self.playback.player.take().map(player::Player::retire)
                 } else {
-                    let removed = self.servers.remove(i);
-                    if self.book.uses_source(&removed.source)
-                        && let Some(player) = &self.player
-                    {
-                        player.stop();
+                    None
+                };
+                self.forget_removed(removed, book);
+                for (n, s) in self.servers.iter_mut().enumerate() {
+                    if s.prefs.position != n {
+                        s.prefs.position = n;
+                        s.persist();
                     }
-                    for (n, s) in self.servers.iter_mut().enumerate() {
-                        if s.prefs.position != n {
-                            s.prefs.position = n;
-                            s.persist();
-                        }
-                    }
-                    if self.servers.is_empty() {
-                        self.active = None;
-                        self.source = None;
-                        self.server.clear();
-                        self.token.clear();
-                        self.generation.fetch_add(1, Ordering::Relaxed);
-                        self.busy = false;
-                        self.connection_open = false;
-                        self.covers.clear();
-                        self.detail = None;
-                        self.notice = None;
-                        self.error = None;
-                    } else {
-                        self.activate(0);
-                        self.overview = true;
-                    }
+                }
+                if self.servers.is_empty() {
+                    self.active = None;
+                    self.source = None;
+                    self.sign_in.server.clear();
+                    self.sign_in.token.clear();
+                    self.generation.fetch_add(1, Ordering::Relaxed);
+                    self.busy = false;
+                    self.connection_open = false;
+                    self.covers.clear();
+                    self.detail = None;
+                    self.notice = None;
+                    self.error = None;
+                } else {
+                    self.activate(0);
+                    self.overview = true;
                 }
                 self.removing = None;
             } else if modal.should_close() {
@@ -1350,11 +1467,271 @@ impl App {
     }
 }
 
+/// A remembered server, opened with its last snapshot on a worker, so startup never waits
+/// on Credential Manager, networking setup or image decoding.
+pub(super) struct Restored {
+    session: session::Session,
+    source: Source,
+    overview: Option<metadata::Overview>,
+    home: Option<metadata::Home>,
+    art: Vec<(String, egui::ColorImage)>,
+}
+
+pub(super) struct Startup {
+    servers: Vec<Restored>,
+    unreadable: Vec<session::Unreadable>,
+    error: Option<String>,
+}
+
+/// Results from work that outlives the view that started it, such as saving or
+/// removing a sign-in. Unlike navigation replies these are never discarded.
+pub(super) enum Background {
+    Notice(String),
+    /// The outcome of saving (`wanted`) or forgetting a server's sign-in.
+    Remembered {
+        kind: ServerKind,
+        origin: Option<String>,
+        wanted: bool,
+        result: Result<(), String>,
+    },
+}
+
+/// The artwork a server's Continue row shows for `item`.
+fn continue_art(item: &Item) -> Option<&String> {
+    item.art
+        .as_ref()
+        .filter(|_| item.kind == Kind::Movie)
+        .or(item.thumb.as_ref())
+}
+
+fn restore_saved(plex_server: String) -> Startup {
+    let saved = session::load();
+    let single_plex = saved
+        .sessions
+        .iter()
+        .filter(|s| s.kind == ServerKind::Plex)
+        .count()
+        == 1;
+    let mut servers = Vec::new();
+    let mut unopened = Vec::new();
+    for mut saved in saved.sessions {
+        if saved.kind == ServerKind::Plex {
+            let matches = session::origin(&saved.server) == session::origin(&plex_server);
+            if std::env::var_os("PLEX_URL").is_some() && !matches {
+                continue;
+            }
+            if let Ok(token) = std::env::var("PLEX_TOKEN") {
+                if !matches && !single_plex {
+                    continue;
+                }
+                saved.token = token.into();
+            }
+        }
+        let Ok(source) = session::open(&saved) else {
+            unopened.push(saved.server.clone());
+            continue;
+        };
+        let store = metadata::Store::new(saved.kind.plugin().id, &saved.server);
+        let overview = store.overview().map(|saved| saved.value);
+        let art = overview
+            .iter()
+            .flat_map(|overview| &overview.continue_items)
+            .filter_map(|item| {
+                let path = continue_art(item)?;
+                let image = source.cached_artwork(path)?;
+                let size = [image.width() as usize, image.height() as usize];
+                Some((
+                    path.clone(),
+                    egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw()),
+                ))
+            })
+            .collect();
+        servers.push(Restored {
+            home: store.home().map(|saved| saved.value),
+            session: saved,
+            source,
+            overview,
+            art,
+        });
+    }
+    let error = saved.error.or_else(|| {
+        (!unopened.is_empty()).then(|| {
+            format!(
+                "Perfuse could not open the saved sign-in for {}. Sign in again in Settings.",
+                unopened.join(", ")
+            )
+        })
+    });
+    Startup {
+        servers,
+        unreadable: saved.unreadable,
+        error,
+    }
+}
+
+impl App {
+    /// Loads saved servers in the background. The window shows them, from their last
+    /// snapshot, as soon as they are ready, then refreshes each one.
+    pub(super) fn restore(&mut self, ctx: &egui::Context) {
+        let (tx, rx) = mpsc::channel();
+        self.restoring = Some(rx);
+        let (server, ctx) = (self.sign_in.server.clone(), ctx.clone());
+        tasks::spawn(move || {
+            let _ = tx.send(restore_saved(server));
+            ctx.request_repaint();
+        });
+    }
+
+    pub(super) fn poll_restore(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.restoring else {
+            return;
+        };
+        let startup = match rx.try_recv() {
+            Ok(startup) => startup,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => Startup {
+                servers: vec![],
+                unreadable: vec![],
+                error: Some("Perfuse could not load your saved servers.".into()),
+            },
+        };
+        self.restoring = None;
+        self.unreadable = startup.unreadable;
+        if let Some(error) = startup.error {
+            self.error = Some(error);
+        }
+        let first = self.servers.len();
+        for restored in startup.servers {
+            self.servers.push(Server::restored(restored, ctx));
+        }
+        self.servers[first..].sort_by_key(|s| s.prefs.position);
+        // The snapshot is on screen. Refreshing each server is the later step.
+        for server in &mut self.servers[first..] {
+            server.check(ctx);
+        }
+        self.next_refresh = Instant::now() + REFRESH_INTERVAL;
+        if first == 0 && !self.servers.is_empty() && self.active.is_none() {
+            self.activate(0);
+            self.overview = true;
+        }
+    }
+
+    pub(super) fn poll_background(&mut self) {
+        while let Ok(result) = self.background_rx.try_recv() {
+            match result {
+                Background::Notice(message) => self.notice = Some(message),
+                Background::Remembered {
+                    kind,
+                    origin,
+                    wanted,
+                    result,
+                } => {
+                    if let Some(server) = self.servers.iter_mut().find(|s| {
+                        s.session.kind == kind && session::origin(&s.session.server) == origin
+                    }) {
+                        server.remembered = if result.is_ok() { wanted } else { !wanted };
+                    }
+                    if let Err(error) = result {
+                        if self.sign_in.form.added_any() {
+                            self.sign_in.form.credential_error = Some(error);
+                        } else {
+                            self.notice = Some(error);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Saves a new sign-in to Credential Manager without blocking the window.
+    pub(super) fn remember_in_background(&self, session: session::Session) {
+        let tx = self.background_tx.clone();
+        tasks::spawn(move || {
+            let result = session::save(&session);
+            let _ = tx.send(Background::Remembered {
+                kind: session.kind,
+                origin: session::origin(&session.server),
+                wanted: true,
+                result,
+            });
+        });
+    }
+
+    /// Signs out on the server where it can, then forgets the saved sign-in, preferences
+    /// and snapshots. Runs in the background and reports only what could not be done.
+    fn forget_removed(&self, removed: Server, book: Option<player::Retired>) {
+        let tx = self.background_tx.clone();
+        let name = removed.name();
+        let Server {
+            session,
+            source,
+            remembered,
+            store,
+            ..
+        } = removed;
+        tasks::spawn(move || {
+            if let Some(book) = book {
+                if book.wait_until(Instant::now() + Duration::from_secs(8)) {
+                    drop(book);
+                } else {
+                    book.detach();
+                }
+            }
+            let mut problems = Vec::new();
+            if source.capabilities().sign_out && source.sign_out().is_err() {
+                problems.push(format!(
+                    "Perfuse could not sign out of {name} on the server."
+                ));
+            }
+            match remembered.then(|| session::clear(&session)) {
+                Some(Err(_)) => problems.push(format!(
+                    "Windows could not delete the saved sign-in for {name}, so it will reappear next time. Remove it again in Settings."
+                )),
+                _ => {
+                    prefs::forget_server(&session);
+                    store.forget();
+                }
+            }
+            if !problems.is_empty() {
+                let _ = tx.send(Background::Notice(problems.join(" ")));
+            }
+        });
+    }
+
+    /// Opens the add-server form for an expired server, keeping its place and name.
+    pub(super) fn sign_in_again(&mut self, i: usize) {
+        let server = &self.servers[i];
+        let (kind, address) = (server.session.kind, server.session.server.clone());
+        self.connection_open = false;
+        self.adding = true;
+        self.choose_source(Some(kind));
+        self.sign_in.server = address;
+        self.sign_in.form.replace(kind, &self.sign_in.server);
+    }
+
+    /// Forgets saved sign-ins that no longer open, after the user confirms.
+    pub(super) fn forget_unreadable(&mut self) {
+        let entries = std::mem::take(&mut self.unreadable);
+        let tx = self.background_tx.clone();
+        tasks::spawn(move || {
+            if entries
+                .iter()
+                .any(|entry| session::forget_unreadable(entry).is_err())
+            {
+                let _ = tx.send(Background::Notice(
+                    "Windows could not delete every unreadable sign-in. Try again next time."
+                        .into(),
+                ));
+            }
+        });
+    }
+}
+
 pub(super) fn library_icon(lib: &Library) -> Icon {
     match lib.kind {
-        Kind::Series => Icon::TvShows,
-        Kind::Audiobook => Icon::Audiobooks,
-        _ => Icon::Movies,
+        LibraryKind::Shows => Icon::TvShows,
+        LibraryKind::Audiobooks => Icon::Audiobooks,
+        LibraryKind::Movies => Icon::Movies,
     }
 }
 
